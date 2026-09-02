@@ -1,0 +1,12 @@
+/target/
+
+*.log
+*.profraw
+
+.env
+.idea/
+.vscode/
+.DS_Store
+
+# Vendor specifications are local references unless redistribution is licensed.
+/docs/*.pdf
