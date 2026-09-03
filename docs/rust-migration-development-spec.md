@@ -820,3 +820,25 @@ normalization 直接修改订单簿状态。
 
 Python、FFI、实时服务、多证券并行和持久化应分别立项，不纳入本次 C++ 订单簿迁移的完成
 条件。
+
+## 15. 生产 Parquet 链路（阶段 7）
+
+核心 v1 冻结后，项目已增加独立的 `production` adapter 和 `qtp-replay` 程序。它不改变
+legacy raw 类型，而是直接把通联字段转换为标准 `BookEvent`：
+
+```text
+Raw Parquet → 必要列投影/Schema 校验 → 股票过滤 → 通道临时分片
+            → 沪深原生序号回放 → 每标的 OrderBook → 截面/验证
+```
+
+- 沪市 `mdl_4_24_0` 在每个 `Channel` 内按 `BizIndex` 回放 A/D/T，S 只触发阶段检查点。
+- 深市 `mdl_6_33_0` 与 `mdl_6_36_0` 在每个 `ChannelNo` 内按 `ApplSeqNum` 归并。
+- 普通截面严格为成功应用全部 `quote_time < T` 事件后的状态；收盘状态使用独立
+  `MarketClose` 类型。
+- 原始 Decimal128 直接转换为万分之一价格单位；必需的 `LocalTime` 与行情时间组合交易日
+  和 Asia/Shanghai 时区后进入核心元数据。
+- 官方 snapshot 只用于验证，不参与恢复；开盘前和连续交易结束锚点允许在同一毫秒事件档
+  内候选匹配，`CLOSE/E0` 收盘状态必须精确匹配。
+
+生产命令、目录布局、失败分片和 JSON 报告详见
+[沪深全市场 Parquet 回放与验证手册](full-market-replay-guide.md)。

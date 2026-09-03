@@ -8,6 +8,7 @@
 pub mod legacy;
 pub mod market_data;
 pub mod order_book;
+pub mod production;
 
 pub use legacy::{
     LegacyContext, LegacyQtpRules, LegacyReplay, NormalizeError, OrderReferenceIndex, ReplayError,
@@ -15,3 +16,4 @@ pub use legacy::{
 };
 pub use market_data::*;
 pub use order_book::*;
+pub use production::*;

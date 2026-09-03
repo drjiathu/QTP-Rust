@@ -12,7 +12,8 @@ cargo build --locked
 cargo build --release --locked
 ```
 
-本项目是库 crate，没有默认可执行程序。生产代码通过 `qtp_core` API 调用订单簿回放。
+本章描述旧 C++ 数据结构的库 API。通联全市场 Parquet 的可执行程序参见
+[沪深全市场 Parquet 回放与验证手册](full-market-replay-guide.md)。
 
 ## 2. 输入约束
 
@@ -184,7 +185,8 @@ cargo run --release --locked --example replay_benchmark -- 100000
 该耗时包含内存中的 normalization、replay 和订单簿更新，不包含文件读取、通联解析和测试
 数据构造。
 
-## 8. 当前边界
+## 8. legacy API 边界
 
-v1 不读取通联文件，不执行 Clara 清洗，也不提供 Python、网络服务或持久化。撤单固定删除
-订单的全部未成交余量，不支持部分撤单。
+legacy API 不读取通联文件，也不提供 Python、网络服务或持久化。生产 `qtp-replay` 使用
+独立的通联 adapter，不复用 legacy raw 类型。两条链路的撤单都固定删除订单的全部未成交
+余量，不支持部分撤单。
