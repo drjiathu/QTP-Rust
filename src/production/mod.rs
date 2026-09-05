@@ -16,10 +16,11 @@ pub use snapshot::{BookSnapshot, SnapshotBookView, SnapshotLevel};
 pub use time::{parse_duration, parse_market_timestamp};
 pub use types::{
     MarketDayRequest, SnapshotKind, SnapshotSchedule, TargetUniverse, ValidationAnchor,
-    ValidationConfig,
+    ValidationConfig, is_chinext_symbol, is_etf_symbol, is_stock_symbol, is_supported_symbol,
 };
 pub use validation::{
-    FieldDifference, ValidationOutcome, ValidationRecord, ValidationReport, validate_market_day,
+    FieldDifference, PhaseAudit, PhaseIssue, ValidationCounts, ValidationOutcome, ValidationRecord,
+    ValidationReport, validate_market_day, validate_pre_open_market_day,
 };
 
 /// Integer price units used by the production Parquet replay and validation pipeline.

@@ -162,14 +162,8 @@ if let Err(error) = result {
 
 ## 7. 测试与性能检查
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets
-cargo test --locked --doc
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-cargo deny check
-```
+提交前的完整检查命令统一维护在 [CONTRIBUTING.md](../CONTRIBUTING.md#required-checks)。
+legacy 链路另外保留下面的 C++ oracle、golden 和性能冒烟检查。
 
 验证 C++ oracle 与 golden：
 

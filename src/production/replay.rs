@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use serde::{Deserialize, Serialize};
 
@@ -9,7 +9,7 @@ use crate::{
     UnknownTradePolicy,
 };
 
-use super::input::{IngestStats, spool_inputs};
+use super::input::{IngestStats, spool_inputs, spool_inputs_before};
 use super::spool::{
     Aggressor, FinishedSpool, SseKind, SseRow, SzExecutionKind, SzExecutionRow, SzOrderKind,
     SzOrderRow, SzSide,
@@ -22,19 +22,54 @@ use super::{
 use crate::production::snapshot::SnapshotCursor;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReplayReport {
     pub input_rows: u64,
     pub selected_rows: u64,
     pub excluded_rows: u64,
+    pub excluded_after_cutoff_rows: u64,
     pub excluded_non_stock_rows: u64,
     pub excluded_unselected_stock_rows: u64,
     pub channels: usize,
     pub symbols: u64,
     pub applied_events: u64,
     pub status_events: u64,
+    pub same_second_quote_time_regressions: u64,
     pub scheduled_snapshots: u64,
     pub market_close_snapshots: u64,
     pub output_rows: u64,
+    pub sz_phase_source_available: bool,
+    pub sz_phase_rows: u64,
+    pub sz_resumption_checkpoints: usize,
+    pub sz_resumption_rest_orders: u64,
+    /// Successfully applied SZ events strictly later than 15:00 (quote time, not receipt time).
+    pub sz_after_close_events: u64,
+    /// Per-symbol counts requiring phase review before E0 validation can pass.
+    pub sz_after_close_events_by_symbol: BTreeMap<String, u64>,
+}
+
+impl ReplayReport {
+    fn observe_sz_applied_event(
+        &mut self,
+        symbol: &str,
+        quote_time_ns: i64,
+    ) -> Result<(), ProductionError> {
+        const CLOSE: i64 = 15 * 3_600_000_000_000;
+        if super::time::time_of_day_nanos(QuoteTimestampNs::from_nanos(quote_time_ns)) > CLOSE {
+            self.sz_after_close_events = self
+                .sz_after_close_events
+                .checked_add(1)
+                .ok_or(ProductionError::Arithmetic("SZ after-close event count"))?;
+            let count = self
+                .sz_after_close_events_by_symbol
+                .entry(symbol.to_owned())
+                .or_default();
+            *count = count.checked_add(1).ok_or(ProductionError::Arithmetic(
+                "SZ symbol after-close event count",
+            ))?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -46,6 +81,17 @@ pub(crate) enum ObservationPoint {
 }
 
 pub(crate) trait StateObserver {
+    fn observe_trade(
+        &mut self,
+        _channel: u32,
+        _symbol: &str,
+        _quote_time_ns: i64,
+        _price_units: i64,
+        _quantity: u64,
+    ) -> Result<(), ProductionError> {
+        Ok(())
+    }
+
     fn observe(
         &mut self,
         channel: u32,
@@ -78,7 +124,24 @@ pub(crate) fn run_market_day(
     observer: &mut dyn StateObserver,
 ) -> Result<ReplayReport, ProductionError> {
     let (spool, ingest) = spool_inputs(request)?;
-    let result = process_spool(request, &spool, ingest, observer);
+    let result = process_spool(request, &spool, ingest, observer, true);
+    finish_spool(result, spool)
+}
+
+pub(crate) fn run_market_day_before(
+    request: &MarketDayRequest,
+    quote_time_exclusive: i64,
+    observer: &mut dyn StateObserver,
+) -> Result<ReplayReport, ProductionError> {
+    let (spool, ingest) = spool_inputs_before(request, Some(quote_time_exclusive))?;
+    let result = process_spool(request, &spool, ingest, observer, false);
+    finish_spool(result, spool)
+}
+
+fn finish_spool(
+    result: Result<ReplayReport, ProductionError>,
+    spool: FinishedSpool,
+) -> Result<ReplayReport, ProductionError> {
     match result {
         Ok(report) => {
             spool.cleanup()?;
@@ -96,20 +159,33 @@ fn process_spool(
     spool: &FinishedSpool,
     ingest: IngestStats,
     observer: &mut dyn StateObserver,
+    complete_day: bool,
 ) -> Result<ReplayReport, ProductionError> {
     let mut report = ReplayReport {
         input_rows: ingest.input_rows,
         selected_rows: ingest.selected_rows,
         excluded_rows: ingest.excluded_rows,
+        excluded_after_cutoff_rows: ingest.excluded_after_cutoff_rows,
         excluded_non_stock_rows: ingest.excluded_non_stock_rows,
         excluded_unselected_stock_rows: ingest.excluded_unselected_stock_rows,
         channels: ingest.channels,
+        sz_phase_source_available: ingest.sz_phase_source_available,
+        sz_phase_rows: ingest.sz_phase_rows,
+        sz_resumption_checkpoints: ingest.sz_resumptions.values().map(Vec::len).sum(),
         ..ReplayReport::default()
     };
     for channel in spool.channels()? {
         match request.market {
             Market::Sse => process_sse_channel(request, spool, channel, observer, &mut report)?,
-            Market::Szse => process_sz_channel(request, spool, channel, observer, &mut report)?,
+            Market::Szse => process_sz_channel(
+                request,
+                spool,
+                channel,
+                observer,
+                &mut report,
+                complete_day,
+                &ingest.sz_resumptions,
+            )?,
         }
     }
     Ok(report)
@@ -121,6 +197,7 @@ struct BookRuntime {
     cursor: Option<SnapshotCursor>,
     last_quote_time_ns: Option<i64>,
     market_close_emitted: bool,
+    resumption_times: Option<Vec<i64>>,
 }
 
 impl BookRuntime {
@@ -150,6 +227,7 @@ impl BookRuntime {
                 .transpose()?,
             last_quote_time_ns: None,
             market_close_emitted: false,
+            resumption_times: None,
         })
     }
 
@@ -157,18 +235,25 @@ impl BookRuntime {
         &mut self,
         symbol: &str,
         quote_time_ns: i64,
-    ) -> Result<(), ProductionError> {
+    ) -> Result<bool, ProductionError> {
         if let Some(previous) = self.last_quote_time_ns {
             if quote_time_ns < previous {
-                return Err(ProductionError::QuoteTimeRegression {
-                    symbol: Symbol::from(symbol),
+                if !same_second_regression_is_allowed(
                     previous,
-                    current: quote_time_ns,
-                });
+                    quote_time_ns,
+                    self.cursor.is_some(),
+                ) {
+                    return Err(ProductionError::QuoteTimeRegression {
+                        symbol: Symbol::from(symbol),
+                        previous,
+                        current: quote_time_ns,
+                    });
+                }
+                return Ok(true);
             }
         }
         self.last_quote_time_ns = Some(quote_time_ns);
-        Ok(())
+        Ok(false)
     }
 
     fn resolve_history(&self, side: Side, order_no: u64) -> Option<OrderKey> {
@@ -179,6 +264,16 @@ impl BookRuntime {
         self.resolve_history(side, order_no)
             .filter(|key| self.book.order(key).is_some())
     }
+}
+
+fn same_second_regression_is_allowed(
+    previous_time_ns: i64,
+    current_time_ns: i64,
+    has_snapshot_cursor: bool,
+) -> bool {
+    !has_snapshot_cursor
+        && current_time_ns < previous_time_ns
+        && previous_time_ns.div_euclid(1_000_000_000) == current_time_ns.div_euclid(1_000_000_000)
 }
 
 fn process_sse_channel(
@@ -265,6 +360,8 @@ fn process_sz_channel(
     channel: u32,
     observer: &mut dyn StateObserver,
     report: &mut ReplayReport,
+    complete_day: bool,
+    resumptions: &HashMap<String, Vec<i64>>,
 ) -> Result<(), ProductionError> {
     let mut orders = spool.sz_order_reader(channel)?;
     let mut executions = spool.sz_execution_reader(channel)?;
@@ -298,6 +395,10 @@ fn process_sz_channel(
             let row = order.take().ok_or_else(|| {
                 ProductionError::InvalidRequest("missing Shenzhen order cursor".to_owned())
             })?;
+            // An unreferenced trade may have created the runtime before its first order.
+            runtime(request, &mut runtimes, &row.symbol)?
+                .resumption_times
+                .get_or_insert_with(|| resumptions.get(&row.symbol).cloned().unwrap_or_default());
             process_sz_order(
                 request,
                 channel,
@@ -339,7 +440,7 @@ fn process_sz_channel(
         writer.as_mut(),
         observer,
         report,
-        true,
+        complete_day,
     )?;
     report.symbols = report
         .symbols
@@ -376,17 +477,35 @@ fn process_sz_order(
     )?;
     let side = sz_side(row.side);
     let key = order_key(channel, side, row.sequence, &row.symbol, row.sequence)?;
+    let same_side_price_available = match side {
+        Side::Buy => runtime.book.summary().best_bid.is_some(),
+        Side::Sell => runtime.book.summary().best_ask.is_some(),
+    };
     let pricing = match row.kind {
-        SzOrderKind::Market => PricingInstruction::OppositeBest,
+        SzOrderKind::Market if row.price_units > 0 => {
+            PricingInstruction::Provided(price(row.price_units, &row.symbol, row.sequence)?)
+        }
+        SzOrderKind::Market => PricingInstruction::Unpriced,
         SzOrderKind::Limit => {
             PricingInstruction::Provided(price(row.price_units, &row.symbol, row.sequence)?)
         }
-        SzOrderKind::SameSideBest => PricingInstruction::SameSideBest,
+        SzOrderKind::SameSideBest if same_side_price_available => PricingInstruction::SameSideBest,
+        SzOrderKind::SameSideBest => PricingInstruction::Unpriced,
     };
-    let crossing = if is_continuous(row.quote_time_ns) {
-        CrossingBehavior::HideIfCrossing
-    } else {
-        CrossingBehavior::Rest
+    let resumption_limit = row.kind == SzOrderKind::Limit
+        && runtime
+            .resumption_times
+            .as_ref()
+            .is_some_and(|times| times.contains(&row.quote_time_ns));
+    let crossing = match row.kind {
+        SzOrderKind::Market => CrossingBehavior::RestAtLastTradePrice,
+        SzOrderKind::SameSideBest if !same_side_price_available => CrossingBehavior::AlwaysHide,
+        // The source flushes pre-resumption limit orders at this exact timestamp.
+        // They may cross before the auction trades arrive. A hidden order that
+        // never trades would otherwise remain invisible for its entire lifetime.
+        _ if resumption_limit => CrossingBehavior::Rest,
+        _ if is_continuous(row.quote_time_ns) => CrossingBehavior::HideIfCrossing,
+        _ => CrossingBehavior::Rest,
     };
     let event = BookEvent::AddOrder(AddOrder {
         meta: meta(
@@ -402,6 +521,10 @@ fn process_sz_order(
         quantity: quantity(row.quantity, &row.symbol, row.sequence)?,
     });
     apply(runtime, event, &row.symbol, row.sequence)?;
+    report.observe_sz_applied_event(&row.symbol, row.quote_time_ns)?;
+    if resumption_limit {
+        report.sz_resumption_rest_orders += 1;
+    }
     runtime.references.insert((side, row.sequence), key);
     report.applied_events += 1;
     observer.observe(
@@ -486,6 +609,16 @@ fn process_sz_execution(
         }
     };
     apply(runtime, event, &row.symbol, row.sequence)?;
+    report.observe_sz_applied_event(&row.symbol, row.quote_time_ns)?;
+    if row.kind == SzExecutionKind::Trade {
+        observer.observe_trade(
+            channel,
+            &row.symbol,
+            row.quote_time_ns,
+            row.price_units,
+            row.quantity,
+        )?;
+    }
     report.applied_events += 1;
     observer.observe(
         channel,
@@ -506,21 +639,13 @@ fn before_row(
     observer: &mut dyn StateObserver,
     report: &mut ReplayReport,
 ) -> Result<(), ProductionError> {
-    runtime.check_quote_time(symbol, quote_time_ns)?;
-    if request.market == Market::Szse && !runtime.market_close_emitted {
-        let close = parse_market_timestamp(request.trading_day, "15:00:00.000")?;
-        if quote_time_ns > close {
-            emit_market_close(
-                request,
-                channel,
-                symbol,
-                close,
-                runtime,
-                writer.as_deref_mut(),
-                observer,
-                report,
-            )?;
-        }
+    if runtime.check_quote_time(symbol, quote_time_ns)? {
+        report.same_second_quote_time_regressions = report
+            .same_second_quote_time_regressions
+            .checked_add(1)
+            .ok_or(ProductionError::Arithmetic(
+                "same-second quote-time regression count",
+            ))?;
     }
     if let (Some(cursor), Some(output)) = (&mut runtime.cursor, writer.as_mut()) {
         let depth = request
@@ -579,11 +704,15 @@ fn finish_channel(
             }
         }
         if emit_sz_close && !runtime.market_close_emitted {
+            // E0 is on a separate feed, so only exhausting both native-sequence
+            // streams completes this offline replay. Never finalize before a
+            // later event. A post-15:00 final state requires phase review.
+            let boundary = close.max(runtime.last_quote_time_ns.unwrap_or(close));
             emit_market_close(
                 request,
                 channel,
                 &symbol,
-                close,
+                boundary,
                 runtime,
                 writer.as_deref_mut(),
                 observer,
@@ -930,7 +1059,7 @@ fn is_continuous(timestamp_ns: i64) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::one_sided_reference;
+    use super::{one_sided_reference, same_second_regression_is_allowed};
     use crate::Side;
 
     #[test]
@@ -941,5 +1070,18 @@ mod tests {
         );
         assert!(one_sided_reference(0, 0, "000001", 1).is_err());
         assert!(one_sided_reference(10, 20, "000001", 1).is_err());
+    }
+
+    #[test]
+    fn only_unscheduled_same_second_quote_time_regressions_are_allowed() {
+        let previous = 13 * 3_600_000_000_000 + 10 * 60_000_000_000 + 60_000_000;
+        let current = previous - 10_000_000;
+        assert!(same_second_regression_is_allowed(previous, current, false));
+        assert!(!same_second_regression_is_allowed(previous, current, true));
+        assert!(!same_second_regression_is_allowed(
+            13 * 3_600_000_000_000,
+            13 * 3_600_000_000_000 - 1_000_000,
+            false,
+        ));
     }
 }

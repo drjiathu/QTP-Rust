@@ -90,7 +90,13 @@ impl fmt::Display for Symbol {
     }
 }
 
-/// Supported exchange.
+/// Supported securities exchange.
+///
+/// The variants use the exchanges' standard English abbreviations:
+/// `Sse` means Shanghai Stock Exchange and `Szse` means Shenzhen Stock
+/// Exchange.
+/// Rust spells enum variants in UpperCamelCase; external CLI,
+/// directory and report market codes remain `SH` and `SZ`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Market {
     Sse,
@@ -311,6 +317,8 @@ pub enum PricingInstruction {
     Provided(Price),
     SameSideBest,
     OppositeBest,
+    /// No effective price is available or needed for an always-hidden order.
+    Unpriced,
 }
 
 /// Placement behavior after the effective price is resolved.
@@ -318,6 +326,13 @@ pub enum PricingInstruction {
 pub enum CrossingBehavior {
     Rest,
     HideIfCrossing,
+    /// Start as an aggressive hidden order, then price any unfilled remainder
+    /// at the latest trade price and let it rest once it no longer crosses.
+    ///
+    /// Shenzhen `OrdType='1'` market orders use this market-to-limit behavior.
+    RestAtLastTradePrice,
+    /// Keep the order out of visible depth for its entire lifetime.
+    AlwaysHide,
 }
 
 /// Reference to one side of a trade.

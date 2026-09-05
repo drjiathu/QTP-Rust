@@ -4,6 +4,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use qtp_core::{
     Market, MarketDayRequest, SnapshotSchedule, Symbol, TargetUniverse, TradingDay,
     ValidationConfig, parse_duration, replay_market_day, validate_market_day,
+    validate_pre_open_market_day,
 };
 
 #[derive(Debug, Parser)]
@@ -26,16 +27,28 @@ enum Command {
         #[arg(long, default_value_t = 10)]
         depth: usize,
     },
-    /// 与官方 snapshot 的开盘前、连续交易结束和收盘锚点对拍。
+    /// 与 snapshot 的开盘前、全部连续交易帧和收盘锚点对拍。
     Validate {
         #[command(flatten)]
         input: InputArgs,
-        /// 官方 snapshot 根目录。
-        #[arg(long, default_value = "/hdd/data/stock/snapshot")]
-        reference_root: PathBuf,
         /// 可选的 JSON 报告输出路径；指定后标准输出只显示汇总。
         #[arg(long)]
         report: Option<PathBuf>,
+        /// 在 JSON 中保留每一条成功匹配明细；全市场验证通常不应启用。
+        #[arg(long)]
+        retain_matched_records: bool,
+        /// 最多保留多少条失败/不可比较明细；聚合统计不受影响。
+        #[arg(long)]
+        max_detail_records: Option<usize>,
+        /// 仅验证 PreOpen，回放至所选开盘帧候选窗口结束。
+        #[arg(long)]
+        pre_open_only: bool,
+        /// 连续交易参考时间之前的候选回看窗口，例如 1s；省略时沪市为 1s、深市为 0s。
+        #[arg(long)]
+        continuous_lookback: Option<String>,
+        /// 诊断用前向窗口覆盖；默认深市创业板 3s，其余 1s，自动按证券选择。
+        #[arg(long)]
+        continuous_lookahead: Option<String>,
     },
 }
 
@@ -56,9 +69,15 @@ struct InputArgs {
     /// 临时通道分片根目录。
     #[arg(long, default_value = "/tmp")]
     temp_root: PathBuf,
-    /// 逗号分隔的股票代码；省略时恢复该市场全部 A 股。
+    /// 逗号分隔的股票或 ETF 代码；省略时恢复该市场全部 A 股。
     #[arg(long, value_delimiter = ',')]
     symbols: Vec<String>,
+    /// 未指定代码时，同时选择该市场全部 ETF。
+    #[arg(long, conflicts_with = "only_etfs")]
+    include_etfs: bool,
+    /// 只选择该市场全部 ETF；与 --symbols、--include-etfs 互斥。
+    #[arg(long, conflicts_with_all = ["include_etfs", "symbols"])]
+    only_etfs: bool,
     /// Arrow 每批读取行数。
     #[arg(long, default_value_t = 65_536)]
     batch_size: usize,
@@ -107,14 +126,32 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Validate {
             input,
-            reference_root,
             report,
+            retain_matched_records,
+            max_detail_records,
+            pre_open_only,
+            continuous_lookback,
+            continuous_lookahead,
         } => {
             let request = input.request(None)?;
-            let validation = validate_market_day(&ValidationConfig {
+            let config = ValidationConfig {
                 request,
-                reference_root,
-            })?;
+                continuous_lookback: continuous_lookback
+                    .as_deref()
+                    .map(parse_duration)
+                    .transpose()?,
+                continuous_lookahead: continuous_lookahead
+                    .as_deref()
+                    .map(parse_duration)
+                    .transpose()?,
+                retain_matched_records,
+                max_detail_records,
+            };
+            let validation = if pre_open_only {
+                validate_pre_open_market_day(&config)?
+            } else {
+                validate_market_day(&config)?
+            };
             let json = serde_json::to_string_pretty(&validation)?;
             if let Some(path) = report.as_ref() {
                 if let Some(parent) = path.parent() {
@@ -122,18 +159,25 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 std::fs::write(path, json.as_bytes())?;
                 println!(
-                    "report={} matched={} mismatched={} not_comparable={} match_rate={:.2}%",
+                    "report={} matched={} mismatched={} excluded_by_status={} data_errors={} missing_source={} standard_acceptance={} match_rate={:.2}% match_tags={:?}",
                     path.display(),
                     validation.matched,
                     validation.mismatched,
-                    validation.not_comparable,
+                    validation.excluded_by_status,
+                    validation.data_errors,
+                    validation.missing_source,
+                    validation.is_standard_acceptance(),
                     validation.match_rate.unwrap_or(0.0) * 100.0,
+                    validation.match_tags,
                 );
             } else {
                 println!("{json}");
             }
             if !validation.is_success() {
-                return Err("snapshot validation contains mismatches".into());
+                return Err(
+                    "snapshot validation contains mismatches, data errors or missing sources"
+                        .into(),
+                );
             }
         }
     }
@@ -148,7 +192,13 @@ impl InputArgs {
         let trading_day = TradingDay::from_yyyymmdd(self.date)
             .ok_or_else(|| format!("invalid trading date: {}", self.date))?;
         let targets = if self.symbols.is_empty() {
-            TargetUniverse::AllStocks
+            if self.only_etfs {
+                TargetUniverse::AllEtfs
+            } else if self.include_etfs {
+                TargetUniverse::AllStocksAndEtfs
+            } else {
+                TargetUniverse::AllStocks
+            }
         } else {
             TargetUniverse::Symbols(self.symbols.into_iter().map(Symbol::from).collect())
         };

@@ -8,6 +8,8 @@ use crate::{Market, Symbol, TradingDay};
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TargetUniverse {
     AllStocks,
+    AllEtfs,
+    AllStocksAndEtfs,
     Symbols(Vec<Symbol>),
 }
 
@@ -16,6 +18,8 @@ impl TargetUniverse {
     pub fn contains(&self, market: Market, symbol: &str) -> bool {
         match self {
             Self::AllStocks => is_stock_symbol(market, symbol),
+            Self::AllEtfs => is_etf_symbol(market, symbol),
+            Self::AllStocksAndEtfs => is_supported_symbol(market, symbol),
             Self::Symbols(symbols) => symbols.iter().any(|candidate| candidate.as_str() == symbol),
         }
     }
@@ -28,9 +32,38 @@ pub fn is_stock_symbol(market: Market, symbol: &str) -> bool {
     }
     let prefixes: &[&str] = match market {
         Market::Sse => &["600", "601", "603", "605", "688", "689"],
-        Market::Szse => &["000", "001", "002", "003", "300", "301"],
+        Market::Szse => &["000", "001", "002", "003", "300", "301", "302"],
     };
     prefixes.iter().any(|prefix| symbol.starts_with(prefix))
+}
+
+#[must_use]
+pub fn is_etf_symbol(market: Market, symbol: &str) -> bool {
+    if symbol.len() != 6 || !symbol.bytes().all(|byte| byte.is_ascii_digit()) {
+        return false;
+    }
+    let prefixes: &[&str] = match market {
+        Market::Sse => &[
+            "510", "511", "512", "513", "515", "516", "517", "518", "560", "561", "562", "563",
+            "588",
+        ],
+        Market::Szse => &["159"],
+    };
+    prefixes.iter().any(|prefix| symbol.starts_with(prefix))
+}
+
+#[must_use]
+pub fn is_supported_symbol(market: Market, symbol: &str) -> bool {
+    is_stock_symbol(market, symbol) || is_etf_symbol(market, symbol)
+}
+
+/// Current SZ ChiNext code ranges; not the SSE STAR Market.
+#[must_use]
+pub fn is_chinext_symbol(symbol: &str) -> bool {
+    is_stock_symbol(Market::Szse, symbol)
+        && ["300", "301", "302"]
+            .iter()
+            .any(|prefix| symbol.starts_with(prefix))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -44,7 +77,7 @@ pub enum SnapshotKind {
 #[serde(rename_all = "snake_case")]
 pub enum ValidationAnchor {
     PreOpen,
-    ContinuousEnd,
+    ContinuousTrading,
     MarketClose,
 }
 
@@ -91,9 +124,9 @@ impl MarketDayRequest {
                 return Err("explicit symbol list must not be empty".to_owned());
             }
             for symbol in symbols {
-                if !is_stock_symbol(self.market, symbol.as_str()) {
+                if !is_supported_symbol(self.market, symbol.as_str()) {
                     return Err(format!(
-                        "symbol {symbol} is not a supported stock for {:?}",
+                        "symbol {symbol} is not a supported stock or ETF for {:?}",
                         self.market
                     ));
                 }
@@ -106,12 +139,32 @@ impl MarketDayRequest {
 #[derive(Clone, Debug)]
 pub struct ValidationConfig {
     pub request: MarketDayRequest,
-    pub reference_root: PathBuf,
+    /// Optional lookback before each continuous snapshot timestamp.
+    ///
+    /// `None` keeps the market default: SSE uses one second and SZSE uses zero.
+    /// A one-second lookback evaluates `[T-1s, T+1s)` without changing replay
+    /// ordering.
+    pub continuous_lookback: Option<Duration>,
+    /// Optional diagnostic horizon after each continuous snapshot timestamp.
+    ///
+    /// `None` selects the standard per-symbol horizon: SZ ChiNext uses three
+    /// seconds; other supported stocks and ETFs use one second. An explicit
+    /// override is reported as diagnostic mode, not standard acceptance.
+    pub continuous_lookahead: Option<Duration>,
+    /// Keep one report record for every successful reference frame.
+    ///
+    /// Full-market validation should normally disable this: aggregate counts
+    /// still include every frame, while `records` retains only mismatches and
+    /// non-comparable cases.
+    pub retain_matched_records: bool,
+    /// Optional cap for retained mismatch/not-comparable detail records.
+    /// Aggregate counts always cover every evaluated reference frame.
+    pub max_detail_records: Option<usize>,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{SnapshotSchedule, TargetUniverse, is_stock_symbol};
+    use super::{SnapshotSchedule, TargetUniverse, is_etf_symbol, is_stock_symbol};
     use crate::{Market, Symbol};
     use std::time::Duration;
 
@@ -120,9 +173,12 @@ mod tests {
         assert!(is_stock_symbol(Market::Sse, "600000"));
         assert!(is_stock_symbol(Market::Sse, "688001"));
         assert!(!is_stock_symbol(Market::Sse, "510300"));
+        assert!(is_etf_symbol(Market::Sse, "510300"));
         assert!(is_stock_symbol(Market::Szse, "000001"));
         assert!(is_stock_symbol(Market::Szse, "300001"));
+        assert!(is_stock_symbol(Market::Szse, "302132"));
         assert!(!is_stock_symbol(Market::Szse, "159915"));
+        assert!(is_etf_symbol(Market::Szse, "159915"));
     }
 
     #[test]
@@ -130,6 +186,23 @@ mod tests {
         let universe = TargetUniverse::Symbols(vec![Symbol::from("600000")]);
         assert!(universe.contains(Market::Sse, "600000"));
         assert!(!universe.contains(Market::Sse, "600001"));
+    }
+
+    #[test]
+    fn combined_universe_includes_stocks_and_etfs() {
+        let universe = TargetUniverse::AllStocksAndEtfs;
+        assert!(universe.contains(Market::Sse, "600000"));
+        assert!(universe.contains(Market::Sse, "510300"));
+        assert!(universe.contains(Market::Szse, "000001"));
+        assert!(universe.contains(Market::Szse, "159915"));
+        assert!(!universe.contains(Market::Sse, "110059"));
+    }
+
+    #[test]
+    fn etf_universe_excludes_stocks() {
+        let universe = TargetUniverse::AllEtfs;
+        assert!(universe.contains(Market::Szse, "159001"));
+        assert!(!universe.contains(Market::Szse, "000001"));
     }
 
     #[test]

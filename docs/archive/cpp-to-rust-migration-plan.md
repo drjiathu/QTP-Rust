@@ -20,8 +20,9 @@
 
 - [legacy 回放使用手册](../order-book-replay-guide.md)：旧 C++ 数据 API 的使用方法。
 - [沪深全市场回放与验证手册](../full-market-replay-guide.md)：当前生产命令与运行行为。
-- [Snapshot 验证匹配规则](../snapshot-validation-rules.md)：统一目标规范及实现差距。
-- [真实数据验证记录](../real-data-validation.md)：各次实验的实际口径、结果与修正过程。
+- [Snapshot 验证匹配规则](../snapshot-validation-rules.md)：当前唯一的验收规范。
+- [20260828 验证基线](../real-data-validation.md)：当前有效结果、证据范围和未闭合边界。
+- [历史调查记录](real-data-validation-20260828-investigation.md)：各次实验的原始口径、结果与修正过程。
 
 旧字段／枚举映射、兼容行为和 C++ oracle/golden 依据仍保留在本文供追溯；归档不删除
 legacy 实现或测试，也不自动将历史草案视为当前 API。当前 API 以源码和生成的 Rust API

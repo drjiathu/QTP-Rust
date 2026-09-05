@@ -15,12 +15,14 @@ pub enum OrderLocation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct OrderState {
     pub key: OrderKey,
-    pub effective_price: Price,
+    pub effective_price: Option<Price>,
     pub original_quantity: Quantity,
     pub remaining_quantity: u64,
     pub previous: Option<OrderHandle>,
     pub next: Option<OrderHandle>,
     pub location: OrderLocation,
+    pub allow_reentry: bool,
+    pub reprice_from_trade: bool,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

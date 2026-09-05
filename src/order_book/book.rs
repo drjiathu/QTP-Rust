@@ -62,6 +62,7 @@ struct KnownTradePlan {
     handle: OrderHandle,
     state: OrderState,
     new_remaining: u64,
+    new_effective_price: Option<Price>,
     reenter: bool,
 }
 
@@ -154,14 +155,18 @@ impl OrderBook {
             return Err(BookError::DuplicateOrder(event.order_key));
         }
         let price = self.resolve_price(event.order_key.side, event.pricing)?;
-        let hidden = event.crossing == CrossingBehavior::HideIfCrossing
-            && self.crosses_opposite(event.order_key.side, price);
+        let hidden = matches!(
+            event.crossing,
+            CrossingBehavior::AlwaysHide | CrossingBehavior::RestAtLastTradePrice
+        ) || (event.crossing == CrossingBehavior::HideIfCrossing
+            && price.is_some_and(|price| self.crosses_opposite(event.order_key.side, price)));
         let location = if hidden {
             OrderLocation::Aggressive
         } else {
             OrderLocation::Resting
         };
         let attach = if location == OrderLocation::Resting {
+            let price = price.ok_or(BookError::UnpricedVisibleOrder)?;
             Some(self.validate_attach(event.order_key.side, price, event.quantity.get())?)
         } else {
             None
@@ -175,9 +180,15 @@ impl OrderBook {
             previous: attach.as_ref().and_then(|plan| plan.previous),
             next: None,
             location,
+            allow_reentry: matches!(
+                event.crossing,
+                CrossingBehavior::HideIfCrossing | CrossingBehavior::RestAtLastTradePrice
+            ),
+            reprice_from_trade: event.crossing == CrossingBehavior::RestAtLastTradePrice,
         };
         let handle = self.orders.insert(state);
         if let Some(plan) = attach {
+            let price = price.ok_or(BookError::UnpricedVisibleOrder)?;
             self.commit_attach(event.order_key.side, price, handle, plan);
         }
         self.active_by_key.insert(event.order_key, handle);
@@ -235,25 +246,40 @@ impl OrderBook {
             None => None,
         };
 
+        for plan in [&mut bid_plan, &mut ask_plan].into_iter().flatten() {
+            if plan.state.location == OrderLocation::Aggressive
+                && plan.state.reprice_from_trade
+                && plan.new_remaining > 0
+            {
+                plan.new_effective_price = Some(event.price);
+            }
+        }
+
         let statistics = self.validate_trade_statistics(event.price, event.quantity.get())?;
         let post_best_ask = self.best_after_trade(Side::Sell, ask_plan.as_ref());
         if let Some(plan) = &mut bid_plan {
             plan.reenter = plan.state.location == OrderLocation::Aggressive
+                && plan.state.allow_reentry
                 && plan.new_remaining > 0
-                && post_best_ask.is_none_or(|best| plan.state.effective_price < best);
+                && plan
+                    .new_effective_price
+                    .is_some_and(|price| post_best_ask.is_none_or(|best| price < best));
         }
         let mut post_best_bid = self.best_after_trade(Side::Buy, bid_plan.as_ref());
         if bid_plan.as_ref().is_some_and(|plan| plan.reenter) {
             let bid_price = bid_plan
                 .as_ref()
-                .map(|plan| plan.state.effective_price)
+                .and_then(|plan| plan.new_effective_price)
                 .ok_or(BookError::InvariantViolation("missing bid reentry plan"))?;
             post_best_bid = Some(post_best_bid.map_or(bid_price, |best| best.max(bid_price)));
         }
         if let Some(plan) = &mut ask_plan {
             plan.reenter = plan.state.location == OrderLocation::Aggressive
+                && plan.state.allow_reentry
                 && plan.new_remaining > 0
-                && post_best_bid.is_none_or(|best| plan.state.effective_price > best);
+                && plan
+                    .new_effective_price
+                    .is_some_and(|price| post_best_bid.is_none_or(|best| price > best));
         }
 
         let bid_attach = self.validate_reentry(bid_plan.as_ref())?;
@@ -267,10 +293,10 @@ impl OrderBook {
             self.commit_trade_plan(plan, event.quantity.get());
         }
         if let (Some(plan), Some(attach)) = (&bid_plan, bid_attach) {
-            self.commit_reentry(plan.handle, &plan.state, plan.new_remaining, attach);
+            self.commit_reentry(plan, attach);
         }
         if let (Some(plan), Some(attach)) = (&ask_plan, ask_attach) {
-            self.commit_reentry(plan.handle, &plan.state, plan.new_remaining, attach);
+            self.commit_reentry(plan, attach);
         }
 
         Ok(ApplyOutcome::Traded {
@@ -283,23 +309,24 @@ impl OrderBook {
         &self,
         side: Side,
         instruction: PricingInstruction,
-    ) -> Result<Price, BookError> {
+    ) -> Result<Option<Price>, BookError> {
         match instruction {
-            PricingInstruction::Provided(price) => Ok(price),
-            PricingInstruction::SameSideBest => {
-                self.best_price(side)
-                    .ok_or(BookError::ReferencePriceUnavailable {
-                        side,
-                        instruction: "same-side best",
-                    })
-            }
-            PricingInstruction::OppositeBest => {
-                self.best_price(opposite(side))
-                    .ok_or(BookError::ReferencePriceUnavailable {
-                        side,
-                        instruction: "opposite best",
-                    })
-            }
+            PricingInstruction::Provided(price) => Ok(Some(price)),
+            PricingInstruction::SameSideBest => self
+                .best_price(side)
+                .ok_or(BookError::ReferencePriceUnavailable {
+                    side,
+                    instruction: "same-side best",
+                })
+                .map(Some),
+            PricingInstruction::OppositeBest => self
+                .best_price(opposite(side))
+                .ok_or(BookError::ReferencePriceUnavailable {
+                    side,
+                    instruction: "opposite best",
+                })
+                .map(Some),
+            PricingInstruction::Unpriced => Ok(None),
         }
     }
 
@@ -362,15 +389,18 @@ impl OrderBook {
             },
         )?;
         if state.location == OrderLocation::Resting {
+            let price = state.effective_price.ok_or(BookError::InvariantViolation(
+                "resting order has no effective price",
+            ))?;
             if new_remaining == 0 {
                 self.validate_detach(handle, &state)?;
             } else {
-                let level = self.level(state.key.side, state.effective_price).ok_or(
-                    BookError::MissingPriceLevel {
-                        side: state.key.side,
-                        price: state.effective_price,
-                    },
-                )?;
+                let level =
+                    self.level(state.key.side, price)
+                        .ok_or(BookError::MissingPriceLevel {
+                            side: state.key.side,
+                            price,
+                        })?;
                 level
                     .total_quantity
                     .checked_sub(trade_quantity)
@@ -379,6 +409,7 @@ impl OrderBook {
         }
         Ok(KnownTradePlan {
             handle,
+            new_effective_price: state.effective_price,
             state,
             new_remaining,
             reenter: false,
@@ -468,12 +499,15 @@ impl OrderBook {
     }
 
     fn validate_detach(&self, handle: OrderHandle, state: &OrderState) -> Result<(), BookError> {
-        let level = self.level(state.key.side, state.effective_price).ok_or(
-            BookError::MissingPriceLevel {
+        let price = state.effective_price.ok_or(BookError::InvariantViolation(
+            "resting order has no effective price",
+        ))?;
+        let level = self
+            .level(state.key.side, price)
+            .ok_or(BookError::MissingPriceLevel {
                 side: state.key.side,
-                price: state.effective_price,
-            },
-        )?;
+                price,
+            })?;
         if level.total_quantity < state.remaining_quantity || level.order_count == 0 {
             return Err(BookError::InvariantViolation("invalid level aggregate"));
         }
@@ -511,6 +545,9 @@ impl OrderBook {
     }
 
     fn commit_detach(&mut self, _handle: OrderHandle, state: &OrderState) {
+        let Some(price) = state.effective_price else {
+            return;
+        };
         if let Some(previous) = state.previous {
             if let Some(previous_state) = self.orders.get_mut(previous) {
                 previous_state.next = state.next;
@@ -524,10 +561,7 @@ impl OrderBook {
 
         let remove_level;
         {
-            let Some(level) = self
-                .level_map_mut(state.key.side)
-                .get_mut(&state.effective_price)
-            else {
+            let Some(level) = self.level_map_mut(state.key.side).get_mut(&price) else {
                 return;
             };
             level.total_quantity -= state.remaining_quantity;
@@ -541,18 +575,20 @@ impl OrderBook {
             remove_level = level.order_count == 0;
         }
         if remove_level {
-            self.level_map_mut(state.key.side)
-                .remove(&state.effective_price);
+            self.level_map_mut(state.key.side).remove(&price);
         }
     }
 
     fn best_after_trade(&self, side: Side, plan: Option<&KnownTradePlan>) -> Option<Price> {
         let levels = self.level_map(side);
         let visible_reduction = plan.and_then(|plan| {
-            (plan.state.location == OrderLocation::Resting).then_some((
-                plan.state.effective_price,
-                plan.state.remaining_quantity - plan.new_remaining,
-            ))
+            (plan.state.location == OrderLocation::Resting)
+                .then_some(plan)
+                .and_then(|plan| {
+                    plan.state
+                        .effective_price
+                        .map(|price| (price, plan.state.remaining_quantity - plan.new_remaining))
+                })
         });
         match side {
             Side::Buy => levels.iter().rev().find_map(|(price, level)| {
@@ -575,13 +611,15 @@ impl OrderBook {
         plan: Option<&KnownTradePlan>,
     ) -> Result<Option<AttachPlan>, BookError> {
         match plan {
-            Some(plan) if plan.reenter => self
-                .validate_attach(
-                    plan.state.key.side,
-                    plan.state.effective_price,
-                    plan.new_remaining,
-                )
-                .map(Some),
+            Some(plan) if plan.reenter => {
+                let price = plan
+                    .new_effective_price
+                    .ok_or(BookError::InvariantViolation(
+                        "re-entering order has no effective price",
+                    ))?;
+                self.validate_attach(plan.state.key.side, price, plan.new_remaining)
+                    .map(Some)
+            }
             _ => Ok(None),
         }
     }
@@ -591,11 +629,10 @@ impl OrderBook {
             if plan.new_remaining == 0 {
                 self.commit_detach(plan.handle, &plan.state);
             } else {
-                if let Some(level) = self
-                    .level_map_mut(plan.state.key.side)
-                    .get_mut(&plan.state.effective_price)
-                {
-                    level.total_quantity -= trade_quantity;
+                if let Some(price) = plan.state.effective_price {
+                    if let Some(level) = self.level_map_mut(plan.state.key.side).get_mut(&price) {
+                        level.total_quantity -= trade_quantity;
+                    }
                 }
                 if let Some(state) = self.orders.get_mut(plan.handle) {
                     state.remaining_quantity = plan.new_remaining;
@@ -603,6 +640,7 @@ impl OrderBook {
             }
         } else if let Some(state) = self.orders.get_mut(plan.handle) {
             state.remaining_quantity = plan.new_remaining;
+            state.effective_price = plan.new_effective_price;
         }
 
         if plan.new_remaining == 0 {
@@ -611,25 +649,18 @@ impl OrderBook {
         }
     }
 
-    fn commit_reentry(
-        &mut self,
-        handle: OrderHandle,
-        old_state: &OrderState,
-        remaining_quantity: u64,
-        attach: AttachPlan,
-    ) {
-        if let Some(state) = self.orders.get_mut(handle) {
-            state.remaining_quantity = remaining_quantity;
+    fn commit_reentry(&mut self, plan: &KnownTradePlan, attach: AttachPlan) {
+        let Some(price) = plan.new_effective_price else {
+            return;
+        };
+        if let Some(state) = self.orders.get_mut(plan.handle) {
+            state.effective_price = Some(price);
+            state.remaining_quantity = plan.new_remaining;
             state.location = OrderLocation::Resting;
             state.previous = attach.previous;
             state.next = None;
         }
-        self.commit_attach(
-            old_state.key.side,
-            old_state.effective_price,
-            handle,
-            attach,
-        );
+        self.commit_attach(plan.state.key.side, price, plan.handle, attach);
     }
 
     fn best_price(&self, side: Side) -> Option<Price> {
@@ -781,7 +812,7 @@ impl OrderBook {
                         .get(handle)
                         .ok_or(BookError::InvariantViolation("level order is missing"))?;
                     if !side_matches(state, side)
-                        || state.effective_price != *price
+                        || state.effective_price != Some(*price)
                         || state.location != OrderLocation::Resting
                         || state.previous != previous
                     {

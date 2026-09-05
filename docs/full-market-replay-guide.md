@@ -1,9 +1,8 @@
 # 沪深全市场 Parquet 回放与验证手册
 
-本手册说明当前命令与运行行为。目标匹配规则统一维护于
-[Snapshot 验证匹配规则](snapshot-validation-rules.md)，其中的实现状态表列出尚待落实项。
-特别是深市“完整单日回放后比较 E0”尚未替换当前 15:00 时间档收盘边界；下述命令不代表
-已经启用该目标行为。
+本手册说明当前命令、运行行为和用户可见限制。验收要求只在
+[Snapshot 验证匹配规则](snapshot-validation-rules.md) 中定义；本手册不改变或放宽该规范。
+开发进度不写入规范文档，相关开发任务应通过 GitHub Issue 跟踪。
 
 ## 编译
 
@@ -83,8 +82,14 @@ Snapshot(T) = 成功应用全部 quote_time < T 事件后的状态
 
 遇到 `quote_time == T` 的事件时先写 `T`，再应用该事件。时间网格分别从 09:15 和
 13:00 开始，第一帧为窗口起点加一个 interval；午间不输出重复静态帧。每只证券另写一条
-`snapshot_kind=market_close`：沪市由 `CLOSE` 状态触发，深市在完整处理 15:00:00 时间档后
-触发。
+`snapshot_kind=market_close`：沪市由逐笔 `CLOSE` 状态触发；深市在对应通道委托、成交／撤单
+两路全部读完并成功应用后触发，不以 15:00 截断输入。
+
+深市 `boundary_time` 为 `max(当日15:00, 已应用行情时间上界)`，表示离线最终状态的逻辑
+边界，不是 snapshot E0 时间或程序执行耗时。若包含 15:00 后事件，该状态需要业务阶段
+复核，不能仅凭 `snapshot_kind=market_close` 宣称等同于 E0。报告中的
+`sz_after_close_events` 及 `sz_after_close_events_by_symbol` 分别给出成功应用的超时事件
+总数和逐标的计数（严格 `quote_time >15:00:00.000`，不按 LocalTime 判断）。
 
 价格、加权均价和成交额以 Decimal128(scale=4) 输出；逐笔 Decimal128 直接缩放为整数，
 不会经过 `f64`。运行结束会输出 JSON 报告，其中分别统计非股票行和未选中股票行。
@@ -108,43 +113,43 @@ target/release/qtp-replay validate \
   --report reports/20260828-sh-preopen.json
 ```
 
-每只可比证券验证：
+选帧、候选窗口、比较字段、深市收盘价和停牌处理只在
+[Snapshot 验证匹配规则](snapshot-validation-rules.md) 中定义；本手册不复制规则正文。
+验证直接读取 raw snapshot，不读取 canonical snapshot，也不提供 `--reference-root`。
 
-- `pre_open`：直接从 raw 快照选择集合竞价结束后帧；沪市使用
-  `MarketData` 中 `[09:25, 09:30)` 内、此前存在 `OCALL` 的首个 `TRADE`，深市使用
-  `mdl_6_28_0` 中 `[09:25, 09:30)` 的首个正常 `B0`，并要求此前存在 `O0`；
-  深市 `H0/B1` 仅作为停牌后备，完整比较订单簿与成交统计；
-- `continuous_trading`：沪市使用 raw `MarketData` 中 09:30 后的全部 `TRADE` 帧；深市使用 raw
-  `mdl_6_28_0` 中 `[09:30, 14:57)` 的全部正常 `T0` 帧，每帧分别验证；
-- `market_close`：沪市取 raw `MarketData` 中此前存在 `CCALL` 的第一条 `CLOSE`；深市取 raw `mdl_6_28_0`
-  的首个 `E0`，与处理完 `quote_time <= 15:00:00.000` 全部事件后的状态完整精确比较。
-  raw 中同标的后续重复 `E0` 必须与首帧全字段相同，否则验证在加载阶段失败。
+当前命令有以下运行行为：
 
-深市股票和 ETF 的 `E0.LastPrice` 均按深交所收盘价规则验证。默认仍直接比较全部字段；仅当
-唯一差异为 `LastPrice` 时检查逐笔成交：若 `[14:57:00, 15:00:00]` 存在成交，不允许
-替换；若该时段没有成交，则以最后一笔成交为终点，计算含首尾端点的 60 秒成交量加权平均价，
-股票按 `0.01` 元、ETF 按 `0.001` 元取整后再比较；当日没有成交时使用 raw E0 的
-`PreCloPrice`。独立计算值与 E0 一致才判为匹配，分别记录
-`SZ_STOCK_AVG_CLOSE_PRICE`、`SZ_ETF_AVG_CLOSE_PRICE`、`SZ_STOCK_PRE_CLOSE_PRICE` 或
-`SZ_ETF_PRE_CLOSE_PRICE` 标签。盘口或其他统计字段仍有差异时不会放宽。
+- `--continuous-lookback 1s`、`--continuous-lookahead 3s` 只调整盘中验证候选窗口，
+  不改变原生序号回放或生产截面。显式覆盖窗口会标记 `diagnostic_window_override`；
+  即使全部匹配也不是标准验收。正式全量验收不要传入这两个参数。
+- 深市收盘在通道内两路输入完全耗尽后比较 E0。若成功应用了
+  `quote_time >15:00:00.000` 的事件，回放仍完成，但对应收盘项以
+  `phase review required` 阻断验收；JSON 的 `sz_after_close_events` 和
+  `sz_after_close_events_by_symbol` 保留总数与逐标的计数。
+- `--pre-open-only` 不生成收盘检查点，也不把未应用的下午事件计入超时事件统计。
 
-两市验证均不再读取 canonical snapshot，也不再提供 `--reference-root`。沪市 `OCALL`、
-`CCALL` 只用于确认阶段先后，`SUSP/ENDTR` 等状态不生成订单簿对拍记录；深市 `O0` 只用于
-确认首个正常 `B0` 的阶段先后。`CCALL/C0` 属于收盘集合竞价，不作为连续交易订单簿参考。
-参考快照的整秒时间是阶段时间，不是逐笔
-`quote_time`。`hh:mm:ss.000` 表示该整秒内某个未公开的采样时刻，而非严格的秒起点状态。
-沪市 `continuous_trading` 默认在 `[ts-1s, ts+1s)` 内枚举状态；深市默认使用
-`[ts, ts+1s)`。20260828 实测表明深市主板股票使用默认范围即可精确匹配；ETF 在接入
-复牌集合竞价语义后也使用此范围，
-但创业板 `T0` 需要覆盖完整三秒帧，可用 `--continuous-lookahead 3s` 诊断
-`[ts,ts+3s)`；`--continuous-lookback 1s` 可显式增加左侧一秒。两个参数只改变验证候选，
-不改变逐笔回放和生产截面语义。
-raw `UpdateTime` 是整秒阶段时间，因此 `pre_open` 也在 `[ts, ts+1s)` 内逐事件寻找候选；
-`market_close` 只比较严格定义的收盘状态。三个阶段统一完整比较十档价格、数量和委托数、
-两侧总量及加权均价、最新/最高/最低价、成交笔数、成交量和成交额。除加权均价外均使用
-整数值精确比较；买卖加权均价先按参考 feed 的发布精度由全书深整数价量计算，再允许
-绝对误差 `<= 0.001` 元（内部四位价格尺度的 10 个单位）。一侧为空时，双方都必须为空，
-不能用容差把缺失值与数值视为相等。验证不使用 `LocalTime` 或另一 feed 的序号对齐。
+### 当前实现状态与限制
+
+以下内容描述当前 `qtp-replay` 的实现，不重复定义或改变验收规范：
+
+- 已实现按市场、证券板块自动选择标准窗口，同一深市请求可以混合主板、创业板和 ETF。
+  `continuous_lookahead_ms_by_symbol` 是逐证券生效值；原标量字段只表示基础窗口。
+- 已实现参考源阶段状态机、异常中间阶段检查、首次 T0 前的正常开盘选择，以及参考时间
+  回退、来源行号重复／倒序诊断；`phase_audit` 保留全量状态计数和首个异常上下文。
+- 已实现正常开盘重复 B0、重复 CLOSE/E0 的规范化字段精确一致性检查；冲突不会通过
+  挑选另一帧消除，也不使用盘口对拍的加权均价容差。
+- 结果分为 `Matched`、`Mismatched`、`ExcludedByStatus`、`DataError`、`MissingSource`。
+  后两者均阻断验收；`NotComparable` 仅保留旧报告反序列化兼容。原 `not_comparable`
+  汇总为后三类的合计，不代表这些记录通过了验收。
+- 候选明细输出毫秒时间、通道、最后成功应用事件的 `matched_candidate_raw_sequence`
+  和 `matched_candidate_apply_sequence`。静态延续候选的时间可能晚于该事件；空簿尚无
+  成功事件时序号为空。失败明细保留差异最少候选的时间、原生序号及字段差异。
+- 深市完整 EOF 收盘保留；15:00 后事件以 `DataError` 阻断未经业务阶段确认的 E0 验收。
+- 功能回归已补入合成测试，97 项测试及严格 Clippy、格式／文档测试通过；20260828
+  沪深股票与 ETF 的新规范全量验收已完成，全部正常可比项通过。分类明细与证据见
+  [真实数据验证记录](real-data-validation.md)，旧报告不自动升级为本轮验收证据。
+
+仍需跨日期回归验证窗口及复牌数据源契约；snapshot 汇总匹配不替代逐订单和 FIFO 测试。
 
 JSON 报告包含 `matched`、`mismatched`、`not_comparable`、可比锚点匹配率、不可比覆盖率、
 差异字段分布、`match_tags` 规则匹配统计和逐证券逐帧差异；保留的成功记录通过
@@ -158,33 +163,24 @@ Unix epoch 毫秒，忠实反映输入时间精度，不暗示纳秒级准确性
 
 全市场验证默认不把每条成功记录写入 `records`，但所有记录仍进入总数和
 `stock/etf × anchor` 的 `breakdown`；`omitted_matched_records` 给出省略量。异常和不可比
-记录始终完整保留。小样本需要检查每条 `matched_candidate_time_ms` 时可增加
+记录默认完整保留，设置 `--max-detail-records` 时按上述规则限制明细。小样本需要检查每条 `matched_candidate_time_ms` 时可增加
 `--retain-matched-records`。
-
-深市停牌状态按锚点处理：正常 PreOpen 只允许 `O0 → B0`，正常连续交易只允许 `T0`，
-正常收盘只允许 `E0`。`B1/T1/E1` 等全天停牌状态生成带具体原因的 `NotComparable`；
-临时 `H0` 只使对应的 PreOpen 不可比，复牌后的 `T0` 与最终 `E0` 仍接受正常规则验证。
-验证不会因为出现 `H0` 而丢弃后续逐笔事件，也不会把真实不一致静默移出分母。
 
 ## 流式与失败恢复
 
 输入文件各扫描一次，按原生通道写入唯一临时目录，再逐通道恢复。成功后自动删除临时
 分片；失败时错误会报告保留目录，便于排查。输出按 RecordBatch 批量写入，不累计全市场
-截面。普通 `replay` 的峰值内存主要由一个输入 batch、当前通道全部活动订单以及一个输出
-batch 构成。`validate` 当前还会加载当日全部 reference 帧并保存逐帧匹配状态，20260828
-全市场实测峰值约 22 GiB；它是离线验收命令，尚未达到同样的通道级内存边界。
+截面。普通 `replay` 的峰值内存主要由一个输入 batch、当前通道订单簿（含历史引用与终身
+去重索引）以及一个输出 batch 构成。`validate` 当前还会加载当日全部 reference 帧并保存
+逐帧匹配状态；本轮 20260828 标准全量验收峰值约为沪市 36.9 GiB、深市 35.2 GiB。
+它是离线验收命令，尚未达到同样的通道级内存边界。
 
 发生失败时不要把保留分片当作新的输入继续运行；修复源数据或规则后重新执行命令。已有的
 部分输出可能不完整，应写到新的输出目录或先人工确认后处理。
 
 ## 开发验证
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets
-cargo test --locked --doc
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
-```
+提交前的格式、Clippy、测试、文档和依赖检查命令统一维护在
+[CONTRIBUTING.md](../CONTRIBUTING.md#required-checks)。
 
 CI 使用 `tests/production_parquet.rs` 中的小型 Arrow/Parquet fixture，不依赖 `/hdd`。

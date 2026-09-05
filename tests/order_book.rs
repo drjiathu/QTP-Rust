@@ -97,6 +97,131 @@ fn hidden_crossing_order_reenters_after_opposite_level_is_consumed() {
 }
 
 #[test]
+fn always_hidden_order_never_rests_or_reenters() {
+    let mut book = strict_book();
+    let bid = key(Side::Buy, 1, 303);
+    let added = book.apply(BookEvent::AddOrder(AddOrder {
+        meta: meta(1, 1),
+        order_key: bid,
+        pricing: PricingInstruction::Unpriced,
+        crossing: CrossingBehavior::AlwaysHide,
+        quantity: common::quantity(100),
+    }));
+    assert!(matches!(
+        added,
+        Ok(ApplyOutcome::Added {
+            effective_price: None,
+            location: OrderLocation::Aggressive,
+            ..
+        })
+    ));
+    assert!(book.levels(Side::Buy).is_empty());
+
+    assert!(
+        book.apply(trade(
+            2,
+            2,
+            OrderReference::Resolved(bid),
+            OrderReference::Absent,
+            55_000,
+            40,
+        ))
+        .is_ok()
+    );
+    assert!(matches!(
+        book.order(&bid),
+        Some(order)
+            if order.location == OrderLocation::Aggressive
+                && order.remaining_quantity == 60
+    ));
+    assert!(book.levels(Side::Buy).is_empty());
+    assert!(book.apply(cancel(3, 3, bid)).is_ok());
+    assert!(book.order(&bid).is_none());
+}
+
+#[test]
+fn market_remainder_reprices_to_last_trade_and_reenters_after_crossing_ends() {
+    let mut book = strict_book();
+    let ask = key(Side::Sell, 1, 304);
+    let market_bid = key(Side::Buy, 1, 305);
+    assert!(book.apply(add(1, 1, ask, 55_000, 100)).is_ok());
+    let added = book.apply(BookEvent::AddOrder(AddOrder {
+        meta: meta(2, 2),
+        order_key: market_bid,
+        // The raw market-order boundary is not its eventual resting price.
+        pricing: PricingInstruction::Provided(price(60_000)),
+        crossing: CrossingBehavior::RestAtLastTradePrice,
+        quantity: common::quantity(150),
+    }));
+    assert!(matches!(
+        added,
+        Ok(ApplyOutcome::Added {
+            effective_price: Some(value),
+            location: OrderLocation::Aggressive,
+            ..
+        }) if value == price(60_000)
+    ));
+
+    assert!(
+        book.apply(trade(
+            3,
+            3,
+            OrderReference::Resolved(market_bid),
+            OrderReference::Resolved(ask),
+            55_000,
+            40,
+        ))
+        .is_ok()
+    );
+    assert!(matches!(
+        book.order(&market_bid),
+        Some(order)
+            if order.location == OrderLocation::Aggressive
+                && order.effective_price == Some(price(55_000))
+                && order.remaining_quantity == 110
+    ));
+    assert!(book.levels(Side::Buy).is_empty());
+
+    assert!(
+        book.apply(trade(
+            4,
+            4,
+            OrderReference::Resolved(market_bid),
+            OrderReference::Resolved(ask),
+            55_000,
+            60,
+        ))
+        .is_ok()
+    );
+    assert!(matches!(
+        book.order(&market_bid),
+        Some(order)
+            if order.location == OrderLocation::Resting
+                && order.effective_price == Some(price(55_000))
+                && order.remaining_quantity == 50
+    ));
+    assert_eq!(book.levels(Side::Buy)[0].price, price(55_000));
+    assert_eq!(book.levels(Side::Buy)[0].total_quantity, 50);
+    assert!(book.check_invariants().is_ok());
+}
+
+#[test]
+fn unpriced_visible_order_is_rejected_atomically() {
+    let mut book = strict_book();
+    let bid = key(Side::Buy, 1, 304);
+    let event = BookEvent::AddOrder(AddOrder {
+        meta: meta(1, 1),
+        order_key: bid,
+        pricing: PricingInstruction::Unpriced,
+        crossing: CrossingBehavior::Rest,
+        quantity: common::quantity(100),
+    });
+    assert_eq!(book.apply(event), Err(BookError::UnpricedVisibleOrder));
+    assert!(book.is_empty());
+    assert!(book.last_applied_meta().is_none());
+}
+
+#[test]
 fn unknown_trade_is_atomic_in_strict_mode() {
     let mut book = strict_book();
     let before = book.summary();
