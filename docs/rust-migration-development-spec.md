@@ -298,11 +298,14 @@ pub enum PricingInstruction {
     Provided(Price),
     SameSideBest,
     OppositeBest,
+    Unpriced,
 }
 
 pub enum CrossingBehavior {
     Rest,
     HideIfCrossing,
+    RestAtLastTradePrice,
+    AlwaysHide,
 }
 
 pub struct OrderCancel {
@@ -333,6 +336,16 @@ pub enum OrderReference {
 `LegacyQtpRules` 把旧订单类型映射成 `PricingInstruction`，同时按 `quote_time` 生成
 `CrossingBehavior`；实际有效价格和是否穿越由 `OrderBook::apply` 在写入前解析。订单簿
 核心不直接解释旧枚举或交易时段。
+
+`Unpriced + AlwaysHide` 是后续生产通联适配器使用的标准语义，不改变 legacy 映射：它表示
+来源确实没有可解析价格、但订单号仍需供下一笔成交或撤单引用的临时订单。该订单从不进入
+可见价位，也不允许成交后重入。`Unpriced` 与 `Rest` 或 `HideIfCrossing` 组合必须返回
+`BookError::UnpricedVisibleOrder`，禁止用零值或任意哨兵价补齐。
+
+深市 `OrdType='1'` 市价单使用 `RestAtLastTradePrice`：新增时作为主动订单隐藏，原始
+`Price` 只保留保护价/边界价语义；每次成交更新有效价格。如果成交后仍有余量且不再穿越
+对手盘，余量以最后成交价进入可见盘口。完全未成交、没有成交价的订单仍保持隐藏。该行为
+与无条件 `AlwaysHide` 不同。
 
 ### 4.5 撤单语义
 
@@ -837,8 +850,16 @@ Raw Parquet → 必要列投影/Schema 校验 → 股票过滤 → 通道临时�
   `MarketClose` 类型。
 - 原始 Decimal128 直接转换为万分之一价格单位；必需的 `LocalTime` 与行情时间组合交易日
   和 Asia/Shanghai 时区后进入核心元数据。
-- 官方 snapshot 只用于验证，不参与恢复；开盘前和连续交易结束锚点允许在同一毫秒事件档
-  内候选匹配，`CLOSE/E0` 收盘状态必须精确匹配。
+- snapshot 只用于验证，不参与恢复。沪市三个锚点均使用 raw `MarketData`，分别选择此前存在
+  `OCALL` 的首个 PreOpen `TRADE`、09:30 后的全部 `TRADE`、此前存在 `CCALL` 的首个
+  `CLOSE`；深市三个锚点均使用 raw `mdl_6_28_0`，分别选择此前存在
+  `O0` 的首个 `B0`、全部 `[09:30, 14:57)` `T0` 和首个 `E0`。PreOpen 与连续交易帧
+  分别在其 `[ts, ts + 1s)` 秒桶内候选匹配，`CLOSE/E0` 比较严格定义的收盘状态。三个
+  阶段统一比较十档价量和委托数、两侧总量、最新/最高/最低价及成交统计；加权委托均价
+  同样比较，但允许绝对误差 `<= 0.001` 元，其余字段精确比较。深市后续重复 `E0` 必须
+  与首帧全字段相同。深市股票和 ETF 的 E0 若仅 `LastPrice` 不同，则先确认收盘集合竞价
+  没有成交，再用最后一笔成交前一分钟 VWAP（当日无成交则用 `PreCloPrice`）验证官方
+  收盘价；只有独立计算结果一致才按带标签的匹配处理。验证报告的时间字段使用毫秒精度。
 
 生产命令、目录布局、失败分片和 JSON 报告详见
 [沪深全市场 Parquet 回放与验证手册](full-market-replay-guide.md)。
