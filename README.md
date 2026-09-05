@@ -14,8 +14,6 @@ QTP-Rust 是对 `QTP-core-main` 的 Rust 重构，支持旧 C++ 行为对拍，�
   `MarketData` 的 `OCALL→TRADE/TRADE/CCALL→CLOSE`，深市使用 `mdl_6_28_0` 的
   `O0→B0/T0/E0` 阶段帧。
 - `qtp-replay`：可执行程序，提供 `replay` 和 `validate` 子命令。
-- `docs/rust-migration-development-spec.md`：单 crate 的 C++ 订单簿迁移行为、接口、阶段和
-  验收标准。
 
 生产回放统一使用 `10_000` 作为价格乘数，即一个内部价格单位等于 `0.0001` 元；价格和
 成交额均以整数计算，避免 `f64` 的精度和 `NaN` 问题。选择该乘数是为了无损承载深市
@@ -64,6 +62,10 @@ cargo deny check
 [legacy 回放使用手册](docs/order-book-replay-guide.md)。真实数据冒烟结果和集合竞价帧的数据
 质量结论见 [真实数据验证记录](docs/real-data-validation.md)。
 
+原 C++ 迁移方案已移入
+[历史归档](docs/archive/cpp-to-rust-migration-plan.md)，仅用于追溯旧字段映射、兼容行为和
+迁移决策，不再作为当前开发或验收规范。归档不影响 legacy 实现及 C++ golden 测试。
+
 ## 目录
 
 ```text
@@ -76,7 +78,8 @@ src/
   bin/qtp-replay.rs      生产命令入口
 tests/                   集成、属性测试、C++ oracle 和 golden
 examples/                replay 外围性能测量
-docs/                    设计和迁移记录
+docs/                    使用手册、验证规范和实验记录
+docs/archive/            不再维护的历史设计与迁移方案
 ```
 
 ## v1 行为

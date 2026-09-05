@@ -15,6 +15,10 @@ cargo build --release --locked
 本章描述旧 C++ 数据结构的库 API。通联全市场 Parquet 的可执行程序参见
 [沪深全市场 Parquet 回放与验证手册](full-market-replay-guide.md)。
 
+原迁移开发方案已[归档](archive/cpp-to-rust-migration-plan.md)，其中保留旧字段／枚举映射、
+有意行为差异和 oracle/golden 的历史依据，不再作为当前 API 草案或开发计划。归档不移除
+本手册介绍的 legacy API，也不移除相关回归测试。
+
 ## 2. 输入约束
 
 一次回放对应唯一的市场、交易日和证券。调用方分别提供 `OrderRecord` 和 `TradeRecord`
