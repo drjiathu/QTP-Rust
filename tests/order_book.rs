@@ -9,6 +9,58 @@ use qtp_core::{
 };
 
 #[test]
+fn crossing_rest_orders_keep_fifo_until_source_trade_and_cancel() {
+    let mut book = strict_book();
+    let ask = key(Side::Sell, 1, 901);
+    let first = key(Side::Buy, 1, 902);
+    let second = key(Side::Buy, 1, 903);
+    assert!(book.apply(add(1, 1, ask, 100_000, 200)).is_ok());
+    assert!(book.apply(add(2, 2, first, 105_000, 100)).is_ok());
+    assert!(book.apply(add(3, 3, second, 105_000, 50)).is_ok());
+    // Crossing itself produces neither a trade nor a hidden order.
+    assert_eq!(book.summary().statistics.trade_count, 0);
+    assert_eq!(book.levels(Side::Buy)[0].total_quantity, 150);
+    assert_eq!(book.levels(Side::Sell)[0].total_quantity, 200);
+    assert!(
+        book.apply(trade(
+            4,
+            4,
+            OrderReference::Resolved(first),
+            OrderReference::Resolved(ask),
+            100_000,
+            40,
+        ))
+        .is_ok()
+    );
+    let bids = book.orders_at(Side::Buy, price(105_000));
+    assert_eq!(
+        bids.iter()
+            .map(|o| (o.key, o.remaining_quantity))
+            .collect::<Vec<_>>(),
+        vec![(first, 60), (second, 50)]
+    );
+    assert!(bids.iter().all(|o| o.location == OrderLocation::Resting));
+    assert!(book.apply(cancel(5, 5, first)).is_ok());
+    assert_eq!(book.levels(Side::Buy)[0].total_quantity, 50);
+    assert_eq!(book.orders_at(Side::Buy, price(105_000))[0].key, second);
+    assert!(
+        book.apply(trade(
+            6,
+            6,
+            OrderReference::Resolved(second),
+            OrderReference::Resolved(ask),
+            100_000,
+            50,
+        ))
+        .is_ok()
+    );
+    assert!(book.levels(Side::Buy).is_empty());
+    assert_eq!(book.levels(Side::Sell)[0].total_quantity, 110);
+    assert_eq!(book.summary().statistics.total_quantity, 90);
+    assert!(book.check_invariants().is_ok());
+}
+
+#[test]
 fn maintains_price_priority_fifo_and_aggregates() {
     let mut book = strict_book();
     let first = key(Side::Buy, 1, 101);

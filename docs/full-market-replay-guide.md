@@ -25,18 +25,16 @@ raw_level2_parquet/date=YYYYMMDD/mdl_6_28_0/part-0.parquet
 snapshot/date=YYYYMMDD/market={SH|SZ}/part-0.parquet
 ```
 
-沪市逐笔读取 `mdl_4_24_0`；深市逐笔读取 `mdl_6_33_0` 和 `mdl_6_36_0`。深市额外分批
-投影 `mdl_6_28_0` 的 `SecurityID/UpdateTime/TradingPhaseCode/source_row_no`，识别每标的
-`H0 → 首个 T0` 复牌检查点。检查点同毫秒发布的限价委托采用集合竞价 `Rest`，下一毫秒
-恢复普通连续竞价规则；不硬编码证券或10:30。价格、数量和成交统计仍全部来自逐笔。
+沪市逐笔读取 `mdl_4_24_0`；深市逐笔读取 `mdl_6_33_0` 和 `mdl_6_36_0`。
+深市限价单采用 `Provided(source_price) + Rest`，不以时间、阶段或穿价推断隐藏；
+成交和撤单按源记录扣减，允许回放中间盘口交叉。价格、数量和成交统计全部来自逐笔。
 程序验证 Clara footer、字段类型和 Decimal scale，只投影回放需要的列。
 
-兼容仅有逐笔的旧输入时，缺少 `mdl_6_28_0` 可继续运行，但报告会标记
-`sz_phase_source_available=false`，不能保证盘中复牌恢复正确。文件存在但 Schema、footer、
-必需值或逐标的阶段时间顺序不合法时直接报错。正常生产应提供此状态来源；该逻辑是已核验
-通联“复牌批次统一时间戳”的适配契约，不能用于推断缺失状态或任意新数据源的竞价边界。
-报告另有 `sz_phase_rows`（状态扫描行数）、`sz_resumption_checkpoints`（检查点数）和
-`sz_resumption_rest_orders`（按复牌规则成功应用的限价委托数），逐笔 `input_rows` 不含状态行。
+`replay` 不读取 `mdl_6_28_0`，其是否存在、状态标签和参考时间不影响恢复。
+`validate` 仍独立读取并校验参考 snapshot，阶段选帧、时间窗和错误标准不变。
+报告 `sz_direct_rest_limit_orders` 统计成功直接入簿的限价委托；旧报告中该值默认 0。
+历史兼容字段 `sz_phase_source_available/sz_phase_rows/sz_resumption_checkpoints/
+sz_resumption_rest_orders` 保留，新回放固定为 false/0，不能用于判断验证器参考文件是否可用。
 
 ## 回放
 

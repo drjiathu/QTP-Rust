@@ -50,10 +50,15 @@ pub struct ReplayReport {
     pub scheduled_snapshots: u64,
     pub market_close_snapshots: u64,
     pub output_rows: u64,
+    /// Legacy phase-assisted replay counters, retained for historical report compatibility.
+    /// New replay does not read reference snapshots; these four fields stay false/zero.
     pub sz_phase_source_available: bool,
     pub sz_phase_rows: u64,
     pub sz_resumption_checkpoints: usize,
     pub sz_resumption_rest_orders: u64,
+    /// Successfully applied SZ limit orders, directly resting irrespective of crossing or phase.
+    /// Zero in older reports that used phase-assisted HideIfCrossing.
+    pub sz_direct_rest_limit_orders: u64,
     /// Successfully applied SZ events strictly later than 15:00 (quote time, not receipt time).
     pub sz_after_close_events: u64,
     /// Per-symbol counts requiring phase review before E0 validation can pass.
@@ -202,23 +207,14 @@ fn process_spool(
         excluded_non_stock_rows: ingest.excluded_non_stock_rows,
         excluded_unselected_stock_rows: ingest.excluded_unselected_stock_rows,
         channels: ingest.channels,
-        sz_phase_source_available: ingest.sz_phase_source_available,
-        sz_phase_rows: ingest.sz_phase_rows,
-        sz_resumption_checkpoints: ingest.sz_resumptions.values().map(Vec::len).sum(),
         ..ReplayReport::default()
     };
     for channel in spool.channels()? {
         match request.market {
             Market::Sse => process_sse_channel(request, spool, channel, observer, &mut report)?,
-            Market::Szse => process_sz_channel(
-                request,
-                spool,
-                channel,
-                observer,
-                &mut report,
-                complete_day,
-                &ingest.sz_resumptions,
-            )?,
+            Market::Szse => {
+                process_sz_channel(request, spool, channel, observer, &mut report, complete_day)?
+            }
         }
     }
     Ok(report)
@@ -230,7 +226,6 @@ struct BookRuntime {
     cursor: Option<SnapshotCursor>,
     last_quote_time_ns: Option<i64>,
     market_close_emitted: bool,
-    resumption_times: Option<Vec<i64>>,
 }
 
 impl BookRuntime {
@@ -260,7 +255,6 @@ impl BookRuntime {
                 .transpose()?,
             last_quote_time_ns: None,
             market_close_emitted: false,
-            resumption_times: None,
         })
     }
 
@@ -394,7 +388,6 @@ fn process_sz_channel(
     observer: &mut dyn StateObserver,
     report: &mut ReplayReport,
     complete_day: bool,
-    resumptions: &HashMap<String, Vec<i64>>,
 ) -> Result<(), ProductionError> {
     let mut orders = spool.sz_order_reader(channel)?;
     let mut executions = spool.sz_execution_reader(channel)?;
@@ -428,10 +421,6 @@ fn process_sz_channel(
             let row = order.take().ok_or_else(|| {
                 ProductionError::InvalidRequest("missing Shenzhen order cursor".to_owned())
             })?;
-            // An unreferenced trade may have created the runtime before its first order.
-            runtime(request, &mut runtimes, &row.symbol)?
-                .resumption_times
-                .get_or_insert_with(|| resumptions.get(&row.symbol).cloned().unwrap_or_default());
             order = orders
                 .as_mut()
                 .map(|reader| reader.next_row())
@@ -656,11 +645,6 @@ fn process_sz_order(
         SzOrderKind::SameSideBest if same_side_price_available => PricingInstruction::SameSideBest,
         SzOrderKind::SameSideBest => PricingInstruction::Unpriced,
     };
-    let resumption_limit = row.kind == SzOrderKind::Limit
-        && runtime
-            .resumption_times
-            .as_ref()
-            .is_some_and(|times| times.contains(&row.quote_time_ns));
     let crossing = match row.kind {
         SzOrderKind::Market
             if request.sz_market_order_policy
@@ -671,12 +655,11 @@ fn process_sz_order(
         SzOrderKind::Market => CrossingBehavior::AlwaysHide,
         SzOrderKind::SameSideBest if !same_side_price_available => CrossingBehavior::AlwaysHide,
         SzOrderKind::SameSideBest => CrossingBehavior::Rest,
-        // The source flushes pre-resumption limit orders at this exact timestamp.
-        // They may cross before the auction trades arrive. A hidden order that
-        // never trades would otherwise remain invisible for its entire lifetime.
-        _ if resumption_limit => CrossingBehavior::Rest,
-        _ if is_continuous(row.quote_time_ns) => CrossingBehavior::HideIfCrossing,
-        _ => CrossingBehavior::Rest,
+        // A crossing price is not evidence of a fill or of invisibility. Keep
+        // every priced limit order until source executions/cancellations reduce
+        // it, including untraded resumption-auction orders. Intermediate replay
+        // states may cross; reference snapshot phases must not drive this ledger.
+        SzOrderKind::Limit => CrossingBehavior::Rest,
     };
     let event = BookEvent::AddOrder(AddOrder {
         meta: meta(
@@ -693,8 +676,8 @@ fn process_sz_order(
     });
     apply(runtime, event, &row.symbol, row.sequence)?;
     report.observe_sz_applied_event(&row.symbol, row.quote_time_ns)?;
-    if resumption_limit {
-        report.sz_resumption_rest_orders += 1;
+    if row.kind == SzOrderKind::Limit {
+        report.sz_direct_rest_limit_orders += 1;
     }
     runtime.references.insert((side, row.sequence), key);
     report.applied_events += 1;
@@ -1218,14 +1201,6 @@ fn sz_side(side: SzSide) -> Side {
         SzSide::Buy => Side::Buy,
         SzSide::Sell => Side::Sell,
     }
-}
-
-fn is_continuous(timestamp_ns: i64) -> bool {
-    const OPEN: i64 = 9 * 3_600_000_000_000 + 30 * 60_000_000_000;
-    const CLOSE_CALL: i64 = 14 * 3_600_000_000_000 + 57 * 60_000_000_000;
-    let quote = QuoteTimestampNs::from_nanos(timestamp_ns);
-    let time = super::time::time_of_day_nanos(quote);
-    (OPEN..CLOSE_CALL).contains(&time)
 }
 
 #[cfg(test)]

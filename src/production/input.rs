@@ -26,9 +26,6 @@ pub(crate) struct IngestStats {
     pub excluded_non_stock_rows: u64,
     pub excluded_unselected_stock_rows: u64,
     pub channels: usize,
-    pub sz_phase_rows: u64,
-    pub sz_phase_source_available: bool,
-    pub sz_resumptions: HashMap<String, Vec<i64>>,
     symbol_channels: HashMap<String, u32>,
 }
 
@@ -36,81 +33,6 @@ pub(crate) fn spool_inputs(
     request: &MarketDayRequest,
 ) -> Result<(FinishedSpool, IngestStats), ProductionError> {
     spool_inputs_before(request, None)
-}
-
-/// Only phase metadata is projected: reference depth and statistics never seed a book.
-/// Tonglian flushes accumulated resumption orders with the resumption timestamp.
-fn load_sz_resumptions(
-    request: &MarketDayRequest,
-    stats: &mut IngestStats,
-    quote_time_exclusive: Option<i64>,
-) -> Result<(), ProductionError> {
-    let path = raw_path(request, "mdl_6_28_0");
-    // Retain compatibility with tick-only fixtures and archives. The report makes
-    // this limitation explicit; such inputs cannot identify intraday resumptions.
-    if !path
-        .try_exists()
-        .map_err(|error| ProductionError::io(&path, error))?
-    {
-        return Ok(());
-    }
-    stats.sz_phase_source_available = true;
-    let mut phases: HashMap<String, SzPhaseHistory> = HashMap::new();
-    for batch in read_batches(&path, request.batch_size, "SZ", "mdl_6_28_0")? {
-        let batch = batch.map_err(|source| ProductionError::Arrow {
-            context: "Shenzhen phase batch",
-            source,
-        })?;
-        let symbols = large_string_column(&path, &batch, "SecurityID")?;
-        let times = large_string_column(&path, &batch, "UpdateTime")?;
-        let codes = large_string_column(&path, &batch, "TradingPhaseCode")?;
-        let rows = u64_column(&path, &batch, "source_row_no")?;
-        for index in 0..batch.num_rows() {
-            stats.sz_phase_rows += 1;
-            let row = required_u64(&path, rows, index, "source_row_no", 0)?;
-            let symbol = required_str(&path, symbols, index, "SecurityID", row)?;
-            if !request.targets.contains(Market::Szse, symbol) {
-                continue;
-            }
-            let time = parse_timestamp_field(request, &path, times, index, row, "UpdateTime")?;
-            if quote_time_exclusive.is_some_and(|cutoff| time >= cutoff) {
-                continue;
-            }
-            let code = required_str(&path, codes, index, "TradingPhaseCode", row)?.trim();
-            let history = phases.entry(symbol.to_owned()).or_default();
-            if history.last_time.is_some_and(|previous| time < previous) {
-                return Err(invalid(&path, row, "UpdateTime", "phase time regressed"));
-            }
-            if history.observe(time, code) {
-                stats
-                    .sz_resumptions
-                    .entry(symbol.to_owned())
-                    .or_default()
-                    .push(time);
-            }
-        }
-    }
-    Ok(())
-}
-
-#[derive(Default)]
-struct SzPhaseHistory {
-    last_time: Option<i64>,
-    halted: bool,
-}
-
-impl SzPhaseHistory {
-    fn observe(&mut self, time: i64, code: &str) -> bool {
-        self.last_time = Some(time);
-        match code {
-            "H0" => {
-                self.halted = true;
-                false
-            }
-            "T0" => std::mem::take(&mut self.halted),
-            _ => false,
-        }
-    }
 }
 
 pub(crate) fn spool_inputs_before(
@@ -129,9 +51,6 @@ pub(crate) fn spool_inputs_before(
         }
     );
     let mut stats = IngestStats::default();
-    if request.market == Market::Szse {
-        load_sz_resumptions(request, &mut stats, quote_time_exclusive)?;
-    }
     let mut spool = SpoolSet::create(&request.temp_root, &label)?;
     let ingest_result = match request.market {
         Market::Sse => ingest_sse(request, &mut spool, &mut stats, quote_time_exclusive),
@@ -920,42 +839,5 @@ fn invalid(
         source_row,
         field,
         detail: detail.into(),
-    }
-}
-
-#[cfg(test)]
-mod phase_tests {
-    use super::SzPhaseHistory;
-
-    #[test]
-    fn normal_open_and_suspended_frames_do_not_create_resumptions() {
-        let mut state = SzPhaseHistory::default();
-        for (index, phase) in ["O0", "B0", "T0", "T0", "C0", "E0", "B1", "T1", "E1"]
-            .into_iter()
-            .enumerate()
-        {
-            assert!(!state.observe(index as i64, phase));
-        }
-    }
-
-    #[test]
-    fn only_first_normal_trading_frame_after_each_halt_creates_checkpoint() {
-        let mut state = SzPhaseHistory::default();
-        for (index, (phase, resumed)) in [
-            ("T0", false),
-            ("H0", false),
-            ("H0", false),
-            ("B0", false),
-            ("T0", true),
-            ("T0", false),
-            ("H0", false),
-            ("T0", true),
-            ("T0", false),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            assert_eq!(state.observe(index as i64, phase), resumed);
-        }
     }
 }

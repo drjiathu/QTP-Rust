@@ -1396,14 +1396,16 @@ fn shenzhen_e0_validates_eof_but_blocks_unclassified_late_events() {
     }
 }
 
-// The buy at 10.50 never trades in the reopening auction. A time-of-day-only
-// classifier hides it behind the 10.00 ask forever, even after that ask fills.
+// The buy at 10.50 never trades in the reopening auction. It must survive
+// regardless of phase feed availability/timing. A later crossing limit ask
+// also remains visible until an actual source execution/cancellation arrives.
 #[test]
-fn reopening_auction_keeps_untraded_limit_orders_visible_only_at_checkpoint() {
-    for (halted, resume_time) in [
-        (true, "10:30:00.000"),
-        (true, "11:00:00.000"),
-        (false, "10:30:00.000"),
+fn reopening_auction_keeps_untraded_limit_orders_without_phase_dependency() {
+    for (phase, resume_time, reference_time) in [
+        ("H0", "10:30:00.000", "10:30:00.000"),
+        ("V0", "11:00:00.000", "10:59:59.000"),
+        ("B0", "10:30:00.000", "10:30:00.000"),
+        ("missing", "11:00:00.000", "11:00:00.000"),
     ] {
         let root = TempDir::new().expect("temp directory");
         write_sz_fixture(&root, [4, 6], 60);
@@ -1475,33 +1477,33 @@ fn reopening_auction_keeps_untraded_limit_orders_visible_only_at_checkpoint() {
             Field::new("TradingPhaseCode", DataType::LargeUtf8, false),
             Field::new("source_row_no", DataType::UInt64, false),
         ]));
-        // No reference depth or statistics columns exist: replay needs only phases.
-        write_batch_with_metadata(
-            &base.join("mdl_6_28_0/part-0.parquet"),
-            schema,
-            vec![
-                Arc::new(LargeStringArray::from(vec!["000001"; 3])),
-                Arc::new(LargeStringArray::from(vec![
-                    "09:25:00.000",
-                    resume_time,
-                    later.as_str(),
-                ])),
-                Arc::new(LargeStringArray::from(vec![
-                    if halted { "H0" } else { "B0" },
-                    "T0",
-                    "T0",
-                ])),
-                Arc::new(UInt64Array::from(vec![1, 2, 3])),
-            ],
-            "mdl_6_28_0",
-        );
+        // Even an offset V0 -> T0 reference cannot affect order visibility.
+        if phase != "missing" {
+            write_batch_with_metadata(
+                &base.join("mdl_6_28_0/part-0.parquet"),
+                schema,
+                vec![
+                    Arc::new(LargeStringArray::from(vec!["000001"; 3])),
+                    Arc::new(LargeStringArray::from(vec![
+                        "09:25:00.000",
+                        reference_time,
+                        later.as_str(),
+                    ])),
+                    Arc::new(LargeStringArray::from(vec![phase, "T0", "T0"])),
+                    Arc::new(UInt64Array::from(vec![1, 2, 3])),
+                ],
+                "mdl_6_28_0",
+            );
+        }
         let mut req = sz_request(&root);
         req.snapshots =
             Some(SnapshotSchedule::new(Duration::from_secs(900), 10).expect("schedule"));
         let report = replay_market_day(&req).expect("reopening replay");
-        assert!(report.sz_phase_source_available);
-        assert_eq!(report.sz_resumption_checkpoints, usize::from(halted));
-        assert_eq!(report.sz_resumption_rest_orders, if halted { 3 } else { 0 });
+        assert!(!report.sz_phase_source_available);
+        assert_eq!(report.sz_phase_rows, 0);
+        assert_eq!(report.sz_resumption_checkpoints, 0);
+        assert_eq!(report.sz_resumption_rest_orders, 0);
+        assert_eq!(report.sz_direct_rest_limit_orders, 4);
         let output = root
             .path()
             .join("output/date=20260828/market=SZ/channel=1/part-0.parquet");
@@ -1525,8 +1527,8 @@ fn reopening_auction_keeps_untraded_limit_orders_visible_only_at_checkpoint() {
                 values.value(index)
             }
         };
-        assert_eq!(quantity("bid_quantity_1"), if halted { 100 } else { 0 });
-        assert_eq!(quantity("ask_quantity_1"), if halted { 0 } else { 100 });
+        assert_eq!(quantity("bid_quantity_1"), 100);
+        assert_eq!(quantity("ask_quantity_1"), 100);
         let boundaries = batch
             .column_by_name("boundary_time")
             .expect("times")
@@ -1559,14 +1561,8 @@ fn rejects_cross_stream_shenzhen_sequence_ambiguity() {
 }
 
 #[test]
-fn rejects_invalid_shenzhen_phase_source_instead_of_silently_ignoring_it() {
-    for (case, expected) in [
-        (0, "UpdateTime"),
-        (1, "TradingPhaseCode"),
-        (2, "regressed"),
-        (3, "UpdateTime"),
-        (4, "footer"),
-    ] {
+fn tick_replay_does_not_consume_even_invalid_reference_phase_files() {
+    for case in 0..5 {
         let root = TempDir::new().expect("temp directory");
         write_sz_fixture(&root, [3, 4], 60);
         let schema = Arc::new(Schema::new(vec![
@@ -1604,8 +1600,11 @@ fn rejects_invalid_shenzhen_phase_source_instead_of_silently_ignoring_it() {
                 "mdl_6_28_0"
             },
         );
-        let error = replay_market_day(&sz_request(&root)).expect_err("invalid phase source");
-        assert!(error.to_string().contains(expected), "case {case}: {error}");
+        let report = replay_market_day(&sz_request(&root)).expect("tick-only replay");
+        assert_eq!(report.applied_events, 4);
+        assert_eq!(report.sz_direct_rest_limit_orders, 2);
+        assert!(!report.sz_phase_source_available);
+        assert_eq!(report.sz_phase_rows, 0);
     }
 }
 
