@@ -163,13 +163,14 @@ pub struct ValidationConfig {
     /// Optional lookback before each continuous snapshot timestamp.
     ///
     /// `None` keeps the market default: SSE uses one second and SZSE uses zero.
-    /// A one-second lookback evaluates `[T-1s, T+1s)` without changing replay
-    /// ordering.
+    /// It shifts only the window start, without changing the per-symbol horizon
+    /// or replay ordering.
     pub continuous_lookback: Option<Duration>,
     /// Optional diagnostic horizon after each continuous snapshot timestamp.
     ///
     /// `None` selects the standard per-symbol horizon: SZ ChiNext uses three
-    /// seconds; other supported stocks and ETFs use one second. An explicit
+    /// seconds, SZ ETFs use 1,100 milliseconds, and other supported securities
+    /// use one second. An explicit
     /// override is reported as diagnostic mode, not standard acceptance.
     pub continuous_lookahead: Option<Duration>,
     /// Keep one report record for every successful reference frame.

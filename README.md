@@ -36,7 +36,8 @@ checked arithmetic。官方 snapshot 中的
 价格和成交额直接从 raw snapshot 的 `Decimal128` 转换为整数单位，不经过 `Float64`。
 Snapshot 验证统一为开盘集合竞价结束、盘中交易、收盘集合竞价结束三个阶段，股票与 ETF
 共用比较流程。选帧、时间窗、字段精度、收盘价和异常处理的唯一规范见
-[Snapshot 验证匹配规则](docs/snapshot-validation-rules.md)。深市现已在完整单日回放后比较首条
+[Snapshot 验证匹配规则](docs/snapshot-validation-rules.md)。深市盘中默认主板 `[T,T+1s)`、
+ETF `[T,T+1.1s)`、创业板 `[T,T+3s)`，不需要传入诊断窗口参数。深市现已在完整单日回放后比较首条
 E0；若成功应用了行情时间晚于 15:00 的事件，会报告并阻断未经阶段确认的收盘验收。
 规范文档只定义验收契约；自动板块窗口、阶段链、重复静态帧校验及分类报告的实现状态见
 [全市场回放与验证手册](docs/full-market-replay-guide.md)。

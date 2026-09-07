@@ -198,7 +198,12 @@ target/release/qtp-replay validate \
   [当前跨日期报告目录](../reports/20260906-latest-cross-date-full/)。
 
 - 已实现按市场、证券板块自动选择标准窗口，同一深市请求可以混合主板、创业板和 ETF。
+  深市盘中默认主板 1000ms、ETF 1100ms、创业板 3000ms，均从参考时刻 T 起左闭右开；
+  沪市、PreOpen 和收盘规则不变。ETF 1100ms 的原始数据验证证据见
+  [20260706 全 ETF 诊断](../reports/20260907-sz-etf-1100ms/README.md)，这不是所有日期的上界证明。
   `continuous_lookahead_ms_by_symbol` 是逐证券生效值；原标量字段只表示基础窗口。
+  Profiling example `validation_benchmark` 支持 `--max-detail-records 0` 保留全部失败和
+  排除明细（默认最多 5000 条）；不保留成功逐帧明细，汇总计数不受明细上限影响。
 - 已实现参考源阶段状态机、异常中间阶段检查、首次 T0 前的正常开盘选择，以及参考时间
   回退、来源行号重复／倒序诊断；`phase_audit` 保留全量状态计数和首个异常上下文。
 - 已实现正常开盘重复 B0、重复 CLOSE/E0 的规范化字段精确一致性检查；冲突不会通过

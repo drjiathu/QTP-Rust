@@ -46,7 +46,7 @@ enum Command {
         /// 连续交易参考时间之前的候选回看窗口，例如 1s；省略时沪市为 1s、深市为 0s。
         #[arg(long)]
         continuous_lookback: Option<String>,
-        /// 诊断用前向窗口覆盖；默认深市创业板 3s，其余 1s，自动按证券选择。
+        /// 诊断用前向窗口覆盖；默认深市 ETF 1100ms、创业板 3s，其余 1s，自动按证券选择。
         #[arg(long)]
         continuous_lookahead: Option<String>,
     },

@@ -84,7 +84,8 @@ pub struct ValidationReport {
     /// Milliseconds inspected before each continuous reference timestamp.
     #[serde(default)]
     pub continuous_lookback_ms: i64,
-    /// Milliseconds inspected after each continuous reference timestamp.
+    /// Base horizon in milliseconds; the effective per-symbol horizons are in
+    /// `continuous_lookahead_ms_by_symbol` (SZ ETFs and ChiNext differ by default).
     #[serde(default = "default_continuous_lookahead_ms")]
     pub continuous_lookahead_ms: i64,
     /// Explicit window overrides are diagnostics, never standard-rule acceptance.
@@ -460,11 +461,15 @@ impl ValidationObserver {
     }
 
     fn lookahead_ns(&self, symbol: &str) -> i64 {
-        if !self.lookahead_override && self.market == Market::Szse && is_chinext_symbol(symbol) {
-            3 * REFERENCE_SECOND_NS
-        } else {
-            self.continuous_lookahead_ns
+        if !self.lookahead_override && self.market == Market::Szse {
+            if is_etf_symbol(self.market, symbol) {
+                return 1_100 * REFERENCE_MILLISECOND_NS;
+            }
+            if is_chinext_symbol(symbol) {
+                return 3 * REFERENCE_SECOND_NS;
+            }
         }
+        self.continuous_lookahead_ns
     }
 
     fn pre_open_only(market: Market, references: HashMap<String, SymbolReferences>) -> Self {
@@ -2767,7 +2772,13 @@ mod tests {
             );
             assert_eq!(
                 report.continuous_lookahead_ms_by_symbol[&record.symbol],
-                if chinext { 3000 } else { 1000 }
+                if chinext {
+                    3000
+                } else if super::is_etf_symbol(Market::Szse, &record.symbol) {
+                    1100
+                } else {
+                    1000
+                }
             );
             if chinext {
                 assert_eq!(record.matched_candidate_time_ms, Some(12000));
@@ -2779,6 +2790,104 @@ mod tests {
                 );
                 assert_eq!(record.channel_id, Some(1));
             }
+        }
+    }
+
+    #[test]
+    fn sz_etf_default_window_accepts_1099ms_but_excludes_1100ms_events() {
+        for offset_ms in [0, 999, 1000, 1040, 1099, 1100, 1101] {
+            let mut actual = empty_book();
+            let mut expected_book = empty_book();
+            add_order(&mut expected_book);
+            let reference_time = 10 * super::REFERENCE_SECOND_NS;
+            let reference = ReferenceSnapshot {
+                time_ns: reference_time,
+                view: Some(
+                    super::SnapshotBookView::from_book(&expected_book, 10)
+                        .unwrap_or_else(|_| std::process::abort()),
+                ),
+                load_error: None,
+                not_comparable_reason: None,
+                pre_close_price_units: None,
+            };
+            let references = HashMap::from([(
+                "159501".to_owned(),
+                SymbolReferences {
+                    pre_open: Some(reference.clone()),
+                    continuous_trading: vec![reference],
+                    market_close: None,
+                },
+            )]);
+            let mut observer = ValidationObserver::new(Market::Szse, references);
+            let event_time = reference_time + offset_ms * super::REFERENCE_MILLISECOND_NS;
+            observer
+                .observe(
+                    1,
+                    "159501",
+                    &actual,
+                    ObservationPoint::BeforeEvent(event_time),
+                )
+                .unwrap_or_else(|_| std::process::abort());
+            add_order(&mut actual);
+            observer
+                .observe(
+                    1,
+                    "159501",
+                    &actual,
+                    ObservationPoint::AfterEvent(event_time),
+                )
+                .unwrap_or_else(|_| std::process::abort());
+            let report = observer.into_report(ReplayReport::default(), true);
+            assert!(!report.diagnostic_window_override);
+            assert_eq!(report.continuous_lookback_ms, 0);
+            assert_eq!(report.continuous_lookahead_ms_by_symbol["159501"], 1100);
+            for (anchor, end_ms) in [
+                (ValidationAnchor::ContinuousTrading, 1100),
+                (ValidationAnchor::PreOpen, 1000),
+            ] {
+                let record = report
+                    .records
+                    .iter()
+                    .find(|r| r.anchor == anchor)
+                    .unwrap_or_else(|| std::process::abort());
+                assert_eq!(
+                    record.outcome,
+                    if offset_ms < end_ms {
+                        ValidationOutcome::Matched
+                    } else {
+                        ValidationOutcome::Mismatched
+                    },
+                    "{anchor:?}, offset={offset_ms}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_horizon_overrides_sz_etf_default_but_not_other_market_defaults() {
+        let default = ValidationObserver::new(Market::Szse, HashMap::new());
+        for (symbol, millis) in [("000001", 1000), ("159501", 1100), ("300001", 3000)] {
+            assert_eq!(
+                default.lookahead_ns(symbol),
+                millis * super::REFERENCE_MILLISECOND_NS
+            );
+        }
+        for millis in [1000, 1100, 3000] {
+            let observer = ValidationObserver::new(Market::Szse, HashMap::new())
+                .with_continuous_lookahead(Some(Duration::from_millis(millis)))
+                .unwrap_or_else(|_| std::process::abort());
+            assert!(observer.diagnostic_window_override);
+            for symbol in ["000001", "159501", "300001"] {
+                assert_eq!(
+                    observer.lookahead_ns(symbol),
+                    i64::try_from(millis).unwrap_or_else(|_| std::process::abort())
+                        * super::REFERENCE_MILLISECOND_NS
+                );
+            }
+        }
+        let sh = ValidationObserver::new(Market::Sse, HashMap::new());
+        for symbol in ["600000", "510300"] {
+            assert_eq!(sh.lookahead_ns(symbol), super::REFERENCE_SECOND_NS);
         }
     }
 

@@ -27,6 +27,9 @@ struct Args {
     report: PathBuf,
     #[arg(long)]
     timings: PathBuf,
+    /// Maximum retained failure/exclusion records; zero retains all details.
+    #[arg(long, default_value_t = 5000)]
+    max_detail_records: usize,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -59,7 +62,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         continuous_lookback: None,
         continuous_lookahead: None,
         retain_matched_records: false,
-        max_detail_records: Some(5000),
+        max_detail_records: (args.max_detail_records != 0).then_some(args.max_detail_records),
     };
     let started = Instant::now();
     let (report, timings) = profile_validate_market_day(&config)?;
