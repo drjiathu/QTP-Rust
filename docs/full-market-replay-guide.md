@@ -181,6 +181,13 @@ target/release/qtp-replay validate \
 
 以下内容描述当前 `qtp-replay` 的实现，不重复定义或改变验收规范：
 
+- 已实现深市无涨跌幅限制股票 E0 的 validation-only 价格范围投影。仅比较视图筛选
+  价位并重算总量、加权价；恢复账本及生产输出不变。日级属性来自验证器的原始参考扫描，
+  成交基准来自成功逐笔事件；详细报告 `close_price_band` 给出范围与来源。
+  成交审计回调额外携带原生序号，防止待决响应组末尾撤单污染基准序号；不改变事件应用。
+  [五个历史 E0 定向验收](../reports/20260907-sz-e0-projection-verification/README.md) 已全部匹配，
+  所选证券非收盘记录不变，300391 的生产 Parquet 输出字节一致；尚非新版全市场验收。
+
 - 深市 CLI 市价单默认 `--sz-market-order-policy rest-at-last-trade-price`：隐藏余量在
   实际成交后不再穿越时按该成交价入簿，入簿后价格固定；不要求响应同毫秒或序号相邻。
   空簿本方最优仍进行严格撤单对账。`require-evidence` 显式启用严格待决解析；

@@ -36,6 +36,28 @@ struct TimedObserver<'a> {
 }
 
 impl StateObserver for TimedObserver<'_> {
+    fn observe_trade_with_sequence(
+        &mut self,
+        channel: u32,
+        symbol: &str,
+        raw_sequence: u64,
+        quote_time_ns: i64,
+        price_units: i64,
+        quantity: u64,
+    ) -> Result<(), ProductionError> {
+        let start = Instant::now();
+        let result = self.inner.observe_trade_with_sequence(
+            channel,
+            symbol,
+            raw_sequence,
+            quote_time_ns,
+            price_units,
+            quantity,
+        );
+        self.elapsed += start.elapsed();
+        self.calls += 1;
+        result
+    }
     fn observe_trade(
         &mut self,
         channel: u32,
@@ -83,6 +105,7 @@ pub fn profile_validate_market_day(
         .with_continuous_lookahead(config.continuous_lookahead)?
         .with_max_detail_records(config.max_detail_records);
     observer.phase_audit = references.phase_audit;
+    observer.sz_close_limits = references.sz_close_limits;
     let mut request = config.request.clone();
     request.snapshots = None;
     let reference_load = start.elapsed();

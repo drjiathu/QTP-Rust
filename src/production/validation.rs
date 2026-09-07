@@ -10,7 +10,10 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
 
+mod close_range;
 mod phases;
+pub use close_range::ClosePriceBandAudit;
+use close_range::{DayLimits, RangeBase};
 #[cfg(feature = "profiling")]
 pub(crate) mod profiling;
 use phases::PhaseTracker;
@@ -48,6 +51,9 @@ pub enum ValidationOutcome {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ValidationRecord {
+    /// Validation-only projection context; not a waiver or a matching tag.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_price_band: Option<ClosePriceBandAudit>,
     pub market: String,
     pub symbol: String,
     pub anchor: ValidationAnchor,
@@ -234,6 +240,8 @@ impl SymbolReferences {
 
 #[derive(Clone, Debug, Default)]
 struct AnchorState {
+    comparison_error: Option<String>,
+    close_price_band: Option<ClosePriceBandAudit>,
     matched: bool,
     finalized: bool,
     matched_candidate_time_ns: Option<i64>,
@@ -254,6 +262,7 @@ struct TradeSample {
 
 #[derive(Clone, Debug, Default)]
 struct SzClosePriceTracker {
+    range_base: Option<RangeBase>,
     last_minute: VecDeque<TradeSample>,
     weighted_price_quantity: u128,
     quantity: u128,
@@ -325,6 +334,14 @@ impl SzClosePriceTracker {
         let time = super::time::time_of_day_nanos(QuoteTimestampNs::from_nanos(quote_time_ns));
         const CLOSE_CALL_START: i64 = 14 * 3_600_000_000_000 + 57 * 60_000_000_000;
         const MARKET_CLOSE: i64 = 15 * 3_600_000_000_000;
+        if time < CLOSE_CALL_START {
+            self.range_base = Some(RangeBase {
+                price: i64::try_from(price_units)
+                    .map_err(|_| ProductionError::Arithmetic("SZ range base"))?,
+                time_ms: timestamp_ns_to_ms(quote_time_ns),
+                raw_sequence: None,
+            });
+        }
         if (CLOSE_CALL_START..=MARKET_CLOSE).contains(&time) {
             self.has_closing_auction_trade = true;
         }
@@ -357,6 +374,7 @@ const SZ_STOCK_PRE_CLOSE_PRICE_TAG: &str = "SZ_STOCK_PRE_CLOSE_PRICE";
 const SZ_ETF_PRE_CLOSE_PRICE_TAG: &str = "SZ_ETF_PRE_CLOSE_PRICE";
 
 struct ValidationObserver {
+    sz_close_limits: HashMap<String, DayLimits>,
     market: Market,
     references: HashMap<String, SymbolReferences>,
     states: HashMap<(String, ValidationAnchor, i64), AnchorState>,
@@ -381,6 +399,7 @@ impl ValidationObserver {
             0
         };
         Self {
+            sz_close_limits: HashMap::new(),
             market,
             references,
             states: HashMap::new(),
@@ -483,11 +502,58 @@ impl ValidationObserver {
         let Some(expected) = reference.view.as_ref() else {
             return Ok(());
         };
-        let mut actual = SnapshotBookView::from_book(book, 10)?;
-        actual.weighted_bid_price_units =
-            published_weighted_price(book, Side::Buy, self.market, symbol)?;
-        actual.weighted_ask_price_units =
-            published_weighted_price(book, Side::Sell, self.market, symbol)?;
+        let projection = if self.market == Market::Szse
+            && !is_etf_symbol(self.market, symbol)
+            && anchor == ValidationAnchor::MarketClose
+        {
+            let metadata = self
+                .sz_close_limits
+                .get(symbol)
+                .cloned()
+                .unwrap_or_default();
+            match metadata.unlimited() {
+                Ok(false) => Ok(None),
+                Ok(true) => self
+                    .sz_close_prices
+                    .get(symbol)
+                    .and_then(|t| t.range_base.as_ref())
+                    .ok_or_else(|| "missing pre-14:57 successful trade for SZ E0 range".to_owned())
+                    .and_then(|base| {
+                        close_range::project(book, base, &metadata)
+                            .map(Some)
+                            .map_err(|e| e.to_string())
+                    }),
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(None)
+        };
+        let mut actual = match projection {
+            Ok(Some((view, audit))) => {
+                self.states
+                    .entry((symbol.to_owned(), anchor, reference_time_ns))
+                    .or_default()
+                    .close_price_band = Some(audit);
+                view
+            }
+            Ok(None) => {
+                let mut view = SnapshotBookView::from_book(book, 10)?;
+                view.weighted_bid_price_units =
+                    published_weighted_price(book, Side::Buy, self.market, symbol)?;
+                view.weighted_ask_price_units =
+                    published_weighted_price(book, Side::Sell, self.market, symbol)?;
+                view
+            }
+            Err(error) => {
+                let state = self
+                    .states
+                    .entry((symbol.to_owned(), anchor, reference_time_ns))
+                    .or_default();
+                state.comparison_error = Some(error);
+                state.finalized = true;
+                return Ok(());
+            }
+        };
         let mut differences = compare_views(self.market, symbol, expected, &actual);
         let match_tag = if self.market == Market::Szse && anchor == ValidationAnchor::MarketClose {
             reconcile_sz_market_close_price(
@@ -794,6 +860,7 @@ impl ValidationObserver {
                     .as_ref()
                     .and_then(|state| state.match_tag)
                     .map(str::to_owned);
+                let close_price_band = state.as_ref().and_then(|s| s.close_price_band.clone());
                 let (outcome, reason, differences) = match (reference.as_ref(), state) {
                     _ if self
                         .phase_audit
@@ -874,6 +941,11 @@ impl ValidationObserver {
                         Some("no selected raw order/trade events were observed".to_owned()),
                         Vec::new(),
                     ),
+                    (Some(_), Some(state)) if state.comparison_error.is_some() => (
+                        ValidationOutcome::DataError,
+                        state.comparison_error,
+                        Vec::new(),
+                    ),
                     (Some(_), Some(state)) if state.matched => {
                         (ValidationOutcome::Matched, None, Vec::new())
                     }
@@ -923,6 +995,7 @@ impl ValidationObserver {
                     }
                 }
                 let record = ValidationRecord {
+                    close_price_band,
                     market: market.clone(),
                     symbol: symbol.clone(),
                     anchor,
@@ -1001,6 +1074,27 @@ impl ValidationObserver {
 }
 
 impl StateObserver for ValidationObserver {
+    fn observe_trade_with_sequence(
+        &mut self,
+        channel: u32,
+        symbol: &str,
+        raw_sequence: u64,
+        quote_time_ns: i64,
+        price_units: i64,
+        quantity: u64,
+    ) -> Result<(), ProductionError> {
+        self.observe_trade(channel, symbol, quote_time_ns, price_units, quantity)?;
+        if let Some(base) = self
+            .sz_close_prices
+            .get_mut(symbol)
+            .and_then(|t| t.range_base.as_mut())
+        {
+            if base.raw_sequence.is_none() {
+                base.raw_sequence = Some(raw_sequence);
+            }
+        }
+        Ok(())
+    }
     fn observe_trade(
         &mut self,
         _channel: u32,
@@ -1095,6 +1189,7 @@ pub fn validate_market_day(config: &ValidationConfig) -> Result<ValidationReport
         .with_continuous_lookahead(config.continuous_lookahead)?
         .with_max_detail_records(config.max_detail_records);
     observer.phase_audit = references.phase_audit;
+    observer.sz_close_limits = references.sz_close_limits;
     let mut request = config.request.clone();
     request.snapshots = None;
     let replay = run_market_day(&request, &mut observer)?;
@@ -1144,6 +1239,7 @@ const fn timestamp_ns_to_ms(timestamp_ns: i64) -> i64 {
 }
 
 struct LoadedReferences {
+    sz_close_limits: HashMap<String, DayLimits>,
     books: HashMap<String, SymbolReferences>,
     phase_audit: BTreeMap<String, PhaseAudit>,
 }
@@ -1162,6 +1258,7 @@ fn load_references(
     let opening_start = super::parse_market_timestamp(request.trading_day, "09:25:00.000")?;
     let continuous_start = super::parse_market_timestamp(request.trading_day, "09:30:00.000")?;
     let mut books: HashMap<String, SymbolReferences> = HashMap::new();
+    let mut sz_close_limits: HashMap<String, DayLimits> = HashMap::new();
     let mut trackers: BTreeMap<String, PhaseTracker> = BTreeMap::new();
     let status_field = if request.market == Market::Sse {
         "InstruStatus"
@@ -1196,6 +1293,28 @@ fn load_references(
                 continue;
             }
             let time_ns = super::parse_market_timestamp(request.trading_day, times.value(row))?;
+            if !pre_open_only
+                && request.market == Market::Szse
+                && !is_etf_symbol(request.market, symbol)
+            {
+                let read_limit = |name: &str| -> Result<i64, String> {
+                    let values = decimal128(&path, &batch, name, 6).map_err(|e| e.to_string())?;
+                    if values.is_null(row) || values.value(row) % 100 != 0 {
+                        return Err(format!("missing/invalid {name}"));
+                    }
+                    i64::try_from(values.value(row) / 100)
+                        .map_err(|_| format!("overflow in {name}"))
+                };
+                let values = read_limit("HighLimitPrice")
+                    .and_then(|high| read_limit("LowLimitPrice").map(|low| (high, low)));
+                sz_close_limits
+                    .entry(symbol.to_owned())
+                    .or_default()
+                    .observe(
+                        values,
+                        format!("{}#source_row_no={}", path.display(), rows.value(row)),
+                    );
+            }
             let tracker = trackers
                 .entry(symbol.to_owned())
                 .or_insert_with(|| PhaseTracker::new(request.market, request.trading_day, symbol));
@@ -1284,6 +1403,7 @@ fn load_references(
         }
     }
     Ok(LoadedReferences {
+        sz_close_limits,
         books,
         phase_audit: trackers
             .into_iter()
@@ -2003,6 +2123,108 @@ mod tests {
             key,
             some_or_abort(PriceScale::from_decimal_places(4)),
         ))
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn e0_projection_is_deterministic_and_never_filters_reference_or_mutates_book() {
+        for case in [
+            "matched",
+            "reference_outside",
+            "missing_base",
+            "missing_metadata",
+            "conflict",
+            "etf",
+        ] {
+            let symbol = if case == "etf" { "159001" } else { "000001" };
+            let mut book = empty_book();
+            add_order(&mut book);
+            let before = book.summary();
+            let full = super::SnapshotBookView::from_book(&book, 10).expect("view");
+            let mut expected = full.clone();
+            if case != "reference_outside" && case != "etf" {
+                expected.bids.clear();
+                expected.total_bid_quantity = 0;
+                expected.weighted_bid_price_units = None;
+            }
+            let refs = HashMap::from([(
+                symbol.to_owned(),
+                SymbolReferences {
+                    market_close: Some(ReferenceSnapshot {
+                        time_ns: timestamp("15:00:00.000"),
+                        view: Some(expected.clone()),
+                        load_error: None,
+                        not_comparable_reason: None,
+                        pre_close_price_units: None,
+                    }),
+                    ..SymbolReferences::default()
+                },
+            )]);
+            let mut observer = ValidationObserver::new(Market::Szse, refs);
+            if case != "missing_metadata" {
+                let mut limits = super::DayLimits::default();
+                limits.observe(
+                    Ok((super::close_range::NO_UPPER_LIMIT, 100)),
+                    "row1".to_owned(),
+                );
+                if case == "conflict" {
+                    limits.observe(Ok((120000, 80000)), "row2".to_owned());
+                }
+                observer.sz_close_limits.insert(symbol.to_owned(), limits);
+            }
+            if case != "missing_base" {
+                observer
+                    .observe_trade_with_sequence(1, symbol, 7, timestamp("14:56:59.990"), 1000, 10)
+                    .expect("trade");
+                // The final trade must not reset the independently frozen range.
+                observer
+                    .observe_trade_with_sequence(1, symbol, 8, timestamp("15:00:00.000"), 2000, 10)
+                    .expect("trade");
+            }
+            observer
+                .observe(
+                    1,
+                    symbol,
+                    &book,
+                    ObservationPoint::MarketClose(timestamp("15:00:00.000")),
+                )
+                .expect("close");
+            assert_eq!(
+                observer.references[symbol]
+                    .market_close
+                    .as_ref()
+                    .expect("reference")
+                    .view,
+                Some(expected)
+            );
+            let report = observer.into_report(ReplayReport::default(), true);
+            let close = report
+                .records
+                .iter()
+                .find(|r| r.anchor == ValidationAnchor::MarketClose)
+                .expect("close");
+            let outcome = match case {
+                "matched" | "etf" => ValidationOutcome::Matched,
+                "reference_outside" => ValidationOutcome::Mismatched,
+                _ => ValidationOutcome::DataError,
+            };
+            assert_eq!(close.outcome, outcome, "{case}");
+            if case == "matched" || case == "reference_outside" {
+                let band = close
+                    .close_price_band
+                    .as_ref()
+                    .expect("rule context even on mismatch");
+                assert_eq!(band.base_price_units, 1000);
+                assert_eq!(band.base_raw_sequence, 7);
+            } else {
+                assert!(close.close_price_band.is_none());
+            }
+            assert_eq!(book.summary(), before);
+            assert_eq!(
+                super::SnapshotBookView::from_book(&book, 10).expect("view"),
+                full
+            );
+        }
     }
 
     fn timestamp(value: &str) -> i64 {
@@ -2964,6 +3186,14 @@ mod tests {
         let symbol = "000001";
         let references = sz_close_references(symbol, 10_000, 9_900);
         let mut observer = ValidationObserver::new(Market::Szse, references);
+        observer.sz_close_limits.insert(
+            symbol.to_owned(),
+            super::DayLimits {
+                values: Some((200_000, 100)),
+                source: "synthetic limited stock".to_owned(),
+                error: None,
+            },
+        );
         assert!(
             observer
                 .observe_trade(1, symbol, timestamp("14:55:30.000"), 10_000, 100)
@@ -3029,6 +3259,14 @@ mod tests {
         let symbol = "000001";
         let references = sz_close_references(symbol, 123_400, 123_400);
         let mut observer = ValidationObserver::new(Market::Szse, references);
+        observer.sz_close_limits.insert(
+            symbol.to_owned(),
+            super::DayLimits {
+                values: Some((200_000, 100)),
+                source: "synthetic limited stock".to_owned(),
+                error: None,
+            },
+        );
         assert!(
             observer
                 .observe(

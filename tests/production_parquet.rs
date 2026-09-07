@@ -435,6 +435,87 @@ fn sz_request(root: &TempDir) -> MarketDayRequest {
     }
 }
 
+#[test]
+fn e0_range_metadata_and_successful_trade_sequence_survive_source_loading() {
+    for case in ["unlimited", "conflict", "null"] {
+        let root = TempDir::new().expect("temporary directory");
+        write_sz_fixture(&root, [3, 4], 60);
+        write_sz_e0_fixture(&root);
+        let path = root
+            .path()
+            .join("raw/date=20260828/mdl_6_28_0/part-0.parquet");
+        let batch = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).expect("file"))
+            .expect("builder")
+            .build()
+            .expect("reader")
+            .next()
+            .expect("batch")
+            .expect("batch");
+        let mut columns = batch.columns().to_vec();
+        let high = batch.schema().index_of("HighLimitPrice").expect("high");
+        let low = batch.schema().index_of("LowLimitPrice").expect("low");
+        columns[high] = Arc::new(
+            Decimal128Array::from(vec![
+                Some(999_999_999_999_900_i128),
+                match case {
+                    "conflict" => Some(12_000_000),
+                    "null" => None,
+                    _ => Some(999_999_999_999_900),
+                },
+            ])
+            .with_precision_and_scale(38, 6)
+            .expect("price"),
+        );
+        columns[low] = Arc::new(
+            Decimal128Array::from(vec![10_000_i128; 2])
+                .with_precision_and_scale(38, 6)
+                .expect("price"),
+        );
+        let mut fields = batch.schema().fields().to_vec();
+        fields[high] = Arc::new(Field::new(
+            "HighLimitPrice",
+            DataType::Decimal128(38, 6),
+            true,
+        ));
+        write_batch_with_metadata(&path, Arc::new(Schema::new(fields)), columns, "mdl_6_28_0");
+        let config = ValidationConfig {
+            request: sz_request(&root),
+            continuous_lookback: None,
+            continuous_lookahead: None,
+            retain_matched_records: true,
+            max_detail_records: None,
+        };
+        let report = validate_market_day(&config).expect("validation");
+        let close = report
+            .records
+            .iter()
+            .find(|r| r.anchor == ValidationAnchor::MarketClose)
+            .expect("close");
+        if case == "unlimited" {
+            assert_eq!(close.outcome, ValidationOutcome::Matched);
+            let band = close.close_price_band.as_ref().expect("projection");
+            assert_eq!(
+                band.base_raw_sequence, 3,
+                "last event 4 is a cancellation, not the range base"
+            );
+            assert_eq!(band.base_price_units, 105_000);
+            #[cfg(feature = "profiling")]
+            {
+                let (profiled, _) =
+                    qtp_core::profile_validate_market_day(&config).expect("profiling");
+                assert_eq!(
+                    serde_json::to_value(&report).expect("json"),
+                    serde_json::to_value(profiled).expect("json")
+                );
+            }
+        } else {
+            assert_eq!(close.outcome, ValidationOutcome::DataError);
+            assert!(close.close_price_band.is_none());
+        }
+        assert_eq!(report.replay.applied_events, 4);
+    }
+}
+
 #[cfg(feature = "profiling")]
 #[test]
 fn profiling_preserves_reports_and_partitions_elapsed_time() {
@@ -937,6 +1018,8 @@ fn write_sz_e0_fixture(root: &TempDir) {
         ("LowPrice".to_owned(), 10_500_000, 6),
         ("Turnover".to_owned(), 4_200_000, 4),
         ("PreCloPrice".to_owned(), 100_000, 4),
+        ("HighLimitPrice".to_owned(), 12_000_000, 6),
+        ("LowLimitPrice".to_owned(), 8_000_000, 6),
         ("WeightedAvgBidPx".to_owned(), 0, 6),
         ("WeightedAvgOfferPx".to_owned(), 11_000_000, 6),
     ];

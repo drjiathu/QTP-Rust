@@ -98,6 +98,19 @@ pub(crate) enum ObservationPoint {
 }
 
 pub(crate) trait StateObserver {
+    // Audit metadata only. Pending groups may end in a cancellation, so the
+    // final book metadata cannot identify the last successful trade's sequence.
+    fn observe_trade_with_sequence(
+        &mut self,
+        channel: u32,
+        symbol: &str,
+        _raw_sequence: u64,
+        quote_time_ns: i64,
+        price_units: i64,
+        quantity: u64,
+    ) -> Result<(), ProductionError> {
+        self.observe_trade(channel, symbol, quote_time_ns, price_units, quantity)
+    }
     fn observe_trade(
         &mut self,
         _channel: u32,
@@ -525,9 +538,10 @@ fn process_sz_channel(
                 // Close-price audit observes trades only after group success.
                 for response in &responses {
                     if response.kind == SzExecutionKind::Trade {
-                        observer.observe_trade(
+                        observer.observe_trade_with_sequence(
                             channel,
                             &row.symbol,
+                            response.sequence,
                             response.quote_time_ns,
                             response.price_units,
                             response.quantity,
@@ -765,9 +779,10 @@ fn process_sz_execution(
     apply(runtime, event, &row.symbol, row.sequence)?;
     report.observe_sz_applied_event(&row.symbol, row.quote_time_ns)?;
     if row.kind == SzExecutionKind::Trade {
-        observer.observe_trade(
+        observer.observe_trade_with_sequence(
             channel,
             &row.symbol,
+            row.sequence,
             row.quote_time_ns,
             row.price_units,
             row.quantity,
