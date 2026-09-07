@@ -222,6 +222,63 @@ fn unpriced_visible_order_is_rejected_atomically() {
 }
 
 #[test]
+fn practical_ioc_path_can_rest_temporarily_but_real_cancel_clears_it() {
+    // Deliberate limitation fixture, NOT an assertion of exact IOC placement.
+    let mut book = strict_book();
+    let first = key(Side::Sell, 1, 310);
+    let second = key(Side::Sell, 1, 311);
+    let bid = key(Side::Buy, 1, 312);
+    assert!(book.apply(add(1, 1, first, 100_000, 100)).is_ok());
+    assert!(book.apply(add(2, 2, second, 100_100, 100)).is_ok());
+    assert!(
+        book.apply(BookEvent::AddOrder(AddOrder {
+            meta: meta(3, 3),
+            order_key: bid,
+            pricing: PricingInstruction::Unpriced,
+            crossing: CrossingBehavior::RestAtLastTradePrice,
+            quantity: common::quantity(300),
+        }))
+        .is_ok()
+    );
+    assert!(
+        book.apply(trade(
+            4,
+            4,
+            OrderReference::Resolved(bid),
+            OrderReference::Resolved(first),
+            100_000,
+            100
+        ))
+        .is_ok()
+    );
+    assert!(
+        matches!(book.order(&bid), Some(o) if o.location == OrderLocation::Resting
+        && o.remaining_quantity == 200 && o.effective_price == Some(price(100_000)))
+    );
+    assert!(
+        book.apply(trade(
+            5,
+            5,
+            OrderReference::Resolved(bid),
+            OrderReference::Resolved(second),
+            100_100,
+            100
+        ))
+        .is_ok()
+    );
+    // Once resting, the legacy practical behavior does not reprice again.
+    assert!(
+        matches!(book.order(&bid), Some(o) if o.remaining_quantity == 100
+        && o.effective_price == Some(price(100_000)))
+    );
+    assert!(book.apply(cancel(6, 6, bid)).is_ok());
+    assert!(book.order(&bid).is_none());
+    assert!(book.levels(Side::Buy).is_empty());
+    assert!(book.levels(Side::Sell).is_empty());
+    assert!(book.check_invariants().is_ok());
+}
+
+#[test]
 fn unknown_trade_is_atomic_in_strict_mode() {
     let mut book = strict_book();
     let before = book.summary();

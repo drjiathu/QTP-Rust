@@ -1,5 +1,9 @@
 /target/
 
+# Local analysis caches and extracted vendor data are not source artifacts.
+/analysis/__pycache__/
+/reports/**/*.parquet
+
 *.log
 *.profraw
 

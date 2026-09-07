@@ -11,6 +11,8 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
 
 mod phases;
+#[cfg(feature = "profiling")]
+pub(crate) mod profiling;
 use phases::PhaseTracker;
 pub use phases::{PhaseAudit, PhaseIssue};
 
@@ -181,7 +183,13 @@ impl ValidationReport {
     /// A diagnostic override may have no mismatches but is not standard acceptance.
     #[must_use]
     pub const fn is_standard_acceptance(&self) -> bool {
-        self.is_success() && !self.diagnostic_window_override
+        self.is_success()
+            && self.replay.sz_pending_resolution_version == 1
+            && !self.diagnostic_window_override
+            && matches!(
+                self.replay.sz_market_order_policy,
+                super::SzMarketOrderPolicy::RequireEvidence
+            )
     }
 }
 
@@ -1190,7 +1198,7 @@ fn load_references(
             let time_ns = super::parse_market_timestamp(request.trading_day, times.value(row))?;
             let tracker = trackers
                 .entry(symbol.to_owned())
-                .or_insert_with(|| PhaseTracker::new(symbol));
+                .or_insert_with(|| PhaseTracker::new(request.market, request.trading_day, symbol));
             let references = books.entry(symbol.to_owned()).or_default();
             let Some(anchor) = tracker.observe(
                 request.market,
@@ -2205,6 +2213,38 @@ mod tests {
             Some(record) if record.outcome == ValidationOutcome::Matched
                 && record.matched_candidate_time_ms == Some(10_999)
         ));
+    }
+
+    #[test]
+    fn old_and_assumed_market_order_reports_are_not_standard_acceptance() {
+        let observer = ValidationObserver::new(Market::Szse, HashMap::new());
+        let mut report = observer.into_report(ReplayReport::default(), true);
+        report.total_anchors = 1;
+        report.comparable_anchors = 1;
+        report.matched = 1;
+        report.omitted_matched_records = 1;
+        assert!(report.is_success());
+        assert!(!report.is_standard_acceptance());
+        report.replay.sz_pending_resolution_version = 1;
+        assert!(report.is_standard_acceptance());
+        report.replay.sz_market_order_policy = crate::SzMarketOrderPolicy::AssumeContiguous;
+        assert!(!report.is_standard_acceptance());
+        report.replay.sz_market_order_policy = crate::SzMarketOrderPolicy::RestAtLastTradePrice;
+        assert!(report.is_success());
+        assert!(!report.is_standard_acceptance());
+    }
+
+    #[test]
+    fn missing_historical_policy_does_not_imply_practical_replay() {
+        let report: ReplayReport = match serde_json::from_str("{}") {
+            Ok(report) => report,
+            Err(_) => std::process::abort(),
+        };
+        assert_eq!(report.sz_pending_resolution_version, 0);
+        assert_eq!(
+            report.sz_market_order_policy,
+            crate::SzMarketOrderPolicy::RequireEvidence
+        );
     }
 
     #[test]

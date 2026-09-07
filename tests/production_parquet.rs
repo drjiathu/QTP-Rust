@@ -26,6 +26,15 @@ fn day() -> TradingDay {
 }
 
 fn write_sse_fixture(root: &TempDir, local_times: Vec<Option<&str>>) {
+    write_sse_symbol_fixture(root, local_times, "600000", "510300");
+}
+
+fn write_sse_symbol_fixture(
+    root: &TempDir,
+    local_times: Vec<Option<&str>>,
+    symbol: &str,
+    excluded_symbol: &str,
+) {
     let directory = root.path().join("raw/date=20260828/mdl_4_24_0");
     fs::create_dir_all(&directory).expect("fixture directory");
     let path = directory.join("part-0.parquet");
@@ -50,7 +59,12 @@ fn write_sse_fixture(root: &TempDir, local_times: Vec<Option<&str>>) {
         Arc::new(UInt64Array::from_iter_values([1, 2, 3, 4, 5, 6])),
         Arc::new(UInt64Array::from_iter_values([1, 1, 1, 1, 1, 1])),
         Arc::new(LargeStringArray::from_iter_values([
-            "600000", "510300", "600000", "600000", "600000", "600000",
+            symbol,
+            excluded_symbol,
+            symbol,
+            symbol,
+            symbol,
+            symbol,
         ])),
         Arc::new(LargeStringArray::from_iter_values([
             "09:20:00.000",
@@ -104,6 +118,7 @@ fn request(root: &TempDir, snapshots: Option<SnapshotSchedule>) -> MarketDayRequ
         targets: TargetUniverse::Symbols(vec![Symbol::from("600000")]),
         snapshots,
         batch_size: 2,
+        sz_market_order_policy: qtp_core::SzMarketOrderPolicy::RequireEvidence,
     }
 }
 
@@ -349,6 +364,7 @@ fn merges_shenzhen_order_and_execution_streams_by_appl_seq_num() {
             SnapshotSchedule::new(Duration::from_secs(3_600), 10).expect("snapshot schedule"),
         ),
         batch_size: 1,
+        sz_market_order_policy: qtp_core::SzMarketOrderPolicy::RequireEvidence,
     };
     let report = replay_market_day(&request).expect("Shenzhen replay succeeds");
     assert_eq!(report.input_rows, 4);
@@ -415,7 +431,46 @@ fn sz_request(root: &TempDir) -> MarketDayRequest {
         targets: TargetUniverse::Symbols(vec![Symbol::from("000001")]),
         snapshots: None,
         batch_size: 1,
+        sz_market_order_policy: qtp_core::SzMarketOrderPolicy::RequireEvidence,
     }
+}
+
+#[cfg(feature = "profiling")]
+#[test]
+fn profiling_preserves_reports_and_partitions_elapsed_time() {
+    let root = TempDir::new().expect("temporary directory");
+    write_sz_fixture(&root, [3, 4], 60);
+    write_sz_e0_fixture(&root);
+    let config = ValidationConfig {
+        request: sz_request(&root),
+        continuous_lookback: None,
+        continuous_lookahead: None,
+        retain_matched_records: true,
+        max_detail_records: None,
+    };
+    let original = validate_market_day(&config).expect("plain validation");
+    let (profiled, timings) =
+        qtp_core::profile_validate_market_day(&config).expect("profiled validation");
+    assert_eq!(
+        serde_json::to_value(original).expect("serialize"),
+        serde_json::to_value(profiled).expect("serialize")
+    );
+    assert!(timings.observation_calls > 0);
+    assert!(timings.restore_total_seconds >= 0.0);
+    assert!(timings.validation_total_seconds >= 0.0);
+    assert!(
+        (timings.profiled_total_seconds
+            - timings.restore_total_seconds
+            - timings.validation_total_seconds
+            - timings.unattributed_seconds)
+            .abs()
+            < 1e-9
+    );
+    // An invalid cancellation must remain a replay failure, not a successful
+    // timing result or a silently shortened day.
+    write_sz_fixture(&root, [3, 4], 61);
+    assert!(qtp_core::profile_validate_market_day(&config).is_err());
+    assert!(validate_market_day(&config).is_err());
 }
 
 fn rewrite_sz_columns(root: &TempDir, feed: &str, replacements: Vec<(&str, ArrayRef)>) {
@@ -434,6 +489,296 @@ fn rewrite_sz_columns(root: &TempDir, feed: &str, replacements: Vec<(&str, Array
         columns[batch.schema().index_of(name).expect("field")] = column;
     }
     write_batch_with_metadata(&path, batch.schema(), columns, feed);
+}
+
+// Ask #1, new bid #2, then bid #6. Responses to #2 are not split by batches.
+fn write_sz_pending_fixture(
+    root: &TempDir,
+    kind: i32,
+    ask_side: i32,
+    responses: &[(i64, i64, i32, i64, &str)],
+) {
+    write_sz_fixture(root, [3, 4], 60);
+    let base = root.path().join("raw/date=20260828");
+    let path = base.join("mdl_6_33_0/part-0.parquet");
+    let schema =
+        ParquetRecordBatchReaderBuilder::try_new(File::open(&path).expect("valid test fixture"))
+            .expect("valid test fixture")
+            .schema()
+            .clone();
+    write_batch_with_metadata(
+        &path,
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1; 3])),
+            Arc::new(Int64Array::from(vec![1, 2, 6])),
+            Arc::new(LargeStringArray::from(vec!["000001"; 3])),
+            Arc::new(
+                Decimal128Array::from(vec![100_000, 123_456, 100_000])
+                    .with_precision_and_scale(38, 4)
+                    .expect("valid test fixture"),
+            ),
+            Arc::new(Int64Array::from(vec![100, 300, 50])),
+            Arc::new(Int32Array::from(vec![ask_side, 49, 49])),
+            Arc::new(LargeStringArray::from(vec![
+                "09:30:00.000",
+                "10:00:00.000",
+                "10:00:00.001",
+            ])),
+            Arc::new(Int32Array::from(vec![50, kind, 50])),
+            Arc::new(LargeStringArray::from(vec!["10:00:01.999"; 3])),
+            Arc::new(UInt64Array::from(vec![1, 2, 3])),
+        ],
+        "mdl_6_33_0",
+    );
+    let path = base.join("mdl_6_36_0/part-0.parquet");
+    let schema =
+        ParquetRecordBatchReaderBuilder::try_new(File::open(&path).expect("valid test fixture"))
+            .expect("valid test fixture")
+            .schema()
+            .clone();
+    let n = responses.len();
+    write_batch_with_metadata(
+        &path,
+        schema,
+        vec![
+            Arc::new(Int32Array::from(vec![1; n])),
+            Arc::new(Int64Array::from_iter_values(responses.iter().map(|r| r.0))),
+            Arc::new(Int64Array::from(vec![2; n])),
+            Arc::new(Int64Array::from_iter_values(
+                responses.iter().map(|r| if r.2 == 70 { 1 } else { 0 }),
+            )),
+            Arc::new(LargeStringArray::from(vec!["000001"; n])),
+            Arc::new(
+                Decimal128Array::from_iter_values(responses.iter().map(|r| i128::from(r.3)))
+                    .with_precision_and_scale(38, 4)
+                    .expect("valid test fixture"),
+            ),
+            Arc::new(Int64Array::from_iter_values(responses.iter().map(|r| r.1))),
+            Arc::new(Int32Array::from_iter_values(responses.iter().map(|r| r.2))),
+            Arc::new(LargeStringArray::from_iter_values(
+                responses.iter().map(|r| r.4),
+            )),
+            Arc::new(LargeStringArray::from(vec!["10:00:02.999"; n])),
+            Arc::new(UInt64Array::from_iter_values((1..=n).map(|i| i as u64))),
+        ],
+        "mdl_6_36_0",
+    );
+}
+
+fn pending_output(root: &TempDir) -> RecordBatch {
+    ParquetRecordBatchReaderBuilder::try_new(
+        File::open(
+            root.path()
+                .join("output/date=20260828/market=SZ/channel=1/part-0.parquet"),
+        )
+        .expect("valid test fixture"),
+    )
+    .expect("valid test fixture")
+    .build()
+    .expect("valid test fixture")
+    .next()
+    .expect("valid test fixture")
+    .expect("valid test fixture")
+}
+
+#[test]
+fn pending_ioc_cancels_without_publishing_remainder_and_preserves_left_limit() {
+    let root = TempDir::new().expect("valid test fixture");
+    write_sz_pending_fixture(
+        &root,
+        49,
+        50,
+        &[
+            (3, 100, 70, 100_000, "10:00:00.000"),
+            (4, 200, 52, 0, "10:00:00.000"),
+        ],
+    );
+    let mut req = sz_request(&root);
+    req.snapshots =
+        Some(SnapshotSchedule::new(Duration::from_secs(2700), 10).expect("valid test fixture"));
+    let report = replay_market_day(&req).expect("valid test fixture");
+    assert_eq!(report.sz_pending_groups, 1);
+    assert_eq!(report.sz_inferred_market_remainders, 0);
+    assert_eq!(report.applied_events, 5);
+    let batch = pending_output(&root);
+    let bids = batch
+        .column_by_name("bid_quantity_1")
+        .expect("valid test fixture")
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("valid test fixture");
+    let asks = batch
+        .column_by_name("ask_quantity_1")
+        .expect("valid test fixture")
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("valid test fixture");
+    assert!(bids.is_null(0)); // scheduled 10:00 excludes every group event
+    assert_eq!(asks.value(0), 100);
+    assert_eq!(bids.value(batch.num_rows() - 1), 50); // only order #6 remains
+}
+
+#[test]
+fn pending_single_price_does_not_silently_enable_rest_in_strict_mode() {
+    let root = TempDir::new().expect("valid test fixture");
+    write_sz_pending_fixture(&root, 49, 50, &[(3, 100, 70, 100_000, "10:00:00.000")]);
+    let error = replay_market_day(&sz_request(&root))
+        .expect_err("must reject invalid fixture")
+        .to_string();
+    assert!(error.contains("lacks execution qualifier"), "{error}");
+}
+
+#[test]
+fn practical_market_replay_accepts_gaps_and_cross_millisecond_responses() {
+    for raw_price in [0, 123_456] {
+        for cancel in [false, true] {
+            let root = TempDir::new().expect("fixture");
+            let mut responses = vec![(4, 100, 70, 100_000, "10:00:00.001")];
+            if cancel {
+                responses.push((5, 200, 52, 0, "10:00:00.001"));
+            }
+            write_sz_pending_fixture(&root, 49, 50, &responses);
+            rewrite_sz_columns(
+                &root,
+                "mdl_6_33_0",
+                vec![(
+                    "Price",
+                    Arc::new(
+                        Decimal128Array::from(vec![100_000, raw_price, 100_000])
+                            .with_precision_and_scale(38, 4)
+                            .expect("decimal"),
+                    ),
+                )],
+            );
+            let mut req = sz_request(&root);
+            req.sz_market_order_policy = qtp_core::SzMarketOrderPolicy::RestAtLastTradePrice;
+            req.snapshots =
+                Some(SnapshotSchedule::new(Duration::from_secs(2700), 10).expect("schedule"));
+            let report = replay_market_day(&req).expect("practical replay");
+            assert_eq!(report.sz_pending_groups, 0);
+            assert_eq!(report.applied_events, if cancel { 5 } else { 4 });
+            assert_eq!(report.sz_market_order_policy, req.sz_market_order_policy);
+            let batch = pending_output(&root);
+            let bids = batch
+                .column_by_name("bid_quantity_1")
+                .expect("quantity")
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("u64");
+            assert!(bids.is_null(0)); // 10:00 left limit precedes market order.
+            assert_eq!(
+                bids.value(batch.num_rows() - 1),
+                if cancel { 50 } else { 250 }
+            );
+        }
+    }
+}
+
+#[test]
+fn practical_market_policy_does_not_relax_empty_same_side_reconciliation() {
+    let root = TempDir::new().expect("fixture");
+    write_sz_pending_fixture(&root, 85, 50, &[]);
+    let mut req = sz_request(&root);
+    req.sz_market_order_policy = qtp_core::SzMarketOrderPolicy::RestAtLastTradePrice;
+    assert!(
+        replay_market_day(&req)
+            .expect_err("empty own side")
+            .to_string()
+            .contains("same-side best")
+    );
+}
+
+#[test]
+fn diagnostic_remainder_uses_initial_best_not_protection_price() {
+    let root = TempDir::new().expect("valid test fixture");
+    write_sz_pending_fixture(&root, 49, 50, &[(3, 100, 70, 100_000, "10:00:00.000")]);
+    // An adjacent next order is required; a filtered/raw gap is not a boundary.
+    rewrite_sz_columns(
+        &root,
+        "mdl_6_33_0",
+        vec![("ApplSeqNum", Arc::new(Int64Array::from(vec![1, 2, 4])))],
+    );
+    let mut req = sz_request(&root);
+    req.snapshots =
+        Some(SnapshotSchedule::new(Duration::from_secs(2700), 10).expect("valid test fixture"));
+    req.sz_market_order_policy = qtp_core::SzMarketOrderPolicy::AssumeContiguous;
+    let report = replay_market_day(&req).expect("valid test fixture");
+    assert_eq!(report.sz_inferred_market_remainders, 1);
+    let batch = pending_output(&root);
+    let last = batch.num_rows() - 1;
+    let bids = batch
+        .column_by_name("bid_quantity_1")
+        .expect("valid test fixture")
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("valid test fixture");
+    let prices = batch
+        .column_by_name("bid_price_1")
+        .expect("valid test fixture")
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .expect("valid test fixture");
+    assert_eq!(bids.value(last), 250);
+    assert_eq!(prices.value(last), 100_000);
+}
+
+#[test]
+fn empty_same_side_requires_exact_source_cancel_and_never_lingers() {
+    for responses in [vec![], vec![(3, 300, 52, 0, "10:00:00.000")]] {
+        let root = TempDir::new().expect("valid test fixture");
+        write_sz_pending_fixture(&root, 85, 50, &responses);
+        let result = replay_market_day(&sz_request(&root));
+        if responses.is_empty() {
+            assert!(
+                result
+                    .expect_err("must reject invalid fixture")
+                    .to_string()
+                    .contains("source cancellation reconciliation")
+            );
+        } else {
+            assert_eq!(
+                result
+                    .expect("valid test fixture")
+                    .sz_empty_same_side_cancellations,
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn same_side_best_is_fixed_at_entry_and_not_raw_price() {
+    let root = TempDir::new().expect("valid test fixture");
+    write_sz_pending_fixture(&root, 85, 49, &[]);
+    let mut req = sz_request(&root);
+    req.snapshots =
+        Some(SnapshotSchedule::new(Duration::from_secs(2700), 10).expect("valid test fixture"));
+    let report = replay_market_day(&req).expect("valid test fixture");
+    assert_eq!(report.sz_pending_groups, 0);
+    let batch = pending_output(&root);
+    let bids = batch
+        .column_by_name("bid_quantity_1")
+        .expect("valid test fixture")
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("valid test fixture");
+    assert_eq!(bids.value(batch.num_rows() - 1), 450);
+}
+
+#[test]
+fn pending_cross_timestamp_and_sequence_gap_are_explicit_failures() {
+    for (sequence, time, reason) in [
+        (3, "10:00:00.001", "quote-time boundary"),
+        (4, "10:00:00.000", "non-adjacent"),
+    ] {
+        let root = TempDir::new().expect("valid test fixture");
+        write_sz_pending_fixture(&root, 49, 50, &[(sequence, 300, 52, 0, time)]);
+        let error = replay_market_day(&sz_request(&root))
+            .expect_err("must reject invalid fixture")
+            .to_string();
+        assert!(error.contains(reason), "{error}");
+    }
 }
 
 #[test]
@@ -641,18 +986,62 @@ fn write_sz_e0_fixture(root: &TempDir) {
 
 #[test]
 fn shanghai_repeated_close_checks_normalized_fields_and_keeps_first_frame() {
+    for (symbol, trading_day, predecessor) in [
+        ("600000", 20_260_828, "CCALL"),
+        ("510300", 20_260_703, "TRADE"),
+        ("510300", 20_260_706, "CCALL"),
+    ] {
+        check_shanghai_repeated_close(
+            symbol,
+            trading_day,
+            [predecessor, "CLOSE", "CLOSE"],
+            ValidationOutcome::Matched,
+        );
+    }
+}
+
+#[test]
+fn shanghai_suspended_close_is_excluded_but_missing_normal_close_is_not() {
+    for (symbol, trading_day) in [
+        ("600000", 20_260_828),
+        ("510300", 20_260_703),
+        ("510300", 20_260_706),
+    ] {
+        for statuses in [["SUSP", "SUSP", "SUSP"], ["SUSP", "CLOSE", "CLOSE"]] {
+            check_shanghai_repeated_close(
+                symbol,
+                trading_day,
+                statuses,
+                ValidationOutcome::ExcludedByStatus,
+            );
+        }
+        check_shanghai_repeated_close(
+            symbol,
+            trading_day,
+            ["SUSP", "TRADE", "CCALL"],
+            ValidationOutcome::MissingSource,
+        );
+    }
+}
+
+fn check_shanghai_repeated_close(
+    symbol: &str,
+    trading_day: u32,
+    statuses: [&str; 3],
+    expected: ValidationOutcome,
+) {
     for conflict in [false, true] {
         let root = TempDir::new().expect("temporary directory");
-        write_sse_fixture(&root, vec![Some("15:00:10.000"); 6]);
+        write_sse_symbol_fixture(&root, vec![Some("15:00:10.000"); 6], symbol, "600001");
         let mut fields = Vec::new();
         let mut columns: Vec<ArrayRef> = Vec::new();
         for (name, values) in [
-            ("SecurityID", ["600000"; 3]),
+            ("SecurityID", [symbol; 3]),
             (
                 "UpdateTime",
                 ["14:57:00.000", "15:00:01.000", "15:00:02.000"],
             ),
-            ("InstruStatus", ["CCALL", "CLOSE", "CLOSE"]),
+            ("InstruStatus", statuses),
         ] {
             fields.push(Field::new(name, DataType::LargeUtf8, false));
             columns.push(Arc::new(LargeStringArray::from_iter_values(values)));
@@ -696,6 +1085,13 @@ fn shanghai_repeated_close_checks_normalized_fields_and_keeps_first_frame() {
             }
         }
         for (name, value, scale) in decimals {
+            // Halt-only frames must not be parsed as normal book references:
+            // this intentionally has a zero ask price with positive quantity.
+            let value = if expected == ValidationOutcome::ExcludedByStatus && name == "AskPrice1" {
+                0
+            } else {
+                value
+            };
             let last = if conflict && name == "WAvgAskPri" {
                 value + 1
             } else {
@@ -716,14 +1112,33 @@ fn shanghai_repeated_close_checks_normalized_fields_and_keeps_first_frame() {
             columns,
             "MarketData",
         );
-        let report = validate_market_day(&ValidationConfig {
-            request: request(&root, None),
+        let mut req = request(&root, None);
+        req.trading_day = TradingDay::from_yyyymmdd(trading_day).expect("valid test day");
+        req.targets = TargetUniverse::Symbols(vec![Symbol::from(symbol)]);
+        if trading_day != day().as_yyyymmdd() {
+            fs::rename(
+                root.path().join("raw/date=20260828"),
+                root.path().join(format!("raw/date={trading_day}")),
+            )
+            .expect("fixture trading day");
+        }
+        let config = ValidationConfig {
+            request: req.clone(),
             continuous_lookback: None,
             continuous_lookahead: None,
             retain_matched_records: true,
             max_detail_records: None,
-        })
-        .expect("report");
+        };
+        let report = validate_market_day(&config).expect("report");
+        #[cfg(feature = "profiling")]
+        {
+            let (profiled, _) = qtp_core::profile_validate_market_day(&config)
+                .expect("profiled Shanghai validation");
+            assert_eq!(
+                serde_json::to_value(&report).expect("serialize"),
+                serde_json::to_value(profiled).expect("serialize")
+            );
+        }
         let close = report
             .records
             .iter()
@@ -731,15 +1146,23 @@ fn shanghai_repeated_close_checks_normalized_fields_and_keeps_first_frame() {
             .expect("close");
         assert_eq!(
             close.outcome,
-            if conflict {
+            if conflict && expected == ValidationOutcome::Matched {
                 ValidationOutcome::DataError
             } else {
-                ValidationOutcome::Matched
+                expected.clone()
             }
         );
+        if expected != ValidationOutcome::Matched {
+            assert!(close.reference_time_ms.is_none());
+            assert!(close.matched_candidate_raw_sequence.is_none());
+            assert!(close.differences.is_empty());
+            continue;
+        }
         assert_eq!(
             close.reference_time_ms,
-            Some(parse_market_timestamp(day(), "15:00:01.000").expect("time") / 1_000_000)
+            Some(
+                parse_market_timestamp(req.trading_day, "15:00:01.000").expect("time") / 1_000_000
+            )
         );
         if conflict {
             assert!(
@@ -1187,11 +1610,119 @@ fn rejects_invalid_shenzhen_phase_source_instead_of_silently_ignoring_it() {
 }
 
 #[test]
-fn rejects_descending_shenzhen_source_sequence() {
+fn repairs_descending_shenzhen_streams_before_two_way_merge() {
+    for feed in ["mdl_6_33_0", "mdl_6_36_0"] {
+        let root = TempDir::new().expect("temp directory");
+        write_sz_fixture(&root, [3, 4], 60);
+        let mut request = sz_request(&root);
+        request.snapshots =
+            Some(SnapshotSchedule::new(Duration::from_secs(3600), 10).expect("schedule"));
+        let baseline = replay_market_day(&request).expect("ordered baseline");
+        let output = root
+            .path()
+            .join("output/date=20260828/market=SZ/channel=1/part-0.parquet");
+        let read_output = || {
+            ParquetRecordBatchReaderBuilder::try_new(File::open(&output).expect("output"))
+                .expect("reader")
+                .build()
+                .expect("reader")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("batches")
+        };
+        let expected = read_output();
+        assert!(baseline.sz_sequence_repairs.is_empty());
+        let path = root
+            .path()
+            .join(format!("raw/date=20260828/{feed}/part-0.parquet"));
+        let mut reader = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).expect("file"))
+            .expect("reader")
+            .build()
+            .expect("reader");
+        let batch = reader.next().expect("batch").expect("batch");
+        drop(reader);
+        let indices = UInt32Array::from(vec![1, 0]);
+        let columns = batch
+            .columns()
+            .iter()
+            .map(|c| arrow::compute::take(c.as_ref(), &indices, None).expect("reorder"))
+            .collect();
+        write_batch_with_metadata(&path, batch.schema(), columns, feed);
+        request.batch_size = 1; // inversion spans Arrow batch boundaries
+        let repaired = replay_market_day(&request).expect("repaired replay");
+        assert_eq!(repaired.applied_events, baseline.applied_events);
+        assert_eq!(repaired.selected_rows, baseline.selected_rows);
+        assert_eq!(repaired.sz_sequence_regressions.len(), 1);
+        assert_eq!(repaired.sz_sequence_repairs.len(), 1);
+        assert_eq!(repaired.sz_sequence_repairs[0].natural_runs, 2);
+        assert_eq!(repaired.sz_sequence_repairs[0].rows, 2);
+        assert_eq!(read_output(), expected);
+    }
+}
+
+#[test]
+fn channel_repair_orders_multiple_symbols_before_cross_stream_execution() {
+    let root = TempDir::new().expect("temp");
+    write_sz_fixture(&root, [3, 4], 60);
+    let path = root
+        .path()
+        .join("raw/date=20260828/mdl_6_33_0/part-0.parquet");
+    let batch = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).expect("file"))
+        .expect("reader")
+        .build()
+        .expect("reader")
+        .next()
+        .expect("batch")
+        .expect("batch");
+    let indices = UInt32Array::from(vec![0, 0, 1]);
+    let mut columns: Vec<_> = batch
+        .columns()
+        .iter()
+        .map(|c| arrow::compute::take(c.as_ref(), &indices, None).expect("take"))
+        .collect();
+    for (name, array) in [
+        (
+            "ApplSeqNum",
+            Arc::new(Int64Array::from(vec![1, 5, 2])) as ArrayRef,
+        ),
+        (
+            "SecurityID",
+            Arc::new(LargeStringArray::from(vec!["000001", "000002", "000001"])),
+        ),
+        ("source_row_no", Arc::new(UInt64Array::from(vec![1, 2, 3]))),
+    ] {
+        columns[batch.schema().index_of(name).expect("column")] = array;
+    }
+    write_batch_with_metadata(&path, batch.schema(), columns, "mdl_6_33_0");
+    let mut request = sz_request(&root);
+    request.targets = TargetUniverse::AllStocksAndEtfs;
+    let report =
+        replay_market_day(&request).expect("order 2 must precede trade 3 across securities");
+    assert_eq!(report.symbols, 2);
+    assert_eq!(report.applied_events, 5);
+    assert_eq!(report.sz_sequence_regressions[0].previous_sequence, 5);
+    assert_eq!(report.sz_sequence_regressions[0].sequence, 2);
+    assert_eq!(report.sz_sequence_repairs[0].rows, 3);
+}
+
+#[test]
+fn repaired_stream_still_rejects_cross_stream_equal_sequence() {
+    let root = TempDir::new().expect("temp");
+    write_sz_fixture(&root, [3, 2], 60);
+    let error = replay_market_day(&sz_request(&root)).expect_err("equal sequence after repair");
+    assert!(
+        error
+            .to_string()
+            .contains("ambiguous Shenzhen ApplSeqNum 2")
+    );
+}
+
+#[test]
+fn native_sequence_repair_does_not_mask_invalid_order_lifecycle() {
     let root = TempDir::new().expect("temp directory");
     write_sz_fixture(&root, [4, 3], 60);
-    let error = replay_market_day(&sz_request(&root)).expect_err("descending sequence must fail");
-    assert!(error.to_string().contains("non-increasing ApplSeqNum"));
+    // Merely swapping sequence values makes cancellation precede the trade.
+    let error = replay_market_day(&sz_request(&root)).expect_err("invalid lifecycle must fail");
+    assert!(error.to_string().contains("does not equal remaining 100"));
 }
 
 #[test]

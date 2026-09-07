@@ -5,6 +5,7 @@ use std::io::{BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use super::ProductionError;
+use super::sequence::{NaturalRuns, SequenceRegression, SequenceRepair};
 
 const MAGIC: &[u8; 4] = b"QTP1";
 
@@ -117,6 +118,9 @@ impl SpoolKind {
 pub(crate) struct SpoolSet {
     root: PathBuf,
     writers: HashMap<(u32, SpoolKind), BufWriter<File>>,
+    runs: HashMap<(u32, SpoolKind), NaturalRuns>,
+    input_sequences: HashMap<(u32, SpoolKind), (u64, u64)>,
+    regressions: Vec<SequenceRegression>,
 }
 
 impl SpoolSet {
@@ -130,6 +134,9 @@ impl SpoolSet {
         Ok(Self {
             root,
             writers: HashMap::new(),
+            runs: HashMap::new(),
+            input_sequences: HashMap::new(),
+            regressions: Vec::new(),
         })
     }
 
@@ -143,6 +150,10 @@ impl SpoolSet {
     }
 
     pub(crate) fn write_sz_order(&mut self, row: &SzOrderRow) -> Result<(), ProductionError> {
+        self.runs
+            .entry((row.channel, SpoolKind::SzOrder))
+            .or_default()
+            .observe(row.channel, row.sequence)?;
         let writer = self.writer(row.channel, SpoolKind::SzOrder)?;
         write_sz_order(writer, row).map_err(|error| ProductionError::io(&self.root, error))
     }
@@ -151,17 +162,95 @@ impl SpoolSet {
         &mut self,
         row: &SzExecutionRow,
     ) -> Result<(), ProductionError> {
+        self.runs
+            .entry((row.channel, SpoolKind::SzExecution))
+            .or_default()
+            .observe(row.channel, row.sequence)?;
         let writer = self.writer(row.channel, SpoolKind::SzExecution)?;
         write_sz_execution(writer, row).map_err(|error| ProductionError::io(&self.root, error))
     }
 
     pub(crate) fn finish(mut self) -> Result<FinishedSpool, ProductionError> {
+        let root = self.root.clone();
+        self.finish_inner()
+            .map_err(|source| ProductionError::ReplayFailed {
+                spool_path: root,
+                source: Box::new(source),
+            })
+    }
+
+    fn finish_inner(&mut self) -> Result<FinishedSpool, ProductionError> {
         for writer in self.writers.values_mut() {
             writer
                 .flush()
                 .map_err(|error| ProductionError::io(&self.root, error))?;
         }
-        Ok(FinishedSpool { root: self.root })
+        self.writers.clear();
+        let audit = self.root.join("sequence-regressions.json");
+        let bytes = serde_json::to_vec_pretty(&self.regressions)
+            .map_err(|e| ProductionError::InvalidRequest(e.to_string()))?;
+        fs::write(&audit, bytes).map_err(|e| ProductionError::io(&audit, e))?;
+        let mut repaired = HashMap::new();
+        let mut repairs = Vec::new();
+        let mut keys: Vec<_> = self.runs.keys().copied().collect();
+        keys.sort_by_key(|(channel, kind)| (*channel, kind.byte()));
+        for (channel, kind) in keys {
+            // QTP1 common fields: 42 bytes; order adds 18, execution adds 33.
+            let row_bytes = match kind {
+                SpoolKind::SzOrder => 60,
+                SpoolKind::SzExecution => 75,
+                SpoolKind::Sse => unreachable!(),
+            };
+            if let Some((path, repair)) = self.runs[&(channel, kind)].repair(
+                &spool_path(&self.root, channel, kind),
+                channel,
+                kind.suffix(),
+                row_bytes,
+            )? {
+                repaired.insert((channel, kind), path);
+                repairs.push(repair);
+            }
+        }
+        Ok(FinishedSpool {
+            root: self.root.clone(),
+            repaired,
+            repairs,
+            regressions: self.regressions.clone(),
+        })
+    }
+
+    /// Scan-wide audit, before universe/time filtering. Not an ordering key.
+    pub(crate) fn observe_sz_sequence(
+        &mut self,
+        channel: u32,
+        sequence: u64,
+        source_row: u64,
+        execution: bool,
+    ) -> Result<(), ProductionError> {
+        let kind = if execution {
+            SpoolKind::SzExecution
+        } else {
+            SpoolKind::SzOrder
+        };
+        if let Some((previous, previous_row)) = self
+            .input_sequences
+            .insert((channel, kind), (sequence, source_row))
+        {
+            if sequence == previous {
+                return Err(ProductionError::AmbiguousSequence { channel, sequence });
+            }
+            if sequence < previous {
+                self.regressions.push(SequenceRegression {
+                    channel,
+                    stream: kind.suffix().to_owned(),
+                    previous_sequence: previous,
+                    sequence,
+                    previous_source_row: previous_row,
+                    source_row,
+                });
+            }
+        }
+        Ok(())
     }
 
     fn writer(
@@ -189,6 +278,9 @@ impl SpoolSet {
 #[derive(Clone, Debug)]
 pub(crate) struct FinishedSpool {
     root: PathBuf,
+    repaired: HashMap<(u32, SpoolKind), PathBuf>,
+    pub(crate) repairs: Vec<SequenceRepair>,
+    pub(crate) regressions: Vec<SequenceRegression>,
 }
 
 impl FinishedSpool {
@@ -228,7 +320,11 @@ impl FinishedSpool {
         &self,
         channel: u32,
     ) -> Result<Option<SzOrderReader>, ProductionError> {
-        let path = spool_path(&self.root, channel, SpoolKind::SzOrder);
+        let path = self
+            .repaired
+            .get(&(channel, SpoolKind::SzOrder))
+            .cloned()
+            .unwrap_or_else(|| spool_path(&self.root, channel, SpoolKind::SzOrder));
         path.exists().then(|| SzOrderReader::open(path)).transpose()
     }
 
@@ -236,7 +332,11 @@ impl FinishedSpool {
         &self,
         channel: u32,
     ) -> Result<Option<SzExecutionReader>, ProductionError> {
-        let path = spool_path(&self.root, channel, SpoolKind::SzExecution);
+        let path = self
+            .repaired
+            .get(&(channel, SpoolKind::SzExecution))
+            .cloned()
+            .unwrap_or_else(|| spool_path(&self.root, channel, SpoolKind::SzExecution));
         path.exists()
             .then(|| SzExecutionReader::open(path))
             .transpose()

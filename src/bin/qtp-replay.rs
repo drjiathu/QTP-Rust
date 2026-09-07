@@ -81,6 +81,12 @@ struct InputArgs {
     /// Arrow 每批读取行数。
     #[arg(long, default_value_t = 65_536)]
     batch_size: usize,
+    /// 深市市价策略；省略时使用 rest-at-last-trade-price。
+    #[arg(long, value_enum, conflicts_with = "assume_sz_contiguous_responses")]
+    sz_market_order_policy: Option<SzMarketOrderPolicyArg>,
+    /// 诊断用：假设深市即时成交/撤单连续发布，允许推断市价余量；不属于标准验收。
+    #[arg(long)]
+    assume_sz_contiguous_responses: bool,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -89,6 +95,23 @@ enum MarketArg {
     Sh,
     #[value(name = "SZ", alias = "sz")]
     Sz,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum SzMarketOrderPolicyArg {
+    RestAtLastTradePrice,
+    RequireEvidence,
+    AssumeContiguous,
+}
+
+impl SzMarketOrderPolicyArg {
+    const fn policy(self) -> qtp_core::SzMarketOrderPolicy {
+        match self {
+            Self::RestAtLastTradePrice => qtp_core::SzMarketOrderPolicy::RestAtLastTradePrice,
+            Self::RequireEvidence => qtp_core::SzMarketOrderPolicy::RequireEvidence,
+            Self::AssumeContiguous => qtp_core::SzMarketOrderPolicy::AssumeContiguous,
+        }
+    }
 }
 
 impl MarketArg {
@@ -189,6 +212,11 @@ impl InputArgs {
         self,
         snapshots: Option<SnapshotSchedule>,
     ) -> Result<MarketDayRequest, Box<dyn std::error::Error>> {
+        if self.market.market() != Market::Szse
+            && (self.sz_market_order_policy.is_some() || self.assume_sz_contiguous_responses)
+        {
+            return Err("SZ market-order policy is only valid for SZ requests".into());
+        }
         let trading_day = TradingDay::from_yyyymmdd(self.date)
             .ok_or_else(|| format!("invalid trading date: {}", self.date))?;
         let targets = if self.symbols.is_empty() {
@@ -211,6 +239,106 @@ impl InputArgs {
             targets,
             snapshots,
             batch_size: self.batch_size,
+            sz_market_order_policy: if self.assume_sz_contiguous_responses {
+                qtp_core::SzMarketOrderPolicy::AssumeContiguous
+            } else if let Some(policy) = self.sz_market_order_policy {
+                policy.policy()
+            } else if self.market.market() == Market::Szse {
+                qtp_core::SzMarketOrderPolicy::RestAtLastTradePrice
+            } else {
+                qtp_core::SzMarketOrderPolicy::RequireEvidence
+            },
         })
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod tests {
+    use super::*;
+
+    fn input(args: &[&str]) -> InputArgs {
+        let cli = Cli::try_parse_from(args).expect("valid CLI fixture");
+        match cli.command {
+            Command::Replay { input, .. } | Command::Validate { input, .. } => input,
+        }
+    }
+
+    #[test]
+    fn policy_defaults_are_market_specific() {
+        for (market, expected) in [
+            ("SZ", qtp_core::SzMarketOrderPolicy::RestAtLastTradePrice),
+            ("SH", qtp_core::SzMarketOrderPolicy::RequireEvidence),
+        ] {
+            let req = input(&[
+                "qtp-replay",
+                "validate",
+                "--date",
+                "20260828",
+                "--market",
+                market,
+            ])
+            .request(None)
+            .expect("request");
+            assert_eq!(req.sz_market_order_policy, expected);
+        }
+    }
+
+    #[test]
+    fn policy_options_and_legacy_alias_are_explicit() {
+        for (argument, expected) in [
+            (
+                "rest-at-last-trade-price",
+                qtp_core::SzMarketOrderPolicy::RestAtLastTradePrice,
+            ),
+            (
+                "require-evidence",
+                qtp_core::SzMarketOrderPolicy::RequireEvidence,
+            ),
+            (
+                "assume-contiguous",
+                qtp_core::SzMarketOrderPolicy::AssumeContiguous,
+            ),
+        ] {
+            let args = [
+                "qtp-replay",
+                "replay",
+                "--date",
+                "20260828",
+                "--market",
+                "SZ",
+                "--sz-market-order-policy",
+                argument,
+            ];
+            assert_eq!(
+                input(&args)
+                    .request(None)
+                    .expect("request")
+                    .sz_market_order_policy,
+                expected
+            );
+            let mut conflict = args.to_vec();
+            conflict.push("--assume-sz-contiguous-responses");
+            assert!(Cli::try_parse_from(conflict).is_err());
+            let mut sh = args;
+            sh[5] = "SH";
+            assert!(input(&sh).request(None).is_err());
+        }
+        let args = [
+            "qtp-replay",
+            "replay",
+            "--date",
+            "20260828",
+            "--market",
+            "SZ",
+            "--assume-sz-contiguous-responses",
+        ];
+        assert_eq!(
+            input(&args)
+                .request(None)
+                .expect("request")
+                .sz_market_order_policy,
+            qtp_core::SzMarketOrderPolicy::AssumeContiguous
+        );
     }
 }

@@ -24,6 +24,18 @@ use crate::production::snapshot::SnapshotCursor;
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ReplayReport {
+    /// Original-input inversions, audited before universe filtering.
+    #[serde(default)]
+    pub sz_sequence_regressions: Vec<super::SequenceRegression>,
+    /// Selected channel streams repaired before the existing two-way merge.
+    #[serde(default)]
+    pub sz_sequence_repairs: Vec<super::SequenceRepair>,
+    /// Zero in historical reports; one uses bounded pending-order resolution.
+    pub sz_pending_resolution_version: u32,
+    pub sz_market_order_policy: super::SzMarketOrderPolicy,
+    pub sz_pending_groups: u64,
+    pub sz_inferred_market_remainders: u64,
+    pub sz_empty_same_side_cancellations: u64,
     pub input_rows: u64,
     pub selected_rows: u64,
     pub excluded_rows: u64,
@@ -138,6 +150,23 @@ pub(crate) fn run_market_day_before(
     finish_spool(result, spool)
 }
 
+/// Benchmark-only phase boundaries; the default production API has no clocks.
+#[cfg(feature = "profiling")]
+pub(crate) fn profile_run_market_day(
+    request: &MarketDayRequest,
+    observer: &mut dyn StateObserver,
+) -> Result<(ReplayReport, [std::time::Duration; 3]), ProductionError> {
+    let start = std::time::Instant::now();
+    let (spool, ingest) = spool_inputs(request)?;
+    let input_elapsed = start.elapsed();
+    let start = std::time::Instant::now();
+    let result = process_spool(request, &spool, ingest, observer, true);
+    let loop_elapsed = start.elapsed();
+    let start = std::time::Instant::now();
+    let report = finish_spool(result, spool)?;
+    Ok((report, [input_elapsed, loop_elapsed, start.elapsed()]))
+}
+
 fn finish_spool(
     result: Result<ReplayReport, ProductionError>,
     spool: FinishedSpool,
@@ -162,6 +191,10 @@ fn process_spool(
     complete_day: bool,
 ) -> Result<ReplayReport, ProductionError> {
     let mut report = ReplayReport {
+        sz_sequence_regressions: spool.regressions.clone(),
+        sz_sequence_repairs: spool.repairs.clone(),
+        sz_pending_resolution_version: 1,
+        sz_market_order_policy: request.sz_market_order_policy,
         input_rows: ingest.input_rows,
         selected_rows: ingest.selected_rows,
         excluded_rows: ingest.excluded_rows,
@@ -399,20 +432,140 @@ fn process_sz_channel(
             runtime(request, &mut runtimes, &row.symbol)?
                 .resumption_times
                 .get_or_insert_with(|| resumptions.get(&row.symbol).cloned().unwrap_or_default());
-            process_sz_order(
-                request,
-                channel,
-                &row,
-                &mut runtimes,
-                writer.as_mut(),
-                observer,
-                report,
-            )?;
             order = orders
                 .as_mut()
                 .map(|reader| reader.next_row())
                 .transpose()?
                 .flatten();
+            let book = &runtime(request, &mut runtimes, &row.symbol)?.book;
+            let side = sz_side(row.side);
+            let same_best = match side {
+                Side::Buy => book.summary().best_bid,
+                Side::Sell => book.summary().best_ask,
+            };
+            if (row.kind == SzOrderKind::Market
+                && request.sz_market_order_policy
+                    != super::SzMarketOrderPolicy::RestAtLastTradePrice)
+                || (row.kind == SzOrderKind::SameSideBest && same_best.is_none())
+            {
+                let opposite_best = match side {
+                    Side::Buy => book.summary().best_ask,
+                    Side::Sell => book.summary().best_bid,
+                };
+                let mut pending = super::sz_pending::PendingOrder::new(
+                    &row,
+                    opposite_best.map(|p| p.price.units()),
+                );
+                let mut responses = Vec::new();
+                while let Some(next) = execution.as_ref() {
+                    if order.as_ref().is_some_and(|o| o.sequence == next.sequence) {
+                        return Err(ProductionError::AmbiguousSequence {
+                            channel,
+                            sequence: next.sequence,
+                        });
+                    }
+                    if pending.terminal()
+                        || order.as_ref().is_some_and(|o| o.sequence < next.sequence)
+                        || !pending.references(next)
+                    {
+                        break;
+                    }
+                    pending.observe(next)?;
+                    responses.push(
+                        execution
+                            .take()
+                            .ok_or_else(|| pending.error("missing execution cursor"))?,
+                    );
+                    execution = executions
+                        .as_mut()
+                        .map(|reader| reader.next_row())
+                        .transpose()?
+                        .flatten();
+                }
+                let next_sequence = order
+                    .as_ref()
+                    .map(|o| o.sequence)
+                    .into_iter()
+                    .chain(execution.as_ref().map(|e| e.sequence))
+                    .min();
+                let disposition = pending.finish(request.sz_market_order_policy, next_sequence)?;
+                // Classification happens before any book mutation. All responses
+                // have the order's quote time; do not expose speculative states.
+                before_row(
+                    request,
+                    channel,
+                    &row.symbol,
+                    row.quote_time_ns,
+                    runtime(request, &mut runtimes, &row.symbol)?,
+                    writer.as_mut(),
+                    observer,
+                    report,
+                )?;
+                process_sz_order(
+                    request,
+                    channel,
+                    &row,
+                    &mut runtimes,
+                    None,
+                    &mut SilentObserver,
+                    report,
+                )?;
+                for response in &responses {
+                    process_sz_execution(
+                        request,
+                        channel,
+                        response,
+                        &mut runtimes,
+                        None,
+                        &mut SilentObserver,
+                        report,
+                    )?;
+                }
+                if let super::sz_pending::Disposition::Rest(units) = disposition {
+                    let key = order_key(channel, side, row.sequence, &row.symbol, row.sequence)?;
+                    runtime(request, &mut runtimes, &row.symbol)?
+                        .book
+                        .rest_pending_order(key, price(units, &row.symbol, row.sequence)?)
+                        .map_err(|source| ProductionError::Apply {
+                            symbol: Symbol::from(row.symbol.as_str()),
+                            sequence: row.sequence,
+                            source,
+                        })?;
+                    report.sz_inferred_market_remainders += 1;
+                }
+                // Close-price audit observes trades only after group success.
+                for response in &responses {
+                    if response.kind == SzExecutionKind::Trade {
+                        observer.observe_trade(
+                            channel,
+                            &row.symbol,
+                            response.quote_time_ns,
+                            response.price_units,
+                            response.quantity,
+                        )?;
+                    }
+                }
+                report.sz_pending_groups += 1;
+                if row.kind == SzOrderKind::SameSideBest {
+                    report.sz_empty_same_side_cancellations += 1;
+                }
+                observer.observe(
+                    channel,
+                    &row.symbol,
+                    &runtime(request, &mut runtimes, &row.symbol)?.book,
+                    ObservationPoint::AfterEvent(row.quote_time_ns),
+                )?;
+            } else {
+                process_sz_order(
+                    request,
+                    channel,
+                    &row,
+                    &mut runtimes,
+                    writer.as_mut(),
+                    observer,
+                    report,
+                )?;
+            }
         } else {
             let row = execution.take().ok_or_else(|| {
                 ProductionError::InvalidRequest("missing Shenzhen execution cursor".to_owned())
@@ -455,6 +608,20 @@ fn process_sz_channel(
     Ok(())
 }
 
+struct SilentObserver;
+
+impl StateObserver for SilentObserver {
+    fn observe(
+        &mut self,
+        _channel: u32,
+        _symbol: &str,
+        _book: &OrderBook,
+        _point: ObservationPoint,
+    ) -> Result<(), ProductionError> {
+        Ok(())
+    }
+}
+
 fn process_sz_order(
     request: &MarketDayRequest,
     channel: u32,
@@ -482,9 +649,6 @@ fn process_sz_order(
         Side::Sell => runtime.book.summary().best_ask.is_some(),
     };
     let pricing = match row.kind {
-        SzOrderKind::Market if row.price_units > 0 => {
-            PricingInstruction::Provided(price(row.price_units, &row.symbol, row.sequence)?)
-        }
         SzOrderKind::Market => PricingInstruction::Unpriced,
         SzOrderKind::Limit => {
             PricingInstruction::Provided(price(row.price_units, &row.symbol, row.sequence)?)
@@ -498,8 +662,15 @@ fn process_sz_order(
             .as_ref()
             .is_some_and(|times| times.contains(&row.quote_time_ns));
     let crossing = match row.kind {
-        SzOrderKind::Market => CrossingBehavior::RestAtLastTradePrice,
+        SzOrderKind::Market
+            if request.sz_market_order_policy
+                == super::SzMarketOrderPolicy::RestAtLastTradePrice =>
+        {
+            CrossingBehavior::RestAtLastTradePrice
+        }
+        SzOrderKind::Market => CrossingBehavior::AlwaysHide,
         SzOrderKind::SameSideBest if !same_side_price_available => CrossingBehavior::AlwaysHide,
+        SzOrderKind::SameSideBest => CrossingBehavior::Rest,
         // The source flushes pre-resumption limit orders at this exact timestamp.
         // They may cross before the auction trades arrive. A hidden order that
         // never trades would otherwise remain invisible for its entire lifetime.

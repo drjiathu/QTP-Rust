@@ -279,7 +279,6 @@ fn ingest_sz_orders(
     quote_time_exclusive: Option<i64>,
 ) -> Result<(), ProductionError> {
     let path = raw_path(request, "mdl_6_33_0");
-    let mut last_sequences = HashMap::new();
     for batch in read_batches(&path, request.batch_size, "SZ", "mdl_6_33_0")? {
         let batch = batch.map_err(|source| ProductionError::Arrow {
             context: "raw Parquet batch",
@@ -301,13 +300,7 @@ fn ingest_sz_orders(
             let source_row = required_u64(&path, source_rows, index, "source_row_no", 0)?;
             let channel = positive_i32_u32(&path, channels, index, source_row, "ChannelNo")?;
             let sequence = positive_i64_u64(&path, sequences, index, source_row, "ApplSeqNum")?;
-            validate_sequence(
-                &mut last_sequences,
-                Market::Szse,
-                channel,
-                sequence,
-                "ApplSeqNum",
-            )?;
+            spool.observe_sz_sequence(channel, sequence, source_row, false)?;
             let symbol = required_str(&path, symbols, index, "SecurityID", source_row)?;
             if !is_supported_symbol(Market::Szse, symbol) {
                 stats.excluded_rows += 1;
@@ -389,7 +382,6 @@ fn ingest_sz_executions(
     quote_time_exclusive: Option<i64>,
 ) -> Result<(), ProductionError> {
     let path = raw_path(request, "mdl_6_36_0");
-    let mut last_sequences = HashMap::new();
     for batch in read_batches(&path, request.batch_size, "SZ", "mdl_6_36_0")? {
         let batch = batch.map_err(|source| ProductionError::Arrow {
             context: "raw Parquet batch",
@@ -412,13 +404,7 @@ fn ingest_sz_executions(
             let source_row = required_u64(&path, source_rows, index, "source_row_no", 0)?;
             let channel = positive_i32_u32(&path, channels, index, source_row, "ChannelNo")?;
             let sequence = positive_i64_u64(&path, sequences, index, source_row, "ApplSeqNum")?;
-            validate_sequence(
-                &mut last_sequences,
-                Market::Szse,
-                channel,
-                sequence,
-                "ApplSeqNum",
-            )?;
+            spool.observe_sz_sequence(channel, sequence, source_row, true)?;
             let symbol = required_str(&path, symbols, index, "SecurityID", source_row)?;
             if !is_supported_symbol(Market::Szse, symbol) {
                 stats.excluded_rows += 1;

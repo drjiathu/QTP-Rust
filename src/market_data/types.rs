@@ -329,7 +329,8 @@ pub enum CrossingBehavior {
     /// Start as an aggressive hidden order, then price any unfilled remainder
     /// at the latest trade price and let it rest once it no longer crosses.
     ///
-    /// Shenzhen `OrdType='1'` market orders use this market-to-limit behavior.
+    /// Legacy/explicit market-to-limit behavior, not a generic Shenzhen market
+    /// order rule. Production SZ replay resolves pending responses separately.
     RestAtLastTradePrice,
     /// Keep the order out of visible depth for its entire lifetime.
     AlwaysHide,

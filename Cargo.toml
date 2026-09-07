@@ -13,6 +13,13 @@ publish = false
 name = "qtp_core"
 path = "src/lib.rs"
 
+[features]
+profiling = []
+
+[[example]]
+name = "validation_benchmark"
+required-features = ["profiling"]
+
 [dependencies]
 arrow = { version = "56.2", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std"] }

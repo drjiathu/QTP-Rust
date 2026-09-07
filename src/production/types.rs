@@ -102,6 +102,21 @@ impl SnapshotSchedule {
     }
 }
 
+/// How to handle market remainders when the source omits execution qualifiers.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SzMarketOrderPolicy {
+    /// Practical replay: hidden orders rest at their own latest execution price
+    /// once they no longer cross. Does not certify exact intermediate states.
+    RestAtLastTradePrice,
+    /// Reject remainders whose disposition cannot be established from the feed.
+    #[default]
+    RequireEvidence,
+    /// Diagnostic only: assume one order's immediate responses are contiguous.
+    /// This is not a verified Tonglian protocol guarantee.
+    AssumeContiguous,
+}
+
 #[derive(Clone, Debug)]
 pub struct MarketDayRequest {
     pub raw_root: PathBuf,
@@ -112,10 +127,16 @@ pub struct MarketDayRequest {
     pub targets: TargetUniverse,
     pub snapshots: Option<SnapshotSchedule>,
     pub batch_size: usize,
+    pub sz_market_order_policy: SzMarketOrderPolicy,
 }
 
 impl MarketDayRequest {
     pub fn validate(&self) -> Result<(), String> {
+        if self.market != Market::Szse
+            && self.sz_market_order_policy != SzMarketOrderPolicy::RequireEvidence
+        {
+            return Err("SZ market-order policy is only valid for SZ requests".to_owned());
+        }
         if self.batch_size == 0 {
             return Err("batch size must be positive".to_owned());
         }

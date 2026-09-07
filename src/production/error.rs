@@ -6,6 +6,16 @@ use crate::{BookError, Market, Symbol};
 
 #[derive(Debug, Error)]
 pub enum ProductionError {
+    #[error(
+        "unresolved Shenzhen order {order_sequence} for {symbol} in channel {channel} after sequence {last_sequence}: {detail}"
+    )]
+    UnresolvedSzOrder {
+        symbol: String,
+        channel: u32,
+        order_sequence: u64,
+        last_sequence: u64,
+        detail: String,
+    },
     #[error("I/O error at {path}: {source}")]
     Io {
         path: PathBuf,

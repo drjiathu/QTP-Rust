@@ -1,5 +1,11 @@
 # 20260828 真实数据验证基线
 
+> 算法版本提示：下述全量运行基于提交 `04e3e43` 的市价余量策略。后续新增的
+> [深市待决订单解析](sz-order-replay.md) 的严格模式不能直接继承这批结果。当前 CLI 已
+> 恢复默认实用市价策略，其 [20260828 独立全量重跑](../reports/20260906-rest-at-last-trade-full/)
+> 已完成；20260601、20260706、20260806 的[最新跨日期批次](../reports/20260906-latest-cross-date-full/)
+> 另行记录。下述旧结果保留用于回归比较，不替代新二进制验证或逐订单生命周期验收。
+
 本文汇总交易日 `20260828` 在当前有效口径下已有的验证证据。它记录“做过什么、
 结果如何、证据边界在哪里”，不重复定义匹配规则，也不把多轮结果合并冒充一次新的全量
 运行。
@@ -112,6 +118,9 @@ target/release/qtp-replay validate --date 20260828 --market SZ --include-etfs \
 
 ## 历史沪市结果
 
+本节及下节仅保留历史结论。对应旧报告已于 2026-09-05 清理，不再作为当前验收入口；
+现存报告清单见 [reports/README.md](../reports/README.md)，正式结果以上文独立全量重跑为准。
+
 原始全量运行使用旧的 `[T,T+1s)` 盘中候选窗口；随后对它的全部 30,726 条失败帧采用
 目标窗口 `[T-1s,T+1s)` 无遗漏复验。由于新窗口包含旧窗口，旧有成功帧不会退化，以下
 结果是“原全量成功集合 + 全部失败集合复验”的合并证据，不表述成扩窗后重新进行的一次
@@ -130,11 +139,7 @@ target/release/qtp-replay validate --date 20260828 --market SZ --include-etfs \
 `513100/513300/513310/513500/513870` 缺少正常 `OCALL → TRADE` PreOpen，不是恢复
 状态不一致。
 
-主要证据：
-
-- `reports/20260828-sh-raw-full-summary.json`
-- `reports/20260828-sh-expanded-window-failures-only.json`
-- `reports/20260828-sh-raw-full-validation.json`
+历史证据名称和调查过程见[调查归档](archive/real-data-validation-20260828-investigation.md)。
 
 ## 历史深市结果
 
@@ -154,11 +159,7 @@ target/release/qtp-replay validate --date 20260828 --market SZ --include-etfs \
 创业板 1,403 只证券在 `[T,T+3s)` 下共 5,311,208 条 `T0` 全部匹配。创业板运行连同
 PreOpen 和 MarketClose 共 5,314,014 个可比锚点，全部匹配。
 
-主要证据：
-
-- `reports/20260828-sz-stocks-strict-window-summary.json`
-- `reports/20260828-sz-chinext-three-second-full-summary.json`
-- `reports/20260828-sz-e0-stock-reconciliation.json`
+历史分组实验及逐订单对账结论见[调查归档](archive/real-data-validation-20260828-investigation.md)。
 
 ### ETF
 
@@ -175,10 +176,7 @@ PreOpen 和 MarketClose 共 5,314,014 个可比锚点，全部匹配。
 和最终 `E0` 已恢复为正常匹配。29 个没有收盘集合竞价成交的 ETF 使用独立的一分钟
 VWAP 收盘价规则匹配，并保留 `SZ_ETF_AVG_CLOSE_PRICE` 标签。
 
-主要证据：
-
-- `reports/20260828-sz-all-etfs-resumption-fixed-summary.json`
-- `reports/20260828-sz-etf-e0-close-price-reconciliation.json`
+历史复牌修复及收盘价对账结论见[调查归档](archive/real-data-validation-20260828-investigation.md)。
 
 ### 汇总边界
 
@@ -202,9 +200,8 @@ VWAP 收盘价规则匹配，并保留 `SZ_ETF_AVG_CLOSE_PRICE` 标签。
 
 - 目前证据主要集中在 `20260828`。其他日期只完成过部分输入时间上界和数据质量抽检，
   不能视为跨日期全量一致性验收。
-- 深市 `OrdType='U'` 在本方盘口为空时，交易所语义是自动撤销；当前
-  `Unpriced + AlwaysHide` 仅维持可见快照，不是最终的订单生命周期实现。修复后仍需补充
-  逐订单测试和真实数据回归。
+- 深市空簿 `OrdType='U'` 已改为源撤单对账，不再无限期隐藏；当前仅支持同毫秒相邻
+  的完整撤单，其他发布方式须先核对来源契约。新待决算法尚需真实数据回归。
 - 深市完整单日 E0 边界是当前实现；若成功应用 `quote_time >15:00:00.000` 的事件，必须
   单独确认业务阶段，不能直接把盘后状态宣称为 E0 验收通过。
 

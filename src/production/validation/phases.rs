@@ -3,9 +3,13 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Market;
+use crate::{Market, TradingDay};
 
-use super::{ValidationAnchor, anchor_text};
+use super::{ValidationAnchor, anchor_text, is_etf_symbol};
+
+// SSE funds switched from continuous closing trading to a closing auction on
+// this trading day (inclusive). Stocks already used the closing auction.
+const SH_ETF_CLOSING_AUCTION_START: u32 = 20_260_706;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PhaseIssue {
@@ -17,6 +21,7 @@ pub struct PhaseIssue {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::*;
 
@@ -24,7 +29,20 @@ mod tests {
         market: Market,
         rows: &[(&str, i64)],
     ) -> (PhaseAudit, Vec<Option<ValidationAnchor>>) {
-        let mut tracker = PhaseTracker::new("test");
+        sequence_for(market, 20_260_828, "test", rows)
+    }
+
+    fn sequence_for(
+        market: Market,
+        day: u32,
+        symbol: &str,
+        rows: &[(&str, i64)],
+    ) -> (PhaseAudit, Vec<Option<ValidationAnchor>>) {
+        let mut tracker = PhaseTracker::new(
+            market,
+            TradingDay::from_yyyymmdd(day).expect("valid test day"),
+            symbol,
+        );
         let actions = rows
             .iter()
             .enumerate()
@@ -131,7 +149,12 @@ mod tests {
             Market::Sse,
             &[("CCALL", 300), ("SUSP", 301), ("CLOSE", 302)],
         );
-        assert!(audit.issue(ValidationAnchor::MarketClose).is_some());
+        assert!(audit.issue(ValidationAnchor::MarketClose).is_none());
+        assert!(
+            audit
+                .excluded_reason(ValidationAnchor::MarketClose)
+                .is_some()
+        );
     }
 
     #[test]
@@ -160,11 +183,130 @@ mod tests {
     #[test]
     fn reference_regression_and_duplicate_source_row_are_not_sorted_away() {
         for position in [(5, 2), (10, 1)] {
-            let mut tracker = PhaseTracker::new("000001");
+            let mut tracker = PhaseTracker::new(
+                Market::Szse,
+                TradingDay::from_yyyymmdd(20_260_828).expect("valid test day"),
+                "000001",
+            );
             tracker.observe(Market::Szse, (10, 1), "O0", 100, 200);
             tracker.observe(Market::Szse, position, "B0", 100, 200);
             assert_eq!(tracker.audit.issues.len(), 3);
         }
+    }
+
+    #[test]
+    fn sh_etf_close_policy_changes_on_effective_day_but_stock_policy_does_not() {
+        for day in [20_260_601, 20_260_703, 20_260_706, 20_260_707, 20_260_828] {
+            for symbol in ["510300", "513100", "588000", "600000", "688981"] {
+                let historical_etf =
+                    day < SH_ETF_CLOSING_AUCTION_START && is_etf_symbol(Market::Sse, symbol);
+                for predecessor in ["TRADE", "CCALL"] {
+                    let (audit, actions) = sequence_for(
+                        Market::Sse,
+                        day,
+                        symbol,
+                        &[(predecessor, 300), ("CLOSE", 301), ("CLOSE", 302)],
+                    );
+                    let valid = (predecessor == "TRADE") == historical_etf;
+                    assert_eq!(actions[1].is_some(), valid, "{day} {symbol} {predecessor}");
+                    assert_eq!(actions[2].is_some(), valid, "repeated CLOSE");
+                    assert_eq!(audit.issue(ValidationAnchor::MarketClose).is_none(), valid);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn historical_sh_etf_close_requires_uninterrupted_continuous_trading() {
+        for rows in [
+            vec![("CLOSE", 300)],
+            vec![("OCALL", 90), ("TRADE", 100), ("CLOSE", 300)],
+            vec![("TRADE", 200), ("ENDTR", 250), ("CLOSE", 300)],
+        ] {
+            let (audit, actions) = sequence_for(Market::Sse, 20_260_703, "510300", &rows);
+            assert_eq!(actions.last(), Some(&None));
+            assert!(audit.issue(ValidationAnchor::MarketClose).is_some());
+        }
+        // A prior halt does not invalidate normal trading after resumption.
+        let (audit, actions) = sequence_for(
+            Market::Sse,
+            20_260_703,
+            "513100",
+            &[("SUSP", 100), ("TRADE", 250), ("CLOSE", 300)],
+        );
+        assert_eq!(actions[2], Some(ValidationAnchor::MarketClose));
+        assert!(audit.issues.is_empty());
+    }
+
+    #[test]
+    fn sz_etf_close_is_not_affected_by_sh_effective_day() {
+        for day in [20_260_703, 20_260_706] {
+            let (audit, actions) = sequence_for(
+                Market::Szse,
+                day,
+                "159915",
+                &[("T0", 200), ("C0", 250), ("E0", 300), ("E0", 301)],
+            );
+            assert!(audit.issues.is_empty());
+            assert_eq!(actions[2], Some(ValidationAnchor::MarketClose));
+            assert_eq!(actions[3], Some(ValidationAnchor::MarketClose));
+        }
+    }
+
+    #[test]
+    fn sh_suspension_excludes_close_without_inventing_a_normal_transition() {
+        let close = 200 + 19_800_000_000_000;
+        for (day, symbol) in [
+            (20_260_601, "560000"),
+            (20_260_706, "560000"),
+            (20_260_601, "603721"),
+        ] {
+            for rows in [
+                vec![("SUSP", 90), ("SUSP", 210), ("SUSP", close)],
+                vec![
+                    ("SUSP", 90),
+                    ("SUSP", 210),
+                    ("CLOSE", close),
+                    ("CLOSE", close + 1),
+                    ("ENDTR", close + 2),
+                ],
+                vec![("TRADE", 200), ("SUSP", 210), ("CLOSE", close)],
+            ] {
+                let (audit, actions) = sequence_for(Market::Sse, day, symbol, &rows);
+                assert!(!actions.contains(&Some(ValidationAnchor::MarketClose)));
+                assert!(audit.issue(ValidationAnchor::MarketClose).is_none());
+                assert!(
+                    audit
+                        .excluded_reason(ValidationAnchor::MarketClose)
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn sh_early_halt_or_normal_auction_does_not_hide_missing_close() {
+        let close = 200 + 19_800_000_000_000;
+        for rows in [
+            vec![("SUSP", 90), ("SUSP", 210)],
+            vec![("SUSP", 90), ("TRADE", 210), ("CCALL", 300)],
+            vec![("CCALL", 300)],
+            vec![("SUSP", close), ("TRADE", close + 1), ("CCALL", close + 2)],
+            vec![("CCALL", 250), ("SUSP", 260), ("CCALL", 270)],
+        ] {
+            let (audit, _) = sequence(Market::Sse, &rows);
+            assert!(
+                audit
+                    .excluded_reason(ValidationAnchor::MarketClose)
+                    .is_none()
+            );
+        }
+        let (audit, actions) = sequence(
+            Market::Sse,
+            &[("SUSP", 90), ("TRADE", 210), ("CCALL", 300), ("CLOSE", 301)],
+        );
+        assert_eq!(actions[3], Some(ValidationAnchor::MarketClose));
+        assert!(audit.issue(ValidationAnchor::MarketClose).is_none());
     }
 }
 
@@ -193,6 +335,7 @@ impl PhaseAudit {
 #[derive(Default)]
 pub(super) struct PhaseTracker {
     pub audit: PhaseAudit,
+    sh_continuous_close: bool,
     last_position: Option<(i64, u64)>,
     last_status: Option<String>,
     opening: bool,
@@ -202,11 +345,15 @@ pub(super) struct PhaseTracker {
     closing: bool,
     closing_valid: bool,
     closed: bool,
+    sh_suspended: bool,
 }
 
 impl PhaseTracker {
-    pub fn new(symbol: &str) -> Self {
+    pub fn new(market: Market, trading_day: TradingDay, symbol: &str) -> Self {
         Self {
+            sh_continuous_close: market == Market::Sse
+                && is_etf_symbol(market, symbol)
+                && trading_day.as_yyyymmdd() < SH_ETF_CLOSING_AUCTION_START,
             audit: PhaseAudit {
                 symbol: symbol.to_owned(),
                 ..PhaseAudit::default()
@@ -300,6 +447,14 @@ impl PhaseTracker {
         continuous: i64,
     ) -> Option<ValidationAnchor> {
         use ValidationAnchor::{ContinuousTrading, MarketClose, PreOpen};
+        if matches!(status, "OCALL" | "TRADE" | "CCALL") {
+            self.sh_suspended = false;
+            // A resumed normal phase must not inherit an old halt exemption
+            // when its own required closing reference is missing.
+            self.audit
+                .excluded_phase_reasons
+                .remove(anchor_text(MarketClose));
+        }
         match status {
             "OCALL" if !self.traded && !self.closing && !self.closed => {
                 self.opening = true;
@@ -347,9 +502,21 @@ impl PhaseTracker {
             }
             "CCALL" => self.error(MarketClose, pos, status, "CCALL after CLOSE"),
             "CLOSE" => {
-                if self.closing_valid
-                    && matches!(self.last_status.as_deref(), Some("CCALL" | "CLOSE"))
-                {
+                // Suspended CLOSE (including repeats) is not a normal closing
+                // reference. Do not parse its book fields or require CCALL.
+                if self.sh_suspended {
+                    self.closed = true;
+                    self.exclude(MarketClose, "SUSP");
+                    return None;
+                }
+                let valid_transition = if self.sh_continuous_close {
+                    (self.traded && !self.closing && self.last_status.as_deref() == Some("TRADE"))
+                        || (self.closed && self.last_status.as_deref() == Some("CLOSE"))
+                } else {
+                    self.closing_valid
+                        && matches!(self.last_status.as_deref(), Some("CCALL" | "CLOSE"))
+                };
+                if valid_transition {
                     self.closed = true;
                     return Some(MarketClose);
                 }
@@ -357,12 +524,21 @@ impl PhaseTracker {
                     MarketClose,
                     pos,
                     status,
-                    "CLOSE has no uninterrupted CCALL transition",
+                    if self.sh_continuous_close {
+                        "historical SH ETF CLOSE has no uninterrupted continuous TRADE transition"
+                    } else {
+                        "CLOSE has no uninterrupted CCALL transition"
+                    },
                 );
             }
             "START" | "ENDTR" => {}
             _ => {
-                let anchor = if self.closing || self.closed {
+                self.sh_suspended = status == "SUSP";
+                // 15:00 is only evidence for suspension coverage here; it does
+                // not select a normal CLOSE frame or cut off tick replay.
+                let suspended_at_close =
+                    self.sh_suspended && pos.0 >= continuous + 19_800_000_000_000;
+                let anchor = if self.closing || self.closed || suspended_at_close {
                     MarketClose
                 } else if pos.0 < continuous {
                     PreOpen

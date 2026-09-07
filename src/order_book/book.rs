@@ -133,6 +133,44 @@ impl OrderBook {
         Ok(outcome)
     }
 
+    /// Adapter-only completion of a buffered execution group. No synthetic raw
+    /// event or clock update: the group's last real event remains the metadata.
+    pub(crate) fn rest_pending_order(
+        &mut self,
+        key: OrderKey,
+        price: Price,
+    ) -> Result<(), BookError> {
+        let handle = *self
+            .active_by_key
+            .get(&key)
+            .ok_or(BookError::UnknownCancellation(key))?;
+        let state = self
+            .orders
+            .get(handle)
+            .ok_or(BookError::InvariantViolation("missing pending order"))?;
+        if state.location != OrderLocation::Aggressive || state.allow_reentry {
+            return Err(BookError::InvariantViolation(
+                "order is not explicitly pending",
+            ));
+        }
+        if self.crosses_opposite(key.side, price) {
+            return Err(BookError::InvariantViolation(
+                "pending remainder still crosses",
+            ));
+        }
+        let attach = self.validate_attach(key.side, price, state.remaining_quantity)?;
+        let state = self
+            .orders
+            .get_mut(handle)
+            .ok_or(BookError::InvariantViolation("missing pending order"))?;
+        state.effective_price = Some(price);
+        state.location = OrderLocation::Resting;
+        state.previous = attach.previous;
+        self.commit_attach(key.side, price, handle, attach);
+        debug_assert!(self.check_invariants().is_ok());
+        Ok(())
+    }
+
     fn validate_meta(&self, meta: &EventMeta) -> Result<(), BookError> {
         if meta.book_key != self.config.book_key {
             return Err(BookError::BookKeyMismatch {
@@ -881,5 +919,82 @@ fn order_view(state: &OrderState) -> OrderView {
         original_quantity: state.original_quantity,
         remaining_quantity: state.remaining_quantity,
         location: state.location,
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod pending_tests {
+    use super::*;
+    use crate::{
+        ChannelId, LocalTimestampNs, Market, OrderId, Quantity, QuoteTimestampNs, RawSequence,
+        Symbol, TradingDay,
+    };
+
+    #[test]
+    fn explicit_pending_rest_preserves_metadata_fifo_and_failure_atomicity() {
+        let book_key = BookKey {
+            market: Market::Szse,
+            symbol: Symbol::from("000001"),
+            trading_day: TradingDay::from_yyyymmdd(20_260_828).expect("date"),
+        };
+        let mut book = OrderBook::new(BookConfig::new(
+            book_key.clone(),
+            PriceScale::from_decimal_places(4).expect("scale"),
+        ));
+        let key = |side, id| OrderKey {
+            side,
+            channel_id: ChannelId::new(1).expect("channel"),
+            order_id: OrderId::new(id).expect("id"),
+        };
+        let meta = |n| EventMeta {
+            book_key: book_key.clone(),
+            raw_sequence: RawSequence::new(n).expect("raw"),
+            apply_sequence: ApplySequence::new(n).expect("apply"),
+            local_time: LocalTimestampNs::from_nanos(7),
+            quote_time: QuoteTimestampNs::from_nanos(6),
+        };
+        let p = Price::from_units(100_000).expect("price");
+        let add = |n, k, crossing| {
+            BookEvent::AddOrder(AddOrder {
+                meta: meta(n),
+                order_key: k,
+                pricing: PricingInstruction::Provided(p),
+                crossing,
+                quantity: Quantity::new(10).expect("quantity"),
+            })
+        };
+        let first = key(Side::Buy, 1);
+        let pending = key(Side::Buy, 2);
+        let ask = key(Side::Sell, 3);
+        book.apply(add(1, first, CrossingBehavior::Rest))
+            .expect("first");
+        book.apply(add(2, pending, CrossingBehavior::AlwaysHide))
+            .expect("pending");
+        book.apply(add(3, ask, CrossingBehavior::Rest))
+            .expect("ask");
+        let before = format!("{book:?}");
+        assert!(book.rest_pending_order(pending, p).is_err());
+        assert_eq!(format!("{book:?}"), before);
+        book.apply(BookEvent::OrderCancel(OrderCancel {
+            meta: meta(4),
+            order_key: ask,
+        }))
+        .expect("cancel");
+        let last_meta = book.last_applied_meta().cloned();
+        book.rest_pending_order(pending, p).expect("rest");
+        assert_eq!(book.last_applied_meta(), last_meta.as_ref());
+        let later = key(Side::Buy, 5);
+        book.apply(add(5, later, CrossingBehavior::Rest))
+            .expect("later");
+        assert_eq!(
+            book.orders_at(Side::Buy, p)
+                .iter()
+                .map(|o| o.key)
+                .collect::<Vec<_>>(),
+            [first, pending, later]
+        );
+        assert_eq!(book.levels(Side::Buy)[0].total_quantity, 30);
+        assert!(book.check_invariants().is_ok());
     }
 }
