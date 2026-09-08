@@ -297,7 +297,10 @@ def summarize(manifest):
     ]
     for row in rows:
         c, t = row.get("counts", {}), row.get("timing_summary", {})
-        fmt = lambda value: f"{value:.2f}" if value is not None else "—"
+
+        def fmt(value):
+            return f"{value:.2f}" if value is not None else "—"
+
         values = [
             row["date"],
             row["market"],
