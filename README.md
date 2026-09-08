@@ -25,12 +25,8 @@ target/release/qtp-replay validate \
 
 ## 验证基线与边界
 
-包版本为 `0.1.0`，历史全量验证代码对应提交 `f3f77c0`（重写前 `73adb97`）。
-两批同一冻结二进制覆盖 15 个日期、
-30 个沪深任务；全部可比股票／ETF snapshot 匹配，停牌排除单列。
-接口退役后的独立二进制另完成 20260828 两市全量重跑，26,224,341 个可比项全部匹配，
-23 个状态排除项单列；不与旧版本统计混加。版本指纹、范围、结果和耗时见
-[验证基线](docs/real-data-validation.md)。
+已完成历史十五日验证及接口退役后的 20260828 回归，可比股票／ETF snapshot 均匹配，
+停牌排除单列。不同版本的指纹、覆盖范围和耗时统一维护在[验证基线](docs/real-data-validation.md)。
 
 深市 CLI 默认 RestAtLastTradePrice：市价单先隐藏，按自身实际成交价更新隐藏余量，
 不再穿越时入簿，入簿后不重定价。限价单直接入簿，本方最优一次定价。
@@ -48,28 +44,18 @@ Rust 枚举默认 RequireEvidence，与 CLI 默认不同，见[实现说明](doc
 这是样本核验结论，不推广为所有来源的统一保护价公式。
 
 因此保留四位精度，不降为 100 或 1000。生产逐笔及 raw snapshot 的 Decimal128
-直接整数转换，不经 Float64；成交额以 `u128` 累计并检查溢出。旧 QTP f64 输入接口已移除。
+直接整数转换，不经 Float64；成交额以 `u128` 累计并检查溢出。
 
-## 文档与代码
-
-旧 QTP legacy 公共接口和 C++ oracle 已移除；生产回放与共享核心保留，
-固定 golden 和 Rust 回归测试继续维护，无需 C++ 工具链。
-这是未发布的破坏性 API 变更；接口退役后验收单独存证，不自动继承历史十五日覆盖。
+## 文档与开发
 
 [文档索引](docs/README.md)分为四份正文：使用手册、实现说明、验收规范、验证基线。
 [验收规范](docs/snapshot-validation-rules.md)是匹配规则的唯一来源，PDF 与历史归档仅作参考。
 
-```text
-src/market_data/       共享标量、核心强类型事件
-src/order_book/        价位、FIFO、失败原子性、统计与只读查询
-src/production/        Parquet、通道修复／回放、截面与验证
-src/bin/qtp-replay.rs  CLI 入口
-tests/                单元外的集成、属性、固定 golden 回归
-examples/             回放与验证性能测量
-reports/              本地验证证据（Git 忽略，不随克隆提供）
-analysis/             当前分析入口
-```
+模块职责见[实现说明](docs/order-book-implementation.md)，分析工具见 [analysis/](analysis/README.md)。
+详细报告 `reports/` 和分析 notebook 仅本地保存，不随 Git 克隆提供。
 
 开发检查和贡献流程见 [CONTRIBUTING](CONTRIBUTING.md)，变化记录见 [CHANGELOG](CHANGELOG.md)，
-安全问题按 [SECURITY](SECURITY.md) 报告。许可证为 [LGPL-3.0-only](LICENSE)，
-组合条款见 [COPYING](COPYING)、[COPYING.LESSER](COPYING.LESSER)，来源见 [NOTICE](NOTICE)。
+安全问题按 [SECURITY](SECURITY.md) 报告。
+
+许可证为 [LGPL-3.0-only](LICENSE)：[LICENSE](LICENSE) 保存 LGPL v3 补充许可，
+[COPYING](COPYING) 保存其引用的 GPL v3 全文，两者共同组成完整条款。来源声明见 [NOTICE](NOTICE)。

@@ -17,6 +17,8 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Simplified root documentation and removed the duplicate `COPYING.LESSER` copy;
+  `LICENSE` and `COPYING` retain the complete LGPL/GPL terms unchanged.
 - Renamed the golden fixture directory to `tests/fixtures/golden` and split the
   two scenarios into independent Rust tests and expected files, preserving all
   event sequences, checkpoint labels and expected values.
