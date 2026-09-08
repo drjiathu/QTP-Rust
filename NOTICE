@@ -1,10 +1,12 @@
-QTP-Rust
+# QTP-Rust
+
 Copyright (c) 2026 Xiaowei Jia
 
 This project is a Rust reimplementation of the QTP quantitative trading core.
-Its order-book compatibility behaviour and the lightweight C++ test oracle are
-based on the original QTP project, which is licensed under the GNU Lesser
-General Public License version 3.
+Its order-book implementation and historical golden test expectations are based
+on the original QTP project, which is licensed under the GNU Lesser General
+Public License version 3. The standalone C++ test oracle has been removed;
+the reviewed golden expectations remain in the Rust regression tests.
 
 QTP-Rust is distributed under the GNU Lesser General Public License version 3
 only (SPDX-License-Identifier: LGPL-3.0-only). See LICENSE, COPYING, and
