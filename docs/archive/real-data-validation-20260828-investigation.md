@@ -5,7 +5,8 @@
 > [Snapshot 验证匹配规则](../snapshot-validation-rules.md)。
 >
 > 报告清理说明（2026-09-05）：本文引用的旧实验报告已从 `reports/` 清理，文件名和校验值
-> 仅保留为历史标识，不代表仍可直接读取。最新保留文件见 [报告目录](../../reports/README.md)。
+> 仅保留为历史标识，不代表仍可直接读取。最新汇总见[验证基线](../real-data-validation.md)；
+> 详细报告仅本地保存，不随 Git 分发。
 >
 > 特别说明：本文保留的“本方盘口为空的 `OrdType='U'` 使用
 > `Unpriced + AlwaysHide`”是当时为了恢复可见快照采用的实现记录，不代表深交所真实

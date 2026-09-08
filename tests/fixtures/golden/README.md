@@ -12,7 +12,8 @@ That program and its CI job have been removed. The former combined fixture in
 `legacy_golden/order_book.txt` is now split by scenario under `golden/`, with event
 sequences, checkpoint labels and expected values unchanged. These tests call the
 core directly and do not depend on a legacy input API.
-Historical C++ source remains available in Git history, including `73adb97`.
+Historical C++ source remains available at `f3f77c0` (formerly `73adb97`, before
+reports were removed from unpublished history).
 
 ## Coverage and limits
 

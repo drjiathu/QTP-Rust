@@ -4,14 +4,12 @@
     "*.md",
     "docs/**/*.md",
     "analysis/*.md",
-    "tests/**/*.md",
-    "reports/README.md",
-    "reports/diagnostics/README.md"
+    "tests/**/*.md"
   ],
   "ignores": [
     "target/**",
     "**/node_modules/**",
-    "reports/20*/**",
+    "reports/**",
     "**/source-snapshot/**"
   ],
   "config": {

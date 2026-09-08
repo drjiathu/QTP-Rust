@@ -39,8 +39,10 @@ The checked-in `.markdownlint-cli2.jsonc` defines the maintained document scope
 and formatting rules, shared with the VS Code markdownlint extension. Code blocks
 and tables are exempt from the 80-character prose limit. Frozen validation
 reports and source snapshots are excluded; do not reformat evidence artifacts.
-`.gitattributes` also exempts frozen source-snapshot `.patch` files from whitespace
-checks so unified-diff context lines and recorded hashes remain intact.
+`reports/` and `analysis/*.ipynb` are local-only and ignored by Git. Keep reusable
+analysis Python tools and their README in version control. Run `ruff check
+analysis` and `ruff format --check analysis` when changing those tools; preparing
+historical reports and input data is separate from cloning this repository.
 
 The QTP legacy input API and standalone C++ oracle are retired. Rust golden tests
 exercise `OrderBook` directly against reviewed, fixed expected output; no C++

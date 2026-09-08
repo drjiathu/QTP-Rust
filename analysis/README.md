@@ -1,18 +1,22 @@
 # 当前保留的分析工具
 
 保留最新批次入口和通用定位工具。依赖旧快照、临时提取文件或旧策略的一次性脚本及
-notebook 已移出工作树；旧代码可从 Git 提交 `73adb97` 恢复。
+notebook 已清理；旧代码可从 Git 提交 `f3f77c0`（历史整理前 `73adb97`）恢复。
+当前只跟踪下列三个 Python 工具与本文档，不属于生产接口。
 
 | 文件 | 用途 |
 | --- | --- |
 | `run_current_full_regression.py` | 十日驱动及共享执行、报告审计、profiling 汇总函数 |
 | `run_additional_random_validation.py` | 新增五日驱动，复用上述模块 |
-| `20260907-current-full-regression.ipynb` | 读取十日结果、异常与计时 |
-| `20260908-additional-random-validation.ipynb` | 重现五日随机选择并读取结果 |
 | `extract_validation_symbols.py` | 从 pretty JSON 验证报告提取不匹配证券代码 |
 
 批次日期、输出目录和版本检查固定用于重现已存证据，`--launch` 拒绝覆盖已有目录。
 运行新批次应使用独立批次实现/目录，不覆盖旧结果。需要 PyArrow 的脚本使用 Clara Python。
+
+`20260907-current-full-regression.ipynb` 和 `20260908-additional-random-validation.ipynb`
+仅用于本地历史结果阅读，已停止跟踪但保留本地文件。`analysis/*.ipynb`、缓存及
+整个 `reports/` 由 Git 忽略；克隆仓库不会获得这些文件。脚本需要的输入、报告和冻结
+二进制必须单独准备，不因保留脚本就能在空环境复现历史结果。
 
 读取/刷新现存汇总，不会重新回放：
 
@@ -22,5 +26,16 @@ notebook 已移出工作树；旧代码可从 Git 提交 `73adb97` 恢复。
 python3 analysis/extract_validation_symbols.py reports/20260908-additional-random-full/20260813-sz-full.json
 ```
 
-正式证据见 [reports/README.md](../reports/README.md)。批次内 `source-snapshot/analysis`
+已提交的结果摘要见[验证基线](../docs/real-data-validation.md)，详细证据位于本地 `reports/`。
+批次内 `source-snapshot/analysis`
 是不可变运行版本，允许保留旧路径，不作为当前执行入口；不要为清理而改写源码快照。
+
+## 代码检查
+
+```bash
+ruff check analysis
+ruff format --check analysis
+```
+
+只检查受维护的 Python 工具，不对本地 notebook 或冻结报告源码批量修复。
+修复 lint 时保留非零子进程退出码审计；worker 异常必须写入失败收据并令批次验收失败。

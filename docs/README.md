@@ -20,8 +20,9 @@
 说明原生消息或申报；具体使用时须核对版本及适用日期，不以 PDF 文件名推定生效范围。
 尤其本目录两份深交所 `v1.32` 文件名为**交易接口**，不能当作 Binary／STEP **行情接口**。
 
-证据、运行收据和源码快照在 [reports/](../reports/README.md)；当前分析入口在
-[analysis/](../analysis/README.md)。大规模逐帧报告不复制到 docs。
+详细证据、运行收据和源码快照保存在本地 `reports/`，由 Git 忽略，不随克隆提供；
+提交的结果摘要见[验证基线](real-data-validation.md)，当前分析工具见
+[analysis/](../analysis/README.md)。本地 notebook 也不跟踪，大规模逐帧报告不复制到 docs。
 
 ## 合并与历史归档
 

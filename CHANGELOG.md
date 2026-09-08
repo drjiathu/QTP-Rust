@@ -11,8 +11,9 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Strongly typed order-book events and SH/SZ Parquet replay and validation.
 - FIFO order-book reconstruction with add, trade, and full-remainder cancel.
 - Reviewed golden fixtures, Rust core regression tests, and property tests.
-- Frozen evidence for five additional validation dates and the post-retirement
+- Summaries for five additional validation dates and the post-retirement
   20260828 SH/SZ full-market regression; all comparable snapshots matched.
+  Detailed evidence is stored locally, outside version control.
 
 ### Changed
 
@@ -24,7 +25,11 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Consolidated maintained documentation into usage, implementation, acceptance
   rules and validation evidence, with shared Markdown lint configuration.
 - Pruned superseded reports and one-off analysis artifacts, retaining complete
-  current evidence, compact diagnostics and a cleanup inventory.
+  local evidence, compact diagnostics and a cleanup inventory.
+- Removed `reports/` from unpublished commit trees without rewriting published
+  remote history; kept local reports and ignored the entire directory.
+- Kept reusable analysis Python tools, fixed Ruff diagnostics and formatting,
+  and stopped tracking local-only result notebooks without deleting local files.
 
 ### Removed
 
