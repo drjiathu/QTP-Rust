@@ -318,7 +318,7 @@ fn practical_ioc_path_can_rest_temporarily_but_real_cancel_clears_it() {
         ))
         .is_ok()
     );
-    // Once resting, the legacy practical behavior does not reprice again.
+    // Once resting, the practical market-order behavior does not reprice again.
     assert!(
         matches!(book.order(&bid), Some(o) if o.remaining_quantity == 100
         && o.effective_price == Some(price(100_000)))

@@ -1,0 +1,208 @@
+# 回放与验证使用手册
+
+本手册说明生产命令和核心 Rust API 的用法。内部机制见[实现说明](order-book-implementation.md)，
+选帧与比较要求只在[验收规范](snapshot-validation-rules.md)定义，测试结果见[验证基线](real-data-validation.md)。
+
+## 编译
+
+安装 rustup 后进入仓库，`rust-toolchain.toml` 自动选择 Rust 1.85.1：
+
+```bash
+cargo build --release --locked --bin qtp-replay
+target/release/qtp-replay --help
+target/release/qtp-replay replay --help
+target/release/qtp-replay validate --help
+```
+
+开发检查见 [CONTRIBUTING](../CONTRIBUTING.md#required-checks)。
+当前生产入口是按逐笔更新状态的完整单日离线回放，不是交易所在线接入服务。
+
+## 输入与证券范围
+
+默认 `--raw-root /hdd/data/stock/raw_level2_parquet`，每个数据集布局为
+`date=YYYYMMDD/<数据集>/part-0.parquet`：
+
+| 市场 | replay 输入 | validate 额外读取的独立参考 |
+| --- | --- | --- |
+| SH | `mdl_4_24_0` 合并逐笔 | `MarketData` |
+| SZ | `mdl_6_33_0` 委托、`mdl_6_36_0` 成交／撤单 | `mdl_6_28_0` |
+
+校验 Clara footer、字段类型、Decimal scale 和必要时间字段；不从 `.csv.7z` 冷归档读取，
+不使用 `/hdd/data/stock/snapshot` canonical 表，也没有 `--reference-root` 参数。
+replay 不读取 raw snapshot，它的缺失或状态不影响订单簿恢复。
+
+| 选择方式 | 范围 |
+| --- | --- |
+| 省略证券参数 | 该市场全部支持的 A 股 |
+| `--include-etfs`（不指定代码） | 全部支持的股票与 ETF |
+| `--only-etfs` | 只选 ETF；与 `--symbols`、`--include-etfs` 互斥 |
+| `--symbols 000001,159001` | 指定六位代码，可混合股票与 ETF |
+
+分类使用[代码前缀](../src/production/types.rs)，尚未接入证券主数据；显式代码也必须在支持范围内。
+每次请求限定一个交易日、一个市场。`--batch-size` 默认 65536，控制读取 batch 而非验证器总内存。
+
+## 回放与截面
+
+恢复沪市全部股票和 ETF，每 30 秒输出十档：
+
+```bash
+target/release/qtp-replay replay \
+  --date 20260828 --market SH --include-etfs \
+  --snapshot-interval 30s --depth 10 \
+  --output-root output/run-20260828-sh --temp-root target/spool
+```
+
+指定深市证券、100 毫秒截面：
+
+```bash
+target/release/qtp-replay replay \
+  --date 20260828 --market SZ --symbols 000001,300750 \
+  --snapshot-interval 100ms --output-root output/run-20260828-sz
+```
+
+省略 `--snapshot-interval` 只恢复、不写截面。间隔接受正整数加 `ms/s/m`，
+例如 `100ms/30s/1m`；`100m` 表示 100 分钟，不是 100 毫秒，`1.1s` 应写 `1100ms`。
+
+输出为
+`OUTPUT/date=YYYYMMDD/market={SH|SZ}/channel=CHANNEL/part-0.parquet`，
+批量写出；价格、加权均价、成交额使用 Decimal128(scale=4)。默认输出根目录为
+`output`，临时根目录为 `/tmp`。请为不同运行使用独立输出目录，避免覆盖已有结果。
+
+普通截面定义不随验证窗口改变：
+
+```text
+Snapshot(T) = 按原生序号成功应用所有 quote_time < T 事件后的状态
+```
+
+遇到事件 q，先输出所有 `T <= q` 的到期帧，再应用事件。同时间档不拆到 T 两侧。
+时间网格分别为 09:15–11:30、13:00–15:00，第一帧为窗口起点加间隔，午间不重复输出。
+另有 `snapshot_kind=market_close`：沪市取逐笔 CLOSE 检查点，深市取通道两流耗尽后的状态，
+不能把普通 15:00 左极限帧冒充最终收盘；边界和 15:00 后事件限制见[实现说明](order-book-implementation.md#截面验证和资源)。
+
+## raw snapshot 验证
+
+```bash
+target/release/qtp-replay validate \
+  --date 20260828 --market SZ --include-etfs \
+  --temp-root target/validation-spool --report reports/manual-20260828-sz.json
+```
+
+每个正常参考帧按[规范](snapshot-validation-rules.md)验证；不同市场／板块自动选择窗口。
+validate 不写生产截面，指定 `--report` 写 JSON 并在标准输出打印汇总，否则输出完整 JSON。
+输入错误、盘口不匹配、数据异常、应有来源缺失或无有效验收项返回非零。
+
+可选参数：
+
+| 参数 | 行为与限制 |
+| --- | --- |
+| `--pre-open-only` | 只验证开盘集合竞价结束。仍完整扫描输入，回放到所选开盘候选窗口的最大右边界；无参考时回退至 09:30。不生成收盘项 |
+| `--retain-matched-records` | 保留全部成功明细；只建议小样本使用 |
+| `--max-detail-records N` | 限制失败／排除明细，不限制总计数；CLI 省略时不限 |
+| `--continuous-lookback/--continuous-lookahead` | 诊断覆盖窗口，标记 `diagnostic_window_override`；正式基线不要传入 |
+
+深市 CLI 默认 `--sz-market-order-policy rest-at-last-trade-price`。
+`require-evidence` 是严格待决模式；`assume-contiguous` 是诊断模式，兼容开关
+`--assume-sz-contiguous-responses` 与新策略参数互斥。沪市拒绝显式深市策略。
+Rust 枚举默认是 `RequireEvidence`，并非 CLI 默认；策略保证见[实现说明](order-book-implementation.md#保留的严格与诊断策略)。
+
+### 报告怎么读
+
+- `Matched/Mismatched/ExcludedByStatus/DataError/MissingSource` 分开计数；
+  排除不算匹配，DataError 和 MissingSource 阻断验收。
+- 旧 `not_comparable` 汇总后三类，`NotComparable` 枚举仅保留旧报告兼容。
+  `breakdown` 按股票／ETF和阶段分组，计数不受明细截断影响。
+- 默认不保存成功逐帧 records，`omitted_matched_records` 记录省略量。
+  `omitted_mismatched_records/omitted_not_comparable_records` 表示明细上限省略量。
+- `reference_time_ms/matched_candidate_time_ms` 使用 epoch 毫秒；命中明细带通道、
+  `matched_candidate_raw_sequence/apply_sequence`。延续状态的候选时间可晚于最后成功事件，
+  空簿尚无事件时序号为空；失败明细保留最接近候选和字段差异。
+- `phase_audit` 记录阶段计数与异常；`match_tags` 记录特殊收盘价规则；
+  `close_price_band` 记录 E0 比较投影；`continuous_lookahead_ms_by_symbol` 是逐证券实际窗口。
+- `sz_sequence_regressions/repairs` 记录逆序与修复；
+  `sz_after_close_events(_by_symbol)` 记录成功应用的 15:00 后事件。
+  旧 `sz_phase_source_available/sz_phase_rows/sz_resumption_checkpoints/sz_resumption_rest_orders`
+  新回放固定 false/0，不代表验证参考缺失。
+- `is_success()` 判断本次比较与来源检查是否成功；`is_standard_acceptance()` 还要求当前
+  待决版本、无诊断覆盖及 RequireEvidence。因此深市默认实用策略可以全部匹配、退出码 0，
+  同时 `standard_acceptance=false`。不能把它当成严格市价路径的验收。
+
+### 内存、失败与重跑
+
+replay 按通道串行处理，保留当前通道的订单簿、历史引用和去重索引；validate 额外保存整日
+参考帧及匹配状态，内存明显更高。并发应依据实测峰值和可用内存安排，不能只按 CPU 核数。
+
+成功自动删除临时分片；失败保留并报告路径。生产失败不支持从半个通道原地续跑，
+修复原因后使用新输出目录重跑，不能把部分输出当成完成结果。旧分片不作为新的 raw 输入。
+性能测量命令与时间拆分见[验证基线与计时](real-data-validation.md#profiling)。
+
+## Rust API
+
+生产文件使用 `MarketDayRequest` 配置 `replay_market_day`，或通过 `ValidationConfig`
+调用 `validate_market_day/validate_pre_open_market_day`。自定义调用者可直接构造
+`BookEvent` 应用到 `OrderBook`，无需旧 QTP raw 类型。local／quote 时间必需且类型不同；
+价格使用整数单位，调用者负责源数据归一化及原生顺序。
+
+```rust
+use qtp_core::*;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let key = BookKey {
+        market: Market::Sse,
+        trading_day: TradingDay::from_yyyymmdd(20260828).ok_or("invalid day")?,
+        symbol: Symbol::from("600000"),
+    };
+    let scale = PriceScale::from_decimal_places(4).ok_or("invalid scale")?;
+    let mut book = OrderBook::new(BookConfig::new(key.clone(), scale));
+    let order_key = OrderKey {
+        channel_id: ChannelId::new(1).ok_or("invalid channel")?,
+        side: Side::Buy,
+        order_id: OrderId::new(101).ok_or("invalid order id")?,
+    };
+    let meta = |seq| -> Result<EventMeta, Box<dyn std::error::Error>> {
+        Ok(EventMeta {
+            book_key: key.clone(),
+            raw_sequence: RawSequence::new(seq).ok_or("invalid raw sequence")?,
+            apply_sequence: ApplySequence::new(seq).ok_or("invalid apply sequence")?,
+            local_time: LocalTimestampNs::from_nanos(1_788_485_400_000_100_000),
+            quote_time: QuoteTimestampNs::from_nanos(1_788_485_400_000_000_000),
+        })
+    };
+    book.apply(BookEvent::AddOrder(AddOrder {
+        meta: meta(1)?,
+        order_key,
+        pricing: PricingInstruction::Provided(Price::from_units(100_000).ok_or("price")?),
+        crossing: CrossingBehavior::Rest,
+        quantity: Quantity::new(100).ok_or("quantity")?,
+    }))?;
+    assert_eq!(book.order(&order_key).map(|order| order.remaining_quantity), Some(100));
+    book.apply(BookEvent::OrderCancel(OrderCancel {
+        meta: meta(2)?,
+        order_key,
+    }))?;
+    assert!(book.is_empty());
+    Ok(())
+}
+```
+
+只读接口包括 `summary()`、`depth(n)`、`levels(side)`、`orders_at(side, price)` 和
+`order(&key)`；终态订单不再返回。核心事件失败不改变盘口、统计或最后成功事件元数据，
+但生产文件失败仍按前文重新运行，不提供原 legacy 切片续跑接口。
+
+完整 API 可通过 `cargo doc --locked --no-deps --open` 查看。
+旧 `LegacyReplay/normalize`、`OrderRecord/TradeRecord/MarketDataRecord` 等接口已退役，
+这属于公共 API 破坏性变更；旧代码和字段映射仅在[历史归档](archive/cpp-to-rust-migration-plan.md)追溯。
+
+## 核心回归与性能冒烟
+
+```bash
+cargo test --locked --test golden
+cargo run --release --locked --example replay_benchmark -- 100000
+```
+
+该 example 输出 `mode=core_apply`，仅测预先构造事件的遍历及 OrderBook::apply；
+不含构造输入、legacy normalization、文件读取或生产验证，不能与旧示例耗时直接比较。
+完整生产 profiling 使用[验证 benchmark](real-data-validation.md#profiling)。
+
+固定 golden 与 Rust 测试继续用于核心回归，检查两个合成场景、十个事件后的价位、FIFO、
+活动余量、隐藏／重新入簿及成交统计。C++ oracle 及其 CI 检查已移除，无需 C++ 工具链。
+这不是完整行情链路验收；用途和更新约束见[golden 测试说明](../tests/fixtures/golden/README_CN.md)。

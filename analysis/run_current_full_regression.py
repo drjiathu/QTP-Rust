@@ -44,6 +44,20 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
+def previously_tested_dates():
+    """Preserve selection history even after superseded report files are pruned."""
+    dates = set(DAYS)
+    for path in (ROOT / 'reports').glob('*/manifest.json'):
+        manifest = json.loads(path.read_text())
+        for key in ('baseline_days', 'random_days', 'days', 'previously_tested_dates', 'excluded_dates'):
+            dates.update(str(day) for day in manifest.get(key, []) if re.fullmatch(r'20\d{6}', str(day)))
+    for path in (ROOT / 'reports').rglob('*-run.json'):
+        match = re.match(r'(20\d{6})-', path.name)
+        if match:
+            dates.add(match[1])
+    return dates
+
+
 def inventory(days):
     rows = []
     for day in days:
@@ -158,7 +172,7 @@ def summarize(manifest):
     lines += ['', '恢复 = 输入读取/分片 + 排除验证回调的回放 + 分片清理；对比 = 参考读取/分类 + 比较回调 + 报告整理。',
               '总时间另含启动/序列化/写报告。均为六进程并发下的 instrumented wall time，不是 CPU 时间或独立纯回放基准。',
               '可比率、状态排除、字段差异和来源缺失分别计数。规则固定，禁止失败后扩窗。',
-              '首阶段 14 个日市场任务全部通过且审计通过后，才随机抽取三个未测试日期。失败时保留逐帧明细与临时分片位置。']
+              manifest.get('selection_note', '首阶段 14 个日市场任务全部通过且审计通过后，才随机抽取三个未测试日期。失败时保留逐帧明细与临时分片位置。')]
     (OUT / 'summary.md').write_text('\n'.join(lines)+'\n')
     return summary
 
@@ -196,11 +210,7 @@ def main():
             hashes[str(relative)] = digest(path)
         save(OUT/'source-sha256.json', hashes)
         (OUT/'working-tree.patch').write_bytes(subprocess.check_output(['git','diff','--binary','HEAD'], cwd=ROOT))
-        historical = set(DAYS)
-        for path in (ROOT/'reports').rglob('*-run.json'):
-            match = re.match(r'(20\d{6})-', path.name)
-            if match:
-                historical.add(match[1])
+        historical = previously_tested_dates()
         eligible = sorted(p.name[5:] for p in RAW.glob('date=*') if re.fullmatch(r'date=\d{8}',p.name)
                           and p.name[5:] not in historical and all((p/f/'part-0.parquet').is_file() for f in FEEDS))
         manifest = dict(status='baseline_running', started_at=utc(), heartbeat_at=utc(), driver_pid=os.getpid(),

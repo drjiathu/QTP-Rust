@@ -1,21 +1,5 @@
 use std::fmt;
 
-/// A monotonic timestamp carried only by legacy QTP input.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct LegacySteadyTimestampNs(i64);
-
-impl LegacySteadyTimestampNs {
-    #[must_use]
-    pub const fn from_nanos(nanoseconds: i64) -> Self {
-        Self(nanoseconds)
-    }
-
-    #[must_use]
-    pub const fn as_nanos(self) -> i64 {
-        self.0
-    }
-}
-
 /// A required local receive or generation timestamp in Unix epoch nanoseconds.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LocalTimestampNs(i64);
@@ -46,14 +30,6 @@ impl QuoteTimestampNs {
     pub const fn as_nanos(self) -> i64 {
         self.0
     }
-}
-
-/// Source timestamps attached to a raw market-data record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RawEventTime {
-    pub steady_time: Option<LegacySteadyTimestampNs>,
-    pub local_time: LocalTimestampNs,
-    pub quote_time: QuoteTimestampNs,
 }
 
 /// Instrument symbol.
@@ -241,76 +217,6 @@ pub struct EventMeta {
     pub quote_time: QuoteTimestampNs,
 }
 
-/// Legacy QTP order side before normalization.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RawOrderSide {
-    Buy,
-    Sell,
-    Borrow,
-    Loan,
-}
-
-/// Legacy QTP order type before normalization.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RawOrderType {
-    MarketPrice,
-    LimitPrice,
-    ForwardBestPrice,
-    ReverseBestPrice,
-    Cancelled,
-}
-
-/// Legacy QTP transaction type before normalization.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RawTradeType {
-    Trade,
-    Cancelled,
-}
-
-/// Legacy QTP aggressor flag retained for audit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RawTradeSide {
-    Unknown,
-    Buy,
-    Sell,
-}
-
-/// Raw legacy order record. Signed identifiers and `f64` prices are preserved.
-#[derive(Clone, Debug, PartialEq)]
-pub struct OrderRecord {
-    pub event_time: RawEventTime,
-    pub symbol: Symbol,
-    pub kind: RawOrderType,
-    pub side: RawOrderSide,
-    pub channel_no: i32,
-    pub sequence: i64,
-    pub order_id: i64,
-    pub price: f64,
-    pub quantity: u64,
-}
-
-/// Raw legacy trade or cancellation record.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TradeRecord {
-    pub event_time: RawEventTime,
-    pub symbol: Symbol,
-    pub kind: RawTradeType,
-    pub side: RawTradeSide,
-    pub channel_no: i32,
-    pub sequence: i64,
-    pub price: f64,
-    pub quantity: u64,
-    pub bid_order_id: i64,
-    pub ask_order_id: i64,
-}
-
-/// Raw input accepted by legacy normalization.
-#[derive(Clone, Debug, PartialEq)]
-pub enum MarketDataRecord {
-    Order(OrderRecord),
-    Trade(TradeRecord),
-}
-
 /// Price resolution performed against the current book at apply time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PricingInstruction {
@@ -329,8 +235,8 @@ pub enum CrossingBehavior {
     /// Start as an aggressive hidden order, then price any unfilled remainder
     /// at the latest trade price and let it rest once it no longer crosses.
     ///
-    /// Legacy/explicit market-to-limit behavior, not a generic Shenzhen market
-    /// order rule. Production SZ replay resolves pending responses separately.
+    /// Used by the practical production SZ policy, not a complete exchange
+    /// market-order rule. Strict SZ policies resolve pending responses separately.
     RestAtLastTradePrice,
     /// Keep the order out of visible depth for its entire lifetime.
     AlwaysHide,

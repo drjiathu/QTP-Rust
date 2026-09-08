@@ -13,20 +13,25 @@
 生产链路补记；归档不代表本次重新执行或通过了全部验收。
 
 本文中的“本期不实现”“API 草案”、依赖清单和生产验证规则反映历史设计，部分已被后续
-实现替代。尤其第 15 节的时间窗口及“snapshot 不参与恢复”表述不应作为现行约束：当前
-深市状态元数据可辅助复牌识别，但 snapshot 价量不得用于初始化订单簿。
+实现替代。第 15 节的时间窗口、复牌适配等均是历史设计，不作为现行约束；
+当前恢复与独立验证的边界见[实现说明](../order-book-implementation.md)。
+
+后续接口退役：旧 QTP legacy 模块、raw 类型与切片回放公共接口现已移除；下文的
+“保留 legacy”说明只代表迁移时状态。C++ oracle 及其 CI 检查也已移除；
+固定 golden、Rust 回归测试和共享订单簿核心继续维护。下文 oracle 方案仅作历史追溯。
+历史代码可从提交 `73adb97` 追溯，不应按本方案重新引入已退役接口。
 
 当前文档入口：
 
-- [legacy 回放使用手册](../order-book-replay-guide.md)：旧 C++ 数据 API 的使用方法。
-- [沪深全市场回放与验证手册](../full-market-replay-guide.md)：当前生产命令与运行行为。
+- [核心 Rust API](../Guidance.md#rust-api)：当前库调用方法，不接收旧 QTP raw 类型。
+- [沪深全市场回放与验证手册](../Guidance.md)：当前生产命令与运行行为。
 - [Snapshot 验证匹配规则](../snapshot-validation-rules.md)：当前唯一的验收规范。
-- [20260828 验证基线](../real-data-validation.md)：当前有效结果、证据范围和未闭合边界。
+- [验证基线与计时](../real-data-validation.md)：当前有效版本、结果和证据范围。
 - [历史调查记录](real-data-validation-20260828-investigation.md)：各次实验的原始口径、结果与修正过程。
 
-旧字段／枚举映射、兼容行为和 C++ oracle/golden 依据仍保留在本文供追溯；归档不删除
-legacy 实现或测试，也不自动将历史草案视为当前 API。当前 API 以源码和生成的 Rust API
-文档为准，尚未建立的架构文档不作为替代入口。
+旧字段／枚举映射、兼容行为和 C++ oracle/golden 依据仍保留在本文供追溯；
+历史草案不代表当前 API。当前 API 以源码和生成的 Rust API
+文档为准，模块调用关系见[实现说明](../order-book-implementation.md)。
 
 以下为保留的历史正文。
 
@@ -887,4 +892,4 @@ Raw Parquet → 必要列投影/Schema 校验 → 股票过滤 → 通道临时�
   收盘价；只有独立计算结果一致才按带标签的匹配处理。验证报告的时间字段使用毫秒精度。
 
 生产命令、目录布局、失败分片和 JSON 报告详见
-[沪深全市场 Parquet 回放与验证手册](../full-market-replay-guide.md)。
+[沪深全市场 Parquet 回放与验证手册](../Guidance.md)。
