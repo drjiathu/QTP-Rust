@@ -10,6 +10,14 @@ pub(super) struct ReferenceLevels {
     len: u8,
 }
 impl ReferenceLevels {
+    fn matches(&self, actual: &[SnapshotLevel]) -> bool {
+        actual.len() == usize::from(self.len)
+            && actual.iter().enumerate().all(|(i, level)| {
+                self.prices[i] == level.price_units
+                    && self.quantities[i] == level.quantity
+                    && u64::from(self.counts[i]) == level.order_count
+            })
+    }
     fn from_levels(levels: &SnapshotLevels) -> Result<Self, ProductionError> {
         if levels.len() > 10 {
             return Err(ProductionError::Validation(
@@ -76,6 +84,12 @@ impl TryFrom<SnapshotBookView> for ReferenceBookView {
     }
 }
 impl ReferenceBookView {
+    pub fn depth_differences(&self, actual: &SnapshotBookView) -> super::DifferenceMask {
+        let mut mask = super::DifferenceMask::default();
+        mask.record(super::DIFF_BIDS, !self.bids.matches(&actual.bids));
+        mask.record(super::DIFF_ASKS, !self.asks.matches(&actual.asks));
+        mask
+    }
     pub fn expand(&self) -> SnapshotBookView {
         SnapshotBookView {
             bids: self.bids.expand(),

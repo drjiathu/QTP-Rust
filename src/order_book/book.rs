@@ -57,6 +57,9 @@ pub struct OrderBook {
     ask_aggregate: SideAggregate,
     statistics: TradeStatistics,
     last_applied_meta: Option<EventMeta>,
+    // A saturated revision disables observer caching instead of wrapping or
+    // introducing a new business failure. Includes non-event pending reentry.
+    revision: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +105,7 @@ impl OrderBook {
             ask_aggregate: SideAggregate::default(),
             statistics: TradeStatistics::default(),
             last_applied_meta: None,
+            revision: 0,
         }
     }
 
@@ -118,6 +122,10 @@ impl OrderBook {
     #[must_use]
     pub const fn last_applied_meta(&self) -> Option<&EventMeta> {
         self.last_applied_meta.as_ref()
+    }
+
+    pub(crate) fn cache_revision(&self) -> Option<u64> {
+        (self.revision != u64::MAX).then_some(self.revision)
     }
 
     pub fn next_apply_sequence(&self) -> Result<ApplySequence, BookError> {
@@ -141,6 +149,7 @@ impl OrderBook {
             BookEvent::Trade(event) => self.apply_trade(event),
         }?;
         self.last_applied_meta = Some(meta);
+        self.revision = self.revision.saturating_add(1);
         debug_assert!(self.check_invariants().is_ok());
         Ok(outcome)
     }
@@ -179,6 +188,7 @@ impl OrderBook {
         state.location = OrderLocation::Resting;
         state.previous = attach.previous;
         self.commit_attach(key.side, price, handle, attach);
+        self.revision = self.revision.saturating_add(1);
         debug_assert!(self.check_invariants().is_ok());
         Ok(())
     }
@@ -1154,7 +1164,9 @@ mod pending_tests {
         book.apply(add(3, ask, CrossingBehavior::Rest))
             .expect("ask");
         let before = format!("{book:?}");
+        let failed_revision = book.cache_revision();
         assert!(book.rest_pending_order(pending, p).is_err());
+        assert_eq!(book.cache_revision(), failed_revision);
         assert_eq!(format!("{book:?}"), before);
         book.apply(BookEvent::OrderCancel(OrderCancel {
             meta: meta(4),
@@ -1162,7 +1174,9 @@ mod pending_tests {
         }))
         .expect("cancel");
         let last_meta = book.last_applied_meta().cloned();
+        let revision = book.cache_revision().expect("revision");
         book.rest_pending_order(pending, p).expect("rest");
+        assert_eq!(book.cache_revision(), Some(revision + 1));
         assert_eq!(book.last_applied_meta(), last_meta.as_ref());
         let later = key(Side::Buy, 5);
         book.apply(add(5, later, CrossingBehavior::Rest))
@@ -1176,5 +1190,12 @@ mod pending_tests {
         );
         assert_eq!(book.levels(Side::Buy)[0].total_quantity, 30);
         assert!(book.check_invariants().is_ok());
+        book.revision = u64::MAX - 1;
+        book.apply(add(6, key(Side::Buy, 6), CrossingBehavior::Rest))
+            .expect("saturate");
+        assert_eq!(book.cache_revision(), None);
+        book.apply(add(7, key(Side::Buy, 7), CrossingBehavior::Rest))
+            .expect("no wrap");
+        assert_eq!(book.cache_revision(), None);
     }
 }

@@ -10,6 +10,8 @@ use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
 
+mod candidate;
+use candidate::{CandidateCache, CandidateContext, CandidateCounters, WindowConfig};
 mod close_range;
 mod columns;
 use columns::RawSnapshotColumns;
@@ -221,6 +223,7 @@ struct SymbolReferences {
     market_close: Option<ReferenceSnapshot>,
 }
 
+#[cfg(test)]
 impl SymbolReferences {
     fn get_single(&self, anchor: ValidationAnchor) -> Option<&ReferenceSnapshot> {
         match anchor {
@@ -300,6 +303,7 @@ impl AnchorState {
 
 #[derive(Clone, Debug, Default)]
 struct SymbolValidationState {
+    cache: CandidateCache,
     references: SymbolReferences,
     continuous_position: usize,
     seen: bool,
@@ -437,10 +441,7 @@ const SZ_STOCK_PRE_CLOSE_PRICE_TAG: &str = "SZ_STOCK_PRE_CLOSE_PRICE";
 const SZ_ETF_PRE_CLOSE_PRICE_TAG: &str = "SZ_ETF_PRE_CLOSE_PRICE";
 
 struct ValidationObserver {
-    #[cfg(feature = "profiling")]
-    scalar_rejected_candidates: u64,
-    #[cfg(feature = "profiling")]
-    depth_materializations: u64,
+    counters: CandidateCounters,
     sz_close_limits: HashMap<String, DayLimits>,
     market: Market,
     symbols: HashMap<String, SymbolValidationState>,
@@ -462,10 +463,7 @@ impl ValidationObserver {
         };
         Self {
             sz_close_limits: HashMap::new(),
-            #[cfg(feature = "profiling")]
-            scalar_rejected_candidates: 0,
-            #[cfg(feature = "profiling")]
-            depth_materializations: 0,
+            counters: CandidateCounters::default(),
             market,
             symbols: references
                 .into_iter()
@@ -493,6 +491,7 @@ impl ValidationObserver {
         }
     }
 
+    #[cfg(test)]
     fn anchor_state(
         &self,
         symbol: &str,
@@ -503,22 +502,6 @@ impl ValidationObserver {
             .get(symbol)
             .and_then(|state| state.references.get(anchor, time_ns))
             .map(|reference| &reference.state)
-    }
-
-    fn anchor_state_mut(
-        &mut self,
-        symbol: &str,
-        anchor: ValidationAnchor,
-        time_ns: i64,
-    ) -> &mut AnchorState {
-        let symbol_state = match self.symbols.get_mut(symbol) {
-            Some(state) => state,
-            None => std::process::abort(),
-        };
-        match symbol_state.references.get_mut(anchor, time_ns) {
-            Some(reference) => &mut reference.state,
-            None => std::process::abort(),
-        }
     }
 
     fn with_continuous_lookback(
@@ -582,6 +565,7 @@ impl ValidationObserver {
         }
     }
 
+    #[cfg(test)]
     fn compare_candidate(
         &mut self,
         symbol: &str,
@@ -590,324 +574,27 @@ impl ValidationObserver {
         reference_time_ns: i64,
         candidate_time_ns: Option<i64>,
     ) -> Result<(), ProductionError> {
-        let Some(reference) = self
-            .symbols
-            .get(symbol)
-            .and_then(|state| state.references.get(anchor, reference_time_ns))
-        else {
+        let Some(state) = self.symbols.get_mut(symbol) else {
             return Ok(());
         };
-        if reference.not_comparable_reason.is_some() {
-            return Ok(());
-        }
-        if self
-            .anchor_state(symbol, anchor, reference_time_ns)
-            .is_some_and(|state| state.matched || state.finalized)
-        {
-            return Ok(());
-        }
-        let Some(expected) = reference.view.as_ref() else {
+        let Some(reference) = state.references.get_mut(anchor, reference_time_ns) else {
             return Ok(());
         };
-        let projection = if self.market == Market::Szse
-            && !is_etf_symbol(self.market, symbol)
-            && anchor == ValidationAnchor::MarketClose
-        {
-            let metadata = self
-                .sz_close_limits
-                .get(symbol)
-                .cloned()
-                .unwrap_or_default();
-            match metadata.unlimited() {
-                Ok(false) => Ok(None),
-                Ok(true) => self
-                    .symbols
-                    .get(symbol)
-                    .and_then(|state| state.close_price.as_ref())
-                    .and_then(|tracker| tracker.range_base.as_ref())
-                    .ok_or_else(|| "missing pre-14:57 successful trade for SZ E0 range".to_owned())
-                    .and_then(|base| {
-                        close_range::project(book, base, &metadata)
-                            .map(Some)
-                            .map_err(|e| e.to_string())
-                    }),
-                Err(error) => Err(error),
-            }
-        } else {
-            Ok(None)
+        let ctx = CandidateContext {
+            market: self.market,
+            symbol,
+            book,
+            limits: self.sz_close_limits.get(symbol),
+            close_price: state.close_price.as_ref(),
         };
-        let (mut actual, close_price_band) = match projection {
-            Ok(Some((view, audit))) => (view, Some(audit)),
-            Ok(None) => {
-                let mut view = SnapshotBookView::from_book_scalars(book)?;
-                view.weighted_bid_price_units =
-                    published_weighted_price(book, Side::Buy, self.market, symbol)?;
-                view.weighted_ask_price_units =
-                    published_weighted_price(book, Side::Sell, self.market, symbol)?;
-                (view, None)
-            }
-            Err(error) => {
-                let state = self.anchor_state_mut(symbol, anchor, reference_time_ns);
-                state.diagnostics_mut().comparison_error = Some(error);
-                state.finalized = true;
-                return Ok(());
-            }
-        };
-        if close_price_band.is_none() {
-            let scalar_mask = compare_reference_scalars(self.market, symbol, expected, &actual);
-            // Depth contributes at most two additional field differences. Only
-            // skip when no depth result can improve the first best candidate.
-            // E0 reconciliation requires its complete mask (LastPrice-only).
-            if anchor != ValidationAnchor::MarketClose
-                && !scalar_mask.is_empty()
-                && reference
-                    .state
-                    .best_differences()
-                    .is_some_and(|best| scalar_mask.count() >= best.len())
-            {
-                #[cfg(feature = "profiling")]
-                {
-                    self.scalar_rejected_candidates += 1;
-                }
-                return Ok(());
-            }
-            actual.fill_depth(book, 10)?;
-        }
-        #[cfg(feature = "profiling")]
-        {
-            self.depth_materializations += 1;
-        }
-        let expected_view = expected.expand();
-        let expected = &expected_view;
-        let mut difference_mask = compare_view_mask(self.market, symbol, expected, &actual);
-        let match_tag = if self.market == Market::Szse && anchor == ValidationAnchor::MarketClose {
-            reconcile_sz_market_close_price(
-                symbol,
-                reference.pre_close_price_units,
-                self.symbols
-                    .get(symbol)
-                    .and_then(|state| state.close_price.as_ref()),
-                expected,
-                &mut actual,
-                difference_mask,
-            )?
-        } else {
-            None
-        };
-        if match_tag.is_some() {
-            difference_mask = compare_view_mask(self.market, symbol, expected, &actual);
-        }
-        let best_differences = if !difference_mask.is_empty()
-            && self
-                .anchor_state(symbol, anchor, reference_time_ns)
-                .and_then(|state| state.best_differences())
-                .is_none_or(|best| difference_mask.count() < best.len())
-        {
-            Some(compare_views(self.market, symbol, expected, &actual))
-        } else {
-            None
-        };
-        let state = self.anchor_state_mut(symbol, anchor, reference_time_ns);
-        if close_price_band.is_some() {
-            state.diagnostics_mut().close_price_band = close_price_band;
-        }
-        if difference_mask.is_empty() {
-            state.matched = true;
-            state.finalized = true;
-            if let Some(diagnostics) = state.diagnostics.as_mut() {
-                diagnostics.best_differences = None;
-            }
-            if state
-                .diagnostics
-                .as_ref()
-                .is_some_and(|d| d.close_price_band.is_none() && d.comparison_error.is_none())
-            {
-                state.diagnostics = None;
-            }
-            state.matched_candidate_time_ns = candidate_time_ns;
-            state.matched_candidate_raw_sequence =
-                book.last_applied_meta().map(|m| m.raw_sequence.get());
-            state.matched_candidate_apply_sequence =
-                book.last_applied_meta().map(|m| m.apply_sequence.get());
-            state.match_tag = match_tag;
-        } else if let Some(differences) = best_differences {
-            state.diagnostics_mut().best_differences = Some(differences);
-            state.best_candidate_time_ns = candidate_time_ns;
-            state.best_candidate_raw_sequence =
-                book.last_applied_meta().map(|m| m.raw_sequence.get());
-        }
-        Ok(())
-    }
-
-    fn observe_timed_anchor(
-        &mut self,
-        symbol: &str,
-        book: &OrderBook,
-        anchor: ValidationAnchor,
-        point: ObservationPoint,
-    ) -> Result<(), ProductionError> {
-        let Some(reference_time) = self
-            .symbols
-            .get(symbol)
-            .and_then(|state| state.references.get_single(anchor))
-            .map(|reference| reference.time_ns)
-        else {
-            return Ok(());
-        };
-        let (point_time, is_before_event) = match point {
-            ObservationPoint::BeforeEvent(value) => (value, true),
-            ObservationPoint::AfterEvent(value) => (value, false),
-            ObservationPoint::MarketClose(_) | ObservationPoint::ChannelFinished => return Ok(()),
-        };
-        let window_ns = match anchor {
-            // Raw market snapshots encode stage time at whole-second
-            // granularity (for example 09:25:01.000 can include auction
-            // trades stamped 09:25:01.010), so PreOpen uses the same
-            // half-open second-bucket candidate rule as periodic frames.
-            ValidationAnchor::PreOpen => REFERENCE_SECOND_NS,
-            ValidationAnchor::ContinuousTrading | ValidationAnchor::MarketClose => return Ok(()),
-        };
-        let window_end = reference_time
-            .checked_add(window_ns)
-            .ok_or(ProductionError::Arithmetic("reference candidate window"))?;
-
-        // The first BeforeEvent at or beyond window_end is the state after every
-        // event in the half-open bucket and is therefore still a valid candidate,
-        // even when the next event is much later. AfterEvent(window_end) already
-        // includes an event outside the bucket and must not be compared.
-        let inside_window =
-            point_time >= reference_time && (point_time < window_end || is_before_event);
-        if inside_window {
-            let candidate_time = if point_time >= window_end {
-                window_end
-                    .checked_sub(REFERENCE_MILLISECOND_NS)
-                    .ok_or(ProductionError::Arithmetic("reference candidate time"))?
-            } else {
-                point_time
-            };
-            self.compare_candidate(symbol, book, anchor, reference_time, Some(candidate_time))?;
-        }
-        if point_time >= window_end {
-            self.anchor_state_mut(symbol, anchor, reference_time)
-                .finalized = true;
-        }
-        Ok(())
-    }
-
-    fn observe_continuous_trading(
-        &mut self,
-        symbol: &str,
-        book: &OrderBook,
-        point: ObservationPoint,
-    ) -> Result<(), ProductionError> {
-        let (point_time, is_before_event) = match point {
-            ObservationPoint::BeforeEvent(value) => (value, true),
-            ObservationPoint::AfterEvent(value) => (value, false),
-            ObservationPoint::MarketClose(_) | ObservationPoint::ChannelFinished => return Ok(()),
-        };
-        let mut position = self
-            .symbols
-            .get(symbol)
-            .map(|state| state.continuous_position)
-            .unwrap_or_default();
-        let mut first_pending = None;
-        loop {
-            let Some(reference_time) = self
-                .symbols
-                .get(symbol)
-                .and_then(|state| state.references.continuous_trading.get(position))
-                .map(|reference| reference.time_ns)
-            else {
-                break;
-            };
-            // Raw snapshots expose a whole-second stage timestamp, while the
-            // independently received tick stream can place the matching book
-            // prefix earlier. This tolerance affects validation only; replay
-            // ordering is still the native market sequence.
-            let window_start = reference_time
-                .checked_sub(self.continuous_lookback_ns)
-                .ok_or(ProductionError::Arithmetic(
-                    "continuous reference window start",
-                ))?;
-            if point_time < window_start {
-                break;
-            }
-            let window_end = reference_time
-                .checked_add(self.lookahead_ns(symbol))
-                .ok_or(ProductionError::Arithmetic("continuous reference second"))?;
-            if point_time < window_end || is_before_event {
-                let candidate_time = if point_time >= window_end {
-                    window_end.checked_sub(REFERENCE_MILLISECOND_NS).ok_or(
-                        ProductionError::Arithmetic("continuous reference candidate time"),
-                    )?
-                } else {
-                    point_time
-                };
-                self.compare_candidate(
-                    symbol,
-                    book,
-                    ValidationAnchor::ContinuousTrading,
-                    reference_time,
-                    Some(candidate_time),
-                )?;
-            }
-            if point_time >= window_end {
-                self.anchor_state_mut(
-                    symbol,
-                    ValidationAnchor::ContinuousTrading,
-                    reference_time,
-                )
-                .finalized = true;
-            }
-            let finalized = self
-                .anchor_state(symbol, ValidationAnchor::ContinuousTrading, reference_time)
-                .is_some_and(|state| state.finalized);
-            if !finalized {
-                first_pending.get_or_insert(position);
-            }
-            position += 1;
-        }
-        self.symbol_state_mut(symbol).continuous_position = first_pending.unwrap_or(position);
-        Ok(())
-    }
-
-    fn finish_continuous_trading(
-        &mut self,
-        symbol: &str,
-        book: &OrderBook,
-    ) -> Result<(), ProductionError> {
-        let mut position = self
-            .symbols
-            .get(symbol)
-            .map(|state| state.continuous_position)
-            .unwrap_or_default();
-        loop {
-            let Some(reference_time) = self
-                .symbols
-                .get(symbol)
-                .and_then(|state| state.references.continuous_trading.get(position))
-                .map(|reference| reference.time_ns)
-            else {
-                break;
-            };
-            let candidate_time = reference_time
-                .checked_add(self.lookahead_ns(symbol) - REFERENCE_MILLISECOND_NS)
-                .ok_or(ProductionError::Arithmetic(
-                    "continuous reference candidate time",
-                ))?;
-            self.compare_candidate(
-                symbol,
-                book,
-                ValidationAnchor::ContinuousTrading,
-                reference_time,
-                Some(candidate_time),
-            )?;
-            self.anchor_state_mut(symbol, ValidationAnchor::ContinuousTrading, reference_time)
-                .finalized = true;
-            position += 1;
-        }
-        self.symbol_state_mut(symbol).continuous_position = position;
-        Ok(())
+        candidate::compare_candidate(
+            ctx,
+            reference,
+            &mut state.cache,
+            &mut self.counters,
+            anchor,
+            candidate_time_ns,
+        )
     }
 
     fn into_report(
@@ -1243,6 +930,7 @@ impl StateObserver for ValidationObserver {
         Ok(())
     }
 
+    #[allow(clippy::map_entry)] // Keep existing-symbol observations allocation-free.
     fn observe(
         &mut self,
         channel: u32,
@@ -1250,59 +938,37 @@ impl StateObserver for ValidationObserver {
         book: &OrderBook,
         point: ObservationPoint,
     ) -> Result<(), ProductionError> {
-        let state = self.symbol_state_mut(symbol);
+        let windows = WindowConfig {
+            pre_open_only: self.pre_open_only,
+            lookback_ns: self.continuous_lookback_ns,
+            lookahead_ns: self.lookahead_ns(symbol),
+        };
+        // No String allocation for an existing symbol; one mutable lookup for
+        // all references handled by this observation.
+        if !self.symbols.contains_key(symbol) {
+            self.symbols
+                .insert(symbol.to_owned(), SymbolValidationState::default());
+        }
+        let state = self
+            .symbols
+            .get_mut(symbol)
+            .ok_or(ProductionError::Arithmetic(
+                "missing symbol validation state",
+            ))?;
         state.seen = true;
         state.channel = Some(channel);
-        self.observe_timed_anchor(symbol, book, ValidationAnchor::PreOpen, point)?;
-        if !self.pre_open_only {
-            self.observe_continuous_trading(symbol, book, point)?;
-        }
-        if !self.pre_open_only {
-            if let ObservationPoint::MarketClose(boundary_time_ns) = point {
-                if let Some(reference_time) = self
-                    .symbols
-                    .get(symbol)
-                    .and_then(|state| state.references.market_close.as_ref())
-                    .map(|reference| reference.time_ns)
-                {
-                    self.compare_candidate(
-                        symbol,
-                        book,
-                        ValidationAnchor::MarketClose,
-                        reference_time,
-                        Some(boundary_time_ns),
-                    )?;
-                    self.anchor_state_mut(symbol, ValidationAnchor::MarketClose, reference_time)
-                        .finalized = true;
-                }
-            }
-        }
-        if point == ObservationPoint::ChannelFinished {
-            if let Some(reference_time) = self
-                .symbols
-                .get(symbol)
-                .and_then(|state| state.references.pre_open.as_ref())
-                .map(|reference| reference.time_ns)
-            {
-                self.compare_candidate(
-                    symbol,
-                    book,
-                    ValidationAnchor::PreOpen,
-                    reference_time,
-                    Some(
-                        reference_time
-                            .checked_add(REFERENCE_SECOND_NS - REFERENCE_MILLISECOND_NS)
-                            .ok_or(ProductionError::Arithmetic("opening window end"))?,
-                    ),
-                )?;
-                self.anchor_state_mut(symbol, ValidationAnchor::PreOpen, reference_time)
-                    .finalized = true;
-            }
-            if !self.pre_open_only {
-                self.finish_continuous_trading(symbol, book)?;
-            }
-        }
-        Ok(())
+        state.observe_candidates(
+            CandidateContext {
+                market: self.market,
+                symbol,
+                book,
+                limits: self.sz_close_limits.get(symbol),
+                close_price: None,
+            },
+            point,
+            windows,
+            &mut self.counters,
+        )
     }
 }
 
@@ -1650,6 +1316,7 @@ fn compare_reference_scalars(
     mask
 }
 
+#[cfg(test)]
 fn compare_view_mask(
     market: Market,
     symbol: &str,
@@ -2364,7 +2031,7 @@ mod tests {
                 }
                 #[cfg(feature = "profiling")]
                 if missing_match {
-                    assert!(observer.scalar_rejected_candidates > 0);
+                    assert!(observer.counters.scalar_rejected_candidates > 0);
                 }
             }
         }

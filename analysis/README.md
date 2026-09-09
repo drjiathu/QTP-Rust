@@ -10,11 +10,23 @@ notebook 已清理；旧代码可从 Git 提交 `f3f77c0`（历史整理前 `73a
 | `run_additional_random_validation.py` | 新增五日驱动，复用上述模块 |
 | `run_p0_optimized_regression.py` | P0 十五日回归，与历史两批逐份比较语义报告；提供优化回归共用驱动 |
 | `run_p1_optimized_regression.py` | 三项 P1 优化的十五日回归，与冻结 P0 基线比较报告、分项耗时和峰值内存 |
+| `run_callback_validation.py` | validation 回调优化：`abba` 串行样本对照、`full` 十五日全量回归，基线为 `72b7d43` |
 | `extract_validation_symbols.py` | 从 pretty JSON 验证报告提取不匹配证券代码 |
 
 批次日期、输出目录和版本检查固定用于重现已存证据，`--launch` 拒绝覆盖已有目录。
 P0/P1 入口直接执行即启动，使用已构建的 release profiling example，目标目录已存在则拒绝运行。
 运行新批次应使用独立批次实现/目录，不覆盖旧结果。需要 PyArrow 的脚本使用 Clara Python。
+
+回调优化的运行顺序（先构建 release profiling example）：
+
+```bash
+cargo build --release --locked --features profiling --example validation_benchmark
+/home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_callback_validation.py abba
+/home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_callback_validation.py full
+```
+
+ABBA 在 20260828 使用沪市 `600519,510300`、深市 `000001,159915`，每个市场按旧、新、
+新、旧串行运行；保存二进制指纹、命令、计时和报告一致性。小样本不能代替全市场验收。
 
 `20260907-current-full-regression.ipynb` 和 `20260908-additional-random-validation.ipynb`
 仅用于本地历史结果阅读，已停止跟踪但保留本地文件。`analysis/*.ipynb`、缓存及
