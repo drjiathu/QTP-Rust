@@ -27,6 +27,8 @@ pub struct ValidationTimings {
     pub profiled_total_seconds: f64,
     pub unattributed_seconds: f64,
     pub observation_calls: u64,
+    pub scalar_rejected_candidates: u64,
+    pub depth_materializations: u64,
 }
 
 struct TimedObserver<'a> {
@@ -121,6 +123,8 @@ pub fn profile_validate_market_day(
         .checked_sub(callbacks)
         .ok_or(ProductionError::Arithmetic("profiling callback partition"))?;
     let start = Instant::now();
+    let scalar_rejected_candidates = observer.scalar_rejected_candidates;
+    let depth_materializations = observer.depth_materializations;
     let report = observer.into_report(replay, config.retain_matched_records);
     let finalize = start.elapsed();
     let restore = input + replay_exclusive + cleanup;
@@ -141,6 +145,8 @@ pub fn profile_validate_market_day(
         profiled_total_seconds: total.as_secs_f64(),
         unattributed_seconds: residual.as_secs_f64(),
         observation_calls: calls,
+        scalar_rejected_candidates,
+        depth_materializations,
     };
     Ok((report, timings))
 }

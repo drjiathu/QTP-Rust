@@ -35,12 +35,28 @@ pub struct SnapshotBookView {
 
 impl SnapshotBookView {
     pub fn from_book(book: &OrderBook, depth: usize) -> Result<Self, ProductionError> {
+        let mut view = Self::from_book_scalars(book)?;
+        view.fill_depth(book, depth)?;
+        Ok(view)
+    }
+
+    pub(crate) fn fill_depth(
+        &mut self,
+        book: &OrderBook,
+        depth: usize,
+    ) -> Result<(), ProductionError> {
+        self.bids = snapshot_levels(book, Side::Buy, depth)?;
+        self.asks = snapshot_levels(book, Side::Sell, depth)?;
+        Ok(())
+    }
+
+    pub(crate) fn from_book_scalars(book: &OrderBook) -> Result<Self, ProductionError> {
         let (total_bid_quantity, weighted_bid_price_units) = aggregate_side(book, Side::Buy)?;
         let (total_ask_quantity, weighted_ask_price_units) = aggregate_side(book, Side::Sell)?;
-        let statistics = book.summary().statistics;
+        let statistics = book.statistics();
         Ok(Self {
-            bids: snapshot_levels(book, Side::Buy, depth)?,
-            asks: snapshot_levels(book, Side::Sell, depth)?,
+            bids: SnapshotLevels::new(),
+            asks: SnapshotLevels::new(),
             total_bid_quantity,
             weighted_bid_price_units,
             total_ask_quantity,

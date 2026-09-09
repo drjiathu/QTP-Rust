@@ -2,15 +2,18 @@
 
 保留最新批次入口和通用定位工具。依赖旧快照、临时提取文件或旧策略的一次性脚本及
 notebook 已清理；旧代码可从 Git 提交 `f3f77c0`（历史整理前 `73adb97`）恢复。
-当前只跟踪下列三个 Python 工具与本文档，不属于生产接口。
+当前跟踪下列 Python 工具与本文档，不属于生产接口。
 
 | 文件 | 用途 |
 | --- | --- |
 | `run_current_full_regression.py` | 十日驱动及共享执行、报告审计、profiling 汇总函数 |
 | `run_additional_random_validation.py` | 新增五日驱动，复用上述模块 |
+| `run_p0_optimized_regression.py` | P0 十五日回归，与历史两批逐份比较语义报告；提供优化回归共用驱动 |
+| `run_p1_optimized_regression.py` | 三项 P1 优化的十五日回归，与冻结 P0 基线比较报告、分项耗时和峰值内存 |
 | `extract_validation_symbols.py` | 从 pretty JSON 验证报告提取不匹配证券代码 |
 
 批次日期、输出目录和版本检查固定用于重现已存证据，`--launch` 拒绝覆盖已有目录。
+P0/P1 入口直接执行即启动，使用已构建的 release profiling example，目标目录已存在则拒绝运行。
 运行新批次应使用独立批次实现/目录，不覆盖旧结果。需要 PyArrow 的脚本使用 Clara Python。
 
 `20260907-current-full-regression.ipynb` 和 `20260908-additional-random-validation.ipynb`
@@ -27,6 +30,9 @@ python3 analysis/extract_validation_symbols.py reports/20260908-additional-rando
 ```
 
 已提交的结果摘要见[验证基线](../docs/real-data-validation.md)，详细证据位于本地 `reports/`。
+优化回归的 `comparison.json`/`comparison.md` 比较同日同市场结果与时间。
+语义报告比较包括汇总、阶段审计、排除项和失败明细；不包含已省略的成功逐帧候选元数据。
+首次命中和最佳失败候选的保真另由差分单元测试覆盖。六进程并发耗时不能视为独占 CPU 基准。
 批次内 `source-snapshot/analysis`
 是不可变运行版本，允许保留旧路径，不作为当前执行入口；不要为清理而改写源码快照。
 

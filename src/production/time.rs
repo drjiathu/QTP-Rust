@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use chrono::{FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, TimeZone};
+use chrono::NaiveDate;
 
 use crate::{QuoteTimestampNs, TradingDay};
 
@@ -38,36 +38,65 @@ pub fn parse_market_timestamp(
     trading_day: TradingDay,
     value: &str,
 ) -> Result<i64, ProductionError> {
-    if value.len() != 12
-        || value.as_bytes().get(2) != Some(&b':')
-        || value.as_bytes().get(5) != Some(&b':')
-        || value.as_bytes().get(8) != Some(&b'.')
-    {
-        return Err(ProductionError::InvalidRequest(format!(
-            "timestamp must be HH:MM:SS.mmm: {value:?}"
-        )));
+    MarketTimestampParser::new(trading_day)?.parse(value)
+}
+
+/// The trading-day conversion is shared by every timestamp in an input stream.
+pub(crate) struct MarketTimestampParser {
+    midnight_millis: i64,
+}
+
+impl MarketTimestampParser {
+    pub(crate) fn new(day: TradingDay) -> Result<Self, ProductionError> {
+        let encoded = day.as_yyyymmdd();
+        let midnight = NaiveDate::from_ymd_opt(
+            (encoded / 10_000) as i32,
+            encoded / 100 % 100,
+            encoded % 100,
+        )
+        .and_then(|date| date.and_hms_opt(0, 0, 0))
+        .ok_or_else(|| {
+            ProductionError::InvalidRequest(format!("invalid trading day: {encoded}"))
+        })?;
+        Ok(Self {
+            midnight_millis: midnight.and_utc().timestamp_millis() - 28_800_000,
+        })
     }
-    let time = NaiveTime::parse_from_str(value, "%H:%M:%S%.3f").map_err(|_| {
-        ProductionError::InvalidRequest(format!("invalid market timestamp: {value:?}"))
-    })?;
-    let date = trading_day.as_yyyymmdd().to_string();
-    let date = NaiveDate::parse_from_str(&date, "%Y%m%d").map_err(|_| {
-        ProductionError::InvalidRequest(format!(
-            "invalid trading day: {}",
-            trading_day.as_yyyymmdd()
-        ))
-    })?;
-    let local = NaiveDateTime::new(date, time);
-    let offset = FixedOffset::east_opt(8 * 60 * 60)
-        .ok_or_else(|| ProductionError::InvalidRequest("invalid Shanghai offset".to_owned()))?;
-    let timestamp = offset
-        .from_local_datetime(&local)
-        .single()
-        .ok_or_else(|| ProductionError::InvalidRequest(format!("invalid local time: {value}")))?;
-    timestamp
-        .timestamp_millis()
-        .checked_mul(NANOS_PER_MILLISECOND)
-        .ok_or(ProductionError::Arithmetic("timestamp nanoseconds"))
+
+    pub(crate) fn parse(&self, value: &str) -> Result<i64, ProductionError> {
+        if value.len() != 12
+            || value.as_bytes().get(2) != Some(&b':')
+            || value.as_bytes().get(5) != Some(&b':')
+            || value.as_bytes().get(8) != Some(&b'.')
+        {
+            return Err(ProductionError::InvalidRequest(format!(
+                "timestamp must be HH:MM:SS.mmm: {value:?}"
+            )));
+        }
+        let bytes = value.as_bytes();
+        let digits = |range: std::ops::Range<usize>| -> Option<i64> {
+            bytes[range].iter().try_fold(0_i64, |v, b| {
+                b.is_ascii_digit().then(|| v * 10 + i64::from(b - b'0'))
+            })
+        };
+        let millis = (|| {
+            let hour = digits(0..2)?;
+            let minute = digits(3..5)?;
+            let second = digits(6..8)?;
+            let fraction = digits(9..12)?;
+            // Chrono accepts leap seconds at :60; retain that existing contract.
+            (hour < 24 && minute < 60 && second <= 60)
+                .then_some(((hour * 60 + minute) * 60 + second) * 1000 + fraction)
+        })()
+        .ok_or_else(|| {
+            ProductionError::InvalidRequest(format!("invalid market timestamp: {value:?}"))
+        })?;
+        self.midnight_millis
+            .checked_add(millis)
+            .ok_or(ProductionError::Arithmetic("timestamp milliseconds"))?
+            .checked_mul(NANOS_PER_MILLISECOND)
+            .ok_or(ProductionError::Arithmetic("timestamp nanoseconds"))
+    }
 }
 
 pub(crate) fn time_of_day_nanos(timestamp: QuoteTimestampNs) -> i64 {
@@ -78,6 +107,7 @@ pub(crate) fn time_of_day_nanos(timestamp: QuoteTimestampNs) -> i64 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::{parse_duration, parse_market_timestamp, time_of_day_nanos};
     use crate::{QuoteTimestampNs, TradingDay};
 
@@ -124,5 +154,51 @@ mod tests {
     fn rejects_non_millisecond_text() {
         assert!(parse_market_timestamp(day(), "09:30:00").is_err());
         assert!(parse_market_timestamp(day(), "25:00:00.000").is_err());
+    }
+
+    #[test]
+    fn fixed_parser_matches_chrono_across_day_and_overflow_boundaries() {
+        use chrono::{FixedOffset, NaiveDate, NaiveTime, TimeZone};
+        for encoded in [16770921, 19691231, 20000229, 20260828, 22620411] {
+            let day = TradingDay::from_yyyymmdd(encoded).expect("day");
+            let parser = super::MarketTimestampParser::new(day).expect("parser");
+            let date = NaiveDate::parse_from_str(&encoded.to_string(), "%Y%m%d").expect("date");
+            for hour in 0..24 {
+                for minute in 0..60 {
+                    for (second, fraction) in [(0, 0), (29, 499), (59, 999), (60, 1)] {
+                        let value = format!("{hour:02}:{minute:02}:{second:02}.{fraction:03}");
+                        let time = NaiveTime::parse_from_str(&value, "%H:%M:%S%.3f").expect("time");
+                        let expected = FixedOffset::east_opt(28_800)
+                            .expect("offset")
+                            .from_local_datetime(&date.and_time(time))
+                            .single()
+                            .expect("local")
+                            .timestamp_millis()
+                            .checked_mul(1_000_000);
+                        assert_eq!(parser.parse(&value).ok(), expected, "{encoded} {value}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_parser_rejects_invalid_digits_and_fields() {
+        let parser = super::MarketTimestampParser::new(day()).expect("parser");
+        for value in [
+            "",
+            "09:30:00",
+            "09:30:00.0000",
+            "24:00:00.000",
+            "09:60:00.000",
+            "09:30:61.000",
+            "0x:30:00.000",
+            "09:30:00.0x0",
+            "09-30:00.000",
+            "é:30:00.000",
+            "09:30:00.-01",
+        ] {
+            assert!(parser.parse(value).is_err(), "{value}");
+        }
     }
 }

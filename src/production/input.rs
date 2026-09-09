@@ -14,8 +14,9 @@ use super::spool::{
     Aggressor, FinishedSpool, SpoolSet, SseKind, SseRow, SzExecutionKind, SzExecutionRow,
     SzOrderKind, SzOrderRow, SzSide,
 };
+use super::time::MarketTimestampParser;
 use super::types::is_supported_symbol;
-use super::{MarketDayRequest, ProductionError, parse_market_timestamp};
+use super::{MarketDayRequest, ProductionError};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IngestStats {
@@ -77,6 +78,7 @@ fn ingest_sse(
     quote_time_exclusive: Option<i64>,
 ) -> Result<(), ProductionError> {
     let path = raw_path(request, "mdl_4_24_0");
+    let timestamp_parser = MarketTimestampParser::new(request.trading_day)?;
     let mut last_sequences = HashMap::new();
     for batch in read_batches(&path, request.batch_size, "SH", "mdl_4_24_0")? {
         let batch = batch.map_err(|source| ProductionError::Arrow {
@@ -130,8 +132,14 @@ fn ingest_sse(
                 stats.excluded_unselected_stock_rows += 1;
                 continue;
             }
-            let quote_time_ns =
-                parse_timestamp_field(request, &path, quote_times, index, source_row, "TickTime")?;
+            let quote_time_ns = parse_timestamp_field(
+                &timestamp_parser,
+                &path,
+                quote_times,
+                index,
+                source_row,
+                "TickTime",
+            )?;
             if quote_time_exclusive.is_some_and(|cutoff| quote_time_ns >= cutoff) {
                 stats.excluded_after_cutoff_rows += 1;
                 continue;
@@ -165,8 +173,14 @@ fn ingest_sse(
                 "TRADE" => 3,
                 _ => 0,
             };
-            let local_time_ns =
-                parse_timestamp_field(request, &path, local_times, index, source_row, "LocalTime")?;
+            let local_time_ns = parse_timestamp_field(
+                &timestamp_parser,
+                &path,
+                local_times,
+                index,
+                source_row,
+                "LocalTime",
+            )?;
             let price_units = decimal_units(&path, prices, index, source_row, "Price", 3)?;
             let quantity = nonnegative_i64(&path, quantities, index, source_row, "Qty")?;
             let row = SseRow {
@@ -198,6 +212,7 @@ fn ingest_sz_orders(
     quote_time_exclusive: Option<i64>,
 ) -> Result<(), ProductionError> {
     let path = raw_path(request, "mdl_6_33_0");
+    let timestamp_parser = MarketTimestampParser::new(request.trading_day)?;
     for batch in read_batches(&path, request.batch_size, "SZ", "mdl_6_33_0")? {
         let batch = batch.map_err(|source| ProductionError::Arrow {
             context: "raw Parquet batch",
@@ -232,7 +247,7 @@ fn ingest_sz_orders(
                 continue;
             }
             let quote_time_ns = parse_timestamp_field(
-                request,
+                &timestamp_parser,
                 &path,
                 quote_times,
                 index,
@@ -276,7 +291,7 @@ fn ingest_sz_orders(
                 symbol: symbol.to_owned(),
                 quote_time_ns,
                 local_time_ns: parse_timestamp_field(
-                    request,
+                    &timestamp_parser,
                     &path,
                     local_times,
                     index,
@@ -301,6 +316,7 @@ fn ingest_sz_executions(
     quote_time_exclusive: Option<i64>,
 ) -> Result<(), ProductionError> {
     let path = raw_path(request, "mdl_6_36_0");
+    let timestamp_parser = MarketTimestampParser::new(request.trading_day)?;
     for batch in read_batches(&path, request.batch_size, "SZ", "mdl_6_36_0")? {
         let batch = batch.map_err(|source| ProductionError::Arrow {
             context: "raw Parquet batch",
@@ -336,7 +352,7 @@ fn ingest_sz_executions(
                 continue;
             }
             let quote_time_ns = parse_timestamp_field(
-                request,
+                &timestamp_parser,
                 &path,
                 quote_times,
                 index,
@@ -367,7 +383,7 @@ fn ingest_sz_executions(
                 symbol: symbol.to_owned(),
                 quote_time_ns,
                 local_time_ns: parse_timestamp_field(
-                    request,
+                    &timestamp_parser,
                     &path,
                     local_times,
                     index,
@@ -769,7 +785,7 @@ fn decimal_units(
 }
 
 fn parse_timestamp_field(
-    request: &MarketDayRequest,
+    parser: &MarketTimestampParser,
     path: &Path,
     array: &LargeStringArray,
     index: usize,
@@ -777,7 +793,8 @@ fn parse_timestamp_field(
     field: &'static str,
 ) -> Result<i64, ProductionError> {
     let value = required_str(path, array, index, field, source_row)?;
-    parse_market_timestamp(request.trading_day, value)
+    parser
+        .parse(value)
         .map_err(|error| invalid(path, source_row, field, error.to_string()))
 }
 

@@ -920,17 +920,22 @@ impl OrderBook {
     }
 
     #[must_use]
-    pub fn summary(&self) -> BookSummary {
-        let best_bid = self.best_level(Side::Buy);
-        let best_ask = self.best_level(Side::Sell);
-        let statistics = TradeStatisticsView {
+    pub fn statistics(&self) -> TradeStatisticsView {
+        TradeStatisticsView {
             last_price: self.statistics.last_price,
             high_price: self.statistics.high_price,
             low_price: self.statistics.low_price,
             total_quantity: self.statistics.total_quantity,
             total_turnover_units: self.statistics.total_turnover_units,
             trade_count: self.statistics.trade_count,
-        };
+        }
+    }
+
+    #[must_use]
+    pub fn summary(&self) -> BookSummary {
+        let best_bid = self.best_level(Side::Buy);
+        let best_ask = self.best_level(Side::Sell);
+        let statistics = self.statistics();
         BookSummary {
             book_key: self.config.book_key.clone(),
             last_raw_sequence: self

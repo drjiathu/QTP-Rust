@@ -11,9 +11,13 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use serde::{Deserialize, Serialize};
 
 mod close_range;
+mod columns;
+use columns::RawSnapshotColumns;
 mod phases;
+mod reference;
 pub use close_range::ClosePriceBandAudit;
 use close_range::{DayLimits, RangeBase};
+use reference::ReferenceBookView;
 #[cfg(feature = "profiling")]
 pub(crate) mod profiling;
 use phases::PhaseTracker;
@@ -203,7 +207,7 @@ impl ValidationReport {
 #[derive(Clone, Debug)]
 struct ReferenceSnapshot {
     time_ns: i64,
-    view: Option<SnapshotBookView>,
+    view: Option<ReferenceBookView>,
     load_error: Option<String>,
     not_comparable_reason: Option<String>,
     pre_close_price_units: Option<i64>,
@@ -264,8 +268,6 @@ impl SymbolReferences {
 
 #[derive(Clone, Debug, Default)]
 struct AnchorState {
-    comparison_error: Option<String>,
-    close_price_band: Option<ClosePriceBandAudit>,
     matched: bool,
     finalized: bool,
     matched_candidate_time_ns: Option<i64>,
@@ -273,8 +275,27 @@ struct AnchorState {
     matched_candidate_apply_sequence: Option<u64>,
     best_candidate_time_ns: Option<i64>,
     best_candidate_raw_sequence: Option<u64>,
-    best_differences: Option<Vec<FieldDifference>>,
     match_tag: Option<&'static str>,
+    diagnostics: Option<Box<AnchorDiagnostics>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AnchorDiagnostics {
+    comparison_error: Option<String>,
+    close_price_band: Option<ClosePriceBandAudit>,
+    best_differences: Option<Vec<FieldDifference>>,
+}
+
+impl AnchorState {
+    fn best_differences(&self) -> Option<&Vec<FieldDifference>> {
+        self.diagnostics
+            .as_ref()
+            .and_then(|d| d.best_differences.as_ref())
+    }
+
+    fn diagnostics_mut(&mut self) -> &mut AnchorDiagnostics {
+        self.diagnostics.get_or_insert_with(Default::default)
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -416,6 +437,10 @@ const SZ_STOCK_PRE_CLOSE_PRICE_TAG: &str = "SZ_STOCK_PRE_CLOSE_PRICE";
 const SZ_ETF_PRE_CLOSE_PRICE_TAG: &str = "SZ_ETF_PRE_CLOSE_PRICE";
 
 struct ValidationObserver {
+    #[cfg(feature = "profiling")]
+    scalar_rejected_candidates: u64,
+    #[cfg(feature = "profiling")]
+    depth_materializations: u64,
     sz_close_limits: HashMap<String, DayLimits>,
     market: Market,
     symbols: HashMap<String, SymbolValidationState>,
@@ -437,6 +462,10 @@ impl ValidationObserver {
         };
         Self {
             sz_close_limits: HashMap::new(),
+            #[cfg(feature = "profiling")]
+            scalar_rejected_candidates: 0,
+            #[cfg(feature = "profiling")]
+            depth_materializations: 0,
             market,
             symbols: references
                 .into_iter()
@@ -610,7 +639,7 @@ impl ValidationObserver {
         let (mut actual, close_price_band) = match projection {
             Ok(Some((view, audit))) => (view, Some(audit)),
             Ok(None) => {
-                let mut view = SnapshotBookView::from_book(book, 10)?;
+                let mut view = SnapshotBookView::from_book_scalars(book)?;
                 view.weighted_bid_price_units =
                     published_weighted_price(book, Side::Buy, self.market, symbol)?;
                 view.weighted_ask_price_units =
@@ -619,11 +648,37 @@ impl ValidationObserver {
             }
             Err(error) => {
                 let state = self.anchor_state_mut(symbol, anchor, reference_time_ns);
-                state.comparison_error = Some(error);
+                state.diagnostics_mut().comparison_error = Some(error);
                 state.finalized = true;
                 return Ok(());
             }
         };
+        if close_price_band.is_none() {
+            let scalar_mask = compare_reference_scalars(self.market, symbol, expected, &actual);
+            // Depth contributes at most two additional field differences. Only
+            // skip when no depth result can improve the first best candidate.
+            // E0 reconciliation requires its complete mask (LastPrice-only).
+            if anchor != ValidationAnchor::MarketClose
+                && !scalar_mask.is_empty()
+                && reference
+                    .state
+                    .best_differences()
+                    .is_some_and(|best| scalar_mask.count() >= best.len())
+            {
+                #[cfg(feature = "profiling")]
+                {
+                    self.scalar_rejected_candidates += 1;
+                }
+                return Ok(());
+            }
+            actual.fill_depth(book, 10)?;
+        }
+        #[cfg(feature = "profiling")]
+        {
+            self.depth_materializations += 1;
+        }
+        let expected_view = expected.expand();
+        let expected = &expected_view;
         let mut difference_mask = compare_view_mask(self.market, symbol, expected, &actual);
         let match_tag = if self.market == Market::Szse && anchor == ValidationAnchor::MarketClose {
             reconcile_sz_market_close_price(
@@ -645,7 +700,7 @@ impl ValidationObserver {
         let best_differences = if !difference_mask.is_empty()
             && self
                 .anchor_state(symbol, anchor, reference_time_ns)
-                .and_then(|state| state.best_differences.as_ref())
+                .and_then(|state| state.best_differences())
                 .is_none_or(|best| difference_mask.count() < best.len())
         {
             Some(compare_views(self.market, symbol, expected, &actual))
@@ -654,12 +709,21 @@ impl ValidationObserver {
         };
         let state = self.anchor_state_mut(symbol, anchor, reference_time_ns);
         if close_price_band.is_some() {
-            state.close_price_band = close_price_band;
+            state.diagnostics_mut().close_price_band = close_price_band;
         }
         if difference_mask.is_empty() {
             state.matched = true;
             state.finalized = true;
-            state.best_differences = None;
+            if let Some(diagnostics) = state.diagnostics.as_mut() {
+                diagnostics.best_differences = None;
+            }
+            if state
+                .diagnostics
+                .as_ref()
+                .is_some_and(|d| d.close_price_band.is_none() && d.comparison_error.is_none())
+            {
+                state.diagnostics = None;
+            }
             state.matched_candidate_time_ns = candidate_time_ns;
             state.matched_candidate_raw_sequence =
                 book.last_applied_meta().map(|m| m.raw_sequence.get());
@@ -667,7 +731,7 @@ impl ValidationObserver {
                 book.last_applied_meta().map(|m| m.apply_sequence.get());
             state.match_tag = match_tag;
         } else if let Some(differences) = best_differences {
-            state.best_differences = Some(differences);
+            state.diagnostics_mut().best_differences = Some(differences);
             state.best_candidate_time_ns = candidate_time_ns;
             state.best_candidate_raw_sequence =
                 book.last_applied_meta().map(|m| m.raw_sequence.get());
@@ -917,7 +981,10 @@ impl ValidationObserver {
                     .as_ref()
                     .and_then(|state| state.match_tag)
                     .map(str::to_owned);
-                let close_price_band = state.as_ref().and_then(|s| s.close_price_band.clone());
+                let close_price_band = state
+                    .as_ref()
+                    .and_then(|s| s.diagnostics.as_ref())
+                    .and_then(|d| d.close_price_band.clone());
                 let (outcome, reason, differences) = match (reference.as_ref(), state) {
                     _ if self
                         .phase_audit
@@ -974,7 +1041,8 @@ impl ValidationObserver {
                                 replay.sz_after_close_events_by_symbol[&symbol]
                             )),
                             state
-                                .and_then(|state| state.best_differences)
+                                .and_then(|state| state.diagnostics)
+                                .and_then(|d| d.best_differences)
                                 .unwrap_or_default(),
                         )
                     }
@@ -993,11 +1061,18 @@ impl ValidationObserver {
                         Some("no selected raw order/trade events were observed".to_owned()),
                         Vec::new(),
                     ),
-                    (Some(_), Some(state)) if state.comparison_error.is_some() => (
-                        ValidationOutcome::DataError,
-                        state.comparison_error,
-                        Vec::new(),
-                    ),
+                    (Some(_), Some(state))
+                        if state
+                            .diagnostics
+                            .as_ref()
+                            .is_some_and(|d| d.comparison_error.is_some()) =>
+                    {
+                        (
+                            ValidationOutcome::DataError,
+                            state.diagnostics.and_then(|d| d.comparison_error),
+                            Vec::new(),
+                        )
+                    }
                     (Some(_), Some(state)) if state.matched => {
                         (ValidationOutcome::Matched, None, Vec::new())
                     }
@@ -1007,7 +1082,10 @@ impl ValidationObserver {
                             "no reconstructed full-state candidate matched the reference"
                                 .to_owned(),
                         ),
-                        state.best_differences.unwrap_or_default(),
+                        state
+                            .diagnostics
+                            .and_then(|d| d.best_differences)
+                            .unwrap_or_default(),
                     ),
                     (Some(_), None) => (
                         ValidationOutcome::MissingSource,
@@ -1296,8 +1374,12 @@ fn load_references(
 ) -> Result<LoadedReferences, ProductionError> {
     let path = raw_snapshot_reference_path(request);
     let file = File::open(&path).map_err(|error| ProductionError::io(&path, error))?;
-    let reader = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|error| ProductionError::parquet(&path, error))?
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|error| ProductionError::parquet(&path, error))?;
+    let projection = columns::projection(&builder, request.market, &path)?;
+    let timestamp_parser = super::time::MarketTimestampParser::new(request.trading_day)?;
+    let reader = builder
+        .with_projection(projection)
         .with_batch_size(request.batch_size)
         .build()
         .map_err(|error| ProductionError::parquet(&path, error))?;
@@ -1316,7 +1398,7 @@ fn load_references(
             context: "raw snapshot batch",
             source,
         })?;
-        validate_raw_snapshot_schema(request.market, &path, &batch)?;
+        let columns = RawSnapshotColumns::bind(request.market, &path, &batch)?;
         let symbols = large_string(&path, &batch, "SecurityID")?;
         let times = large_string(&path, &batch, "UpdateTime")?;
         let statuses = large_string(&path, &batch, status_field)?;
@@ -1338,21 +1420,12 @@ fn load_references(
             {
                 continue;
             }
-            let time_ns = super::parse_market_timestamp(request.trading_day, times.value(row))?;
+            let time_ns = timestamp_parser.parse(times.value(row))?;
             if !pre_open_only
                 && request.market == Market::Szse
                 && !is_etf_symbol(request.market, symbol)
             {
-                let read_limit = |name: &str| -> Result<i64, String> {
-                    let values = decimal128(&path, &batch, name, 6).map_err(|e| e.to_string())?;
-                    if values.is_null(row) || values.value(row) % 100 != 0 {
-                        return Err(format!("missing/invalid {name}"));
-                    }
-                    i64::try_from(values.value(row) / 100)
-                        .map_err(|_| format!("overflow in {name}"))
-                };
-                let values = read_limit("HighLimitPrice")
-                    .and_then(|high| read_limit("LowLimitPrice").map(|low| (high, low)));
+                let values = columns.limits(row);
                 sz_close_limits
                     .entry(symbol.to_owned())
                     .or_default()
@@ -1377,8 +1450,7 @@ fn load_references(
             if pre_open_only && anchor != ValidationAnchor::PreOpen {
                 continue;
             }
-            let (view, load_error) =
-                load_raw_snapshot_view(request.market, &path, &batch, row, anchor)?;
+            let (view, load_error) = load_raw_snapshot_view(&columns, &path, row)?;
             let candidate = ReferenceSnapshot {
                 time_ns,
                 view,
@@ -1387,7 +1459,7 @@ fn load_references(
                 pre_close_price_units: if request.market == Market::Szse
                     && anchor == ValidationAnchor::MarketClose
                 {
-                    optional_decimal_units(&path, &batch, "PreCloPrice", row, 4, 4)?
+                    columns.pre_close(row)?
                 } else {
                     None
                 },
@@ -1460,14 +1532,12 @@ fn load_references(
 }
 
 fn load_raw_snapshot_view(
-    market: Market,
+    columns: &RawSnapshotColumns<'_>,
     path: &Path,
-    batch: &RecordBatch,
     row: usize,
-    anchor: ValidationAnchor,
-) -> Result<(Option<SnapshotBookView>, Option<String>), ProductionError> {
-    match raw_snapshot_reference_view(market, path, batch, row, anchor) {
-        Ok(view) => Ok((Some(view), None)),
+) -> Result<(Option<ReferenceBookView>, Option<String>), ProductionError> {
+    match columns.view(path, row) {
+        Ok(view) => Ok((Some(view.try_into()?), None)),
         Err(ProductionError::Validation(detail)) => Ok((None, Some(detail))),
         Err(error) => Err(error),
     }
@@ -1482,160 +1552,6 @@ fn raw_snapshot_reference_path(request: &MarketDayRequest) -> PathBuf {
             Market::Szse => "mdl_6_28_0",
         })
         .join("part-0.parquet")
-}
-
-fn validate_raw_snapshot_schema(
-    market: Market,
-    path: &Path,
-    batch: &RecordBatch,
-) -> Result<(), ProductionError> {
-    let common = [
-        "UpdateTime",
-        "SecurityID",
-        "LastPrice",
-        "HighPrice",
-        "LowPrice",
-        "Turnover",
-        "source_row_no",
-    ];
-    let market_fields: &[&str] = match market {
-        Market::Sse => &[
-            "InstruStatus",
-            "TradNumber",
-            "TradVolume",
-            "TotalBidVol",
-            "WAvgBidPri",
-            "TotalAskVol",
-            "WAvgAskPri",
-        ],
-        Market::Szse => &[
-            "TradingPhaseCode",
-            "PreCloPrice",
-            "TurnNum",
-            "Volume",
-            "TotalBidQty",
-            "WeightedAvgBidPx",
-            "TotalOfferQty",
-            "WeightedAvgOfferPx",
-        ],
-    };
-    for field in common.into_iter().chain(market_fields.iter().copied()) {
-        column_index(path, batch, field)?;
-    }
-    for side in ["Ask", "Bid"] {
-        for level in 1..=10 {
-            for field in [
-                format!("{side}Price{level}"),
-                format!("{side}Volume{level}"),
-                format!("NumOrders{}{level}", if side == "Ask" { "S" } else { "B" }),
-            ] {
-                column_index(path, batch, &field)?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn raw_snapshot_reference_view(
-    market: Market,
-    path: &Path,
-    batch: &RecordBatch,
-    row: usize,
-    _anchor: ValidationAnchor,
-) -> Result<SnapshotBookView, ProductionError> {
-    let price_scale = match market {
-        Market::Sse => 3,
-        Market::Szse => 6,
-    };
-    let mut asks = SnapshotLevels::new();
-    let mut bids = SnapshotLevels::new();
-    for (side, target) in [("Ask", &mut asks), ("Bid", &mut bids)] {
-        for level in 1..=10 {
-            let price = optional_decimal_units(
-                path,
-                batch,
-                &format!("{side}Price{level}"),
-                row,
-                price_scale,
-                4,
-            )?;
-            let quantity = match market {
-                Market::Sse => {
-                    optional_decimal_u64(path, batch, &format!("{side}Volume{level}"), row, 3)?
-                }
-                Market::Szse => {
-                    optional_nonnegative(path, batch, &format!("{side}Volume{level}"), row)?
-                }
-            };
-            let order_count = optional_uint32(
-                path,
-                batch,
-                &format!("NumOrders{}{level}", if side == "Ask" { "S" } else { "B" }),
-                row,
-            )?;
-            match (price, quantity, order_count) {
-                (None, None | Some(0), None | Some(0)) => {}
-                (Some(price_units), Some(quantity), Some(order_count))
-                    if quantity > 0 && order_count > 0 =>
-                {
-                    target.push(SnapshotLevel {
-                        price_units,
-                        quantity,
-                        order_count,
-                    });
-                }
-                values => {
-                    return Err(ProductionError::Validation(format!(
-                        "inconsistent raw snapshot {side} level {level} in {} row {row}: {values:?}",
-                        path.display()
-                    )));
-                }
-            }
-        }
-    }
-
-    let (
-        total_bid_quantity,
-        weighted_bid_price_units,
-        total_ask_quantity,
-        weighted_ask_price_units,
-        trade_count,
-        trade_quantity,
-        turnover_units,
-    ) = match market {
-        Market::Sse => (
-            required_decimal_u64(path, batch, "TotalBidVol", row, 3)?,
-            optional_decimal_units(path, batch, "WAvgBidPri", row, 3, 4)?,
-            required_decimal_u64(path, batch, "TotalAskVol", row, 3)?,
-            optional_decimal_units(path, batch, "WAvgAskPri", row, 3, 4)?,
-            required_uint32(path, batch, "TradNumber", row)?,
-            required_decimal_u64(path, batch, "TradVolume", row, 3)?,
-            required_decimal_scaled_u128(path, batch, "Turnover", row, 5, 4)?,
-        ),
-        Market::Szse => (
-            required_nonnegative(path, batch, "TotalBidQty", row)?,
-            optional_decimal_units(path, batch, "WeightedAvgBidPx", row, 6, 4)?,
-            required_nonnegative(path, batch, "TotalOfferQty", row)?,
-            optional_decimal_units(path, batch, "WeightedAvgOfferPx", row, 6, 4)?,
-            required_nonnegative(path, batch, "TurnNum", row)?,
-            required_nonnegative(path, batch, "Volume", row)?,
-            required_decimal_scaled_u128(path, batch, "Turnover", row, 4, 4)?,
-        ),
-    };
-    Ok(SnapshotBookView {
-        bids,
-        asks,
-        total_bid_quantity,
-        weighted_bid_price_units,
-        total_ask_quantity,
-        weighted_ask_price_units,
-        last_price_units: optional_decimal_units(path, batch, "LastPrice", row, price_scale, 4)?,
-        high_price_units: optional_decimal_units(path, batch, "HighPrice", row, price_scale, 4)?,
-        low_price_units: optional_decimal_units(path, batch, "LowPrice", row, price_scale, 4)?,
-        trade_count,
-        trade_quantity,
-        turnover_units,
-    })
 }
 
 fn market_text(market: Market) -> &'static str {
@@ -1679,6 +1595,59 @@ impl DifferenceMask {
     const fn is_only(self, bit: u16) -> bool {
         self.0 == bit
     }
+}
+
+fn compare_reference_scalars(
+    market: Market,
+    symbol: &str,
+    expected: &ReferenceBookView,
+    actual: &SnapshotBookView,
+) -> DifferenceMask {
+    let mut mask = DifferenceMask::default();
+    mask.record(
+        DIFF_TOTAL_BID_QUANTITY,
+        expected.total_bid_quantity != actual.total_bid_quantity,
+    );
+    mask.record(
+        DIFF_WEIGHTED_BID_PRICE,
+        !weighted_prices_match(
+            expected.weighted_bid_price_units,
+            validation_price(market, symbol, actual.weighted_bid_price_units),
+        ),
+    );
+    mask.record(
+        DIFF_TOTAL_ASK_QUANTITY,
+        expected.total_ask_quantity != actual.total_ask_quantity,
+    );
+    mask.record(
+        DIFF_WEIGHTED_ASK_PRICE,
+        !weighted_prices_match(
+            expected.weighted_ask_price_units,
+            validation_price(market, symbol, actual.weighted_ask_price_units),
+        ),
+    );
+    mask.record(
+        DIFF_LAST_PRICE,
+        expected.last_price_units != actual.last_price_units,
+    );
+    mask.record(
+        DIFF_HIGH_PRICE,
+        expected.high_price_units != actual.high_price_units,
+    );
+    mask.record(
+        DIFF_LOW_PRICE,
+        expected.low_price_units != actual.low_price_units,
+    );
+    mask.record(DIFF_TRADE_COUNT, expected.trade_count != actual.trade_count);
+    mask.record(
+        DIFF_TRADE_QUANTITY,
+        expected.trade_quantity != actual.trade_quantity,
+    );
+    mask.record(
+        DIFF_TURNOVER,
+        expected.turnover_units != actual.turnover_units,
+    );
+    mask
 }
 
 fn compare_view_mask(
@@ -2067,140 +2036,6 @@ fn rescale_nonnegative_decimal(value: i128, source_scale: i8, target_scale: i8) 
     }
 }
 
-fn optional_decimal_units(
-    path: &Path,
-    batch: &RecordBatch,
-    name: &str,
-    row: usize,
-    source_scale: i8,
-    target_scale: i8,
-) -> Result<Option<i64>, ProductionError> {
-    let array = decimal128(path, batch, name, source_scale)?;
-    if array.is_null(row) || array.value(row) == 0 {
-        return Ok(None);
-    }
-    let raw = array.value(row);
-    let scaled = rescale_nonnegative_decimal(raw, source_scale, target_scale).ok_or_else(|| {
-        ProductionError::Validation(format!("invalid raw reference {name}={raw} at row {row}"))
-    })?;
-    i64::try_from(scaled).map(Some).map_err(|_| {
-        ProductionError::Validation(format!(
-            "raw reference {name}={raw} does not fit i64 at row {row}"
-        ))
-    })
-}
-
-fn optional_decimal_u64(
-    path: &Path,
-    batch: &RecordBatch,
-    name: &str,
-    row: usize,
-    source_scale: i8,
-) -> Result<Option<u64>, ProductionError> {
-    let array = decimal128(path, batch, name, source_scale)?;
-    if array.is_null(row) {
-        return Ok(None);
-    }
-    let raw = array.value(row);
-    let divisor = 10_i128
-        .checked_pow(u32::try_from(source_scale).unwrap_or_default())
-        .ok_or(ProductionError::Arithmetic("raw quantity scale"))?;
-    if raw < 0 || raw % divisor != 0 {
-        return Err(ProductionError::Validation(format!(
-            "raw reference quantity {name}={raw} is not an integer at row {row}"
-        )));
-    }
-    u64::try_from(raw / divisor).map(Some).map_err(|_| {
-        ProductionError::Validation(format!(
-            "raw reference quantity {name}={raw} does not fit u64 at row {row}"
-        ))
-    })
-}
-
-fn required_decimal_u64(
-    path: &Path,
-    batch: &RecordBatch,
-    name: &str,
-    row: usize,
-    source_scale: i8,
-) -> Result<u64, ProductionError> {
-    optional_decimal_u64(path, batch, name, row, source_scale)?.ok_or_else(|| {
-        ProductionError::Validation(format!("raw reference {name} is null at row {row}"))
-    })
-}
-
-fn required_decimal_scaled_u128(
-    path: &Path,
-    batch: &RecordBatch,
-    name: &str,
-    row: usize,
-    source_scale: i8,
-    target_scale: i8,
-) -> Result<u128, ProductionError> {
-    let array = decimal128(path, batch, name, source_scale)?;
-    if array.is_null(row) {
-        return Err(ProductionError::Validation(format!(
-            "raw reference {name} is null at row {row}"
-        )));
-    }
-    let raw = array.value(row);
-    let scaled = rescale_nonnegative_decimal(raw, source_scale, target_scale).ok_or_else(|| {
-        ProductionError::Validation(format!("invalid raw reference {name}={raw} at row {row}"))
-    })?;
-    u128::try_from(scaled).map_err(|_| {
-        ProductionError::Validation(format!(
-            "raw reference {name}={raw} does not fit u128 at row {row}"
-        ))
-    })
-}
-
-fn optional_uint32(
-    path: &Path,
-    batch: &RecordBatch,
-    name: &str,
-    row: usize,
-) -> Result<Option<u64>, ProductionError> {
-    let array = uint32(path, batch, name)?;
-    Ok((!array.is_null(row)).then(|| u64::from(array.value(row))))
-}
-
-fn required_uint32(
-    path: &Path,
-    batch: &RecordBatch,
-    name: &str,
-    row: usize,
-) -> Result<u64, ProductionError> {
-    optional_uint32(path, batch, name, row)?.ok_or_else(|| {
-        ProductionError::Validation(format!("raw reference {name} is null at row {row}"))
-    })
-}
-
-fn optional_nonnegative(
-    path: &Path,
-    batch: &RecordBatch,
-    name: &str,
-    row: usize,
-) -> Result<Option<u64>, ProductionError> {
-    let array = int64(path, batch, name)?;
-    if array.is_null(row) {
-        return Ok(None);
-    }
-    u64::try_from(array.value(row)).map(Some).map_err(|_| {
-        ProductionError::Validation(format!("reference {name} is negative at row {row}"))
-    })
-}
-
-fn required_nonnegative(
-    path: &Path,
-    batch: &RecordBatch,
-    name: &str,
-    row: usize,
-) -> Result<u64, ProductionError> {
-    optional_nonnegative(path, batch, name, row)?.ok_or_else(|| {
-        ProductionError::Validation(format!("reference {name} is null at row {row}"))
-    })
-}
-
 const fn anchor_rank(anchor: ValidationAnchor) -> u8 {
     match anchor {
         ValidationAnchor::PreOpen => 0,
@@ -2278,7 +2113,12 @@ mod tests {
                 SymbolReferences {
                     market_close: Some(ReferenceSnapshot {
                         time_ns: timestamp("15:00:00.000"),
-                        view: Some(expected.clone()),
+                        view: Some(
+                            expected
+                                .clone()
+                                .try_into()
+                                .unwrap_or_else(|_| std::process::abort()),
+                        ),
                         load_error: None,
                         not_comparable_reason: None,
                         pre_close_price_units: None,
@@ -2323,7 +2163,11 @@ mod tests {
                     .as_ref()
                     .expect("reference")
                     .view,
-                Some(expected)
+                Some(
+                    expected
+                        .try_into()
+                        .unwrap_or_else(|_| std::process::abort())
+                )
             );
             let report = observer.into_report(ReplayReport::default(), true);
             let close = report
@@ -2382,7 +2226,7 @@ mod tests {
                 continuous_trading: Vec::new(),
                 market_close: Some(ReferenceSnapshot {
                     time_ns: timestamp("15:00:00.000"),
-                    view: Some(view),
+                    view: Some(view.try_into().unwrap_or_else(|_| std::process::abort())),
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: Some(pre_close_price_units),
@@ -2417,6 +2261,116 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::expect_used)]
+    fn scalar_pruning_preserves_first_match_and_best_difference_context() {
+        let mut book = empty_book();
+        let mut candidates = vec![book.clone()];
+        for seq in 1..=24 {
+            book.apply(BookEvent::AddOrder(AddOrder {
+                meta: EventMeta {
+                    book_key: book.config().book_key.clone(),
+                    raw_sequence: RawSequence::new(seq).expect("raw"),
+                    apply_sequence: ApplySequence::new(seq).expect("apply"),
+                    local_time: LocalTimestampNs::from_nanos(seq as i64),
+                    quote_time: QuoteTimestampNs::from_nanos(seq as i64),
+                },
+                order_key: OrderKey {
+                    channel_id: ChannelId::new(1).expect("channel"),
+                    side: if seq % 2 == 0 { Side::Buy } else { Side::Sell },
+                    order_id: OrderId::new(seq).expect("id"),
+                },
+                pricing: PricingInstruction::Provided(
+                    Price::from_units(100_000 + seq as i64 * 100).expect("price"),
+                ),
+                crossing: CrossingBehavior::Rest,
+                quantity: Quantity::new(seq * 100).expect("qty"),
+            }))
+            .expect("apply");
+            candidates.push(book.clone());
+        }
+        for market in [Market::Sse, Market::Szse] {
+            for missing_match in [false, true] {
+                let mut expected =
+                    super::SnapshotBookView::from_book(&candidates[12], 10).expect("view");
+                expected.weighted_bid_price_units =
+                    super::published_weighted_price(&candidates[12], Side::Buy, market, "600000")
+                        .expect("bid");
+                expected.weighted_ask_price_units =
+                    super::published_weighted_price(&candidates[12], Side::Sell, market, "600000")
+                        .expect("ask");
+                if missing_match {
+                    expected.trade_count = 1;
+                }
+                let refs = HashMap::from([(
+                    "600000".to_owned(),
+                    SymbolReferences {
+                        continuous_trading: vec![ReferenceSnapshot {
+                            time_ns: 10,
+                            view: Some(expected.clone().try_into().expect("compact")),
+                            load_error: None,
+                            not_comparable_reason: None,
+                            pre_close_price_units: None,
+                            state: AnchorState::default(),
+                        }],
+                        ..SymbolReferences::default()
+                    },
+                )]);
+                let mut observer = ValidationObserver::new(market, refs);
+                let mut best: Option<Vec<super::FieldDifference>> = None;
+                let mut best_time = None;
+                let mut matched_time = None;
+                for (i, candidate) in candidates.iter().chain(candidates.iter().rev()).enumerate() {
+                    let time = i as i64;
+                    if matched_time.is_none() {
+                        let mut actual =
+                            super::SnapshotBookView::from_book(candidate, 10).expect("view");
+                        actual.weighted_bid_price_units =
+                            super::published_weighted_price(candidate, Side::Buy, market, "600000")
+                                .expect("bid");
+                        actual.weighted_ask_price_units = super::published_weighted_price(
+                            candidate,
+                            Side::Sell,
+                            market,
+                            "600000",
+                        )
+                        .expect("ask");
+                        let diffs = super::compare_views(market, "600000", &expected, &actual);
+                        if diffs.is_empty() {
+                            matched_time = Some(time);
+                            best = None;
+                        } else if best.as_ref().is_none_or(|b| diffs.len() < b.len()) {
+                            best = Some(diffs);
+                            best_time = Some(time);
+                        }
+                    }
+                    observer
+                        .compare_candidate(
+                            "600000",
+                            candidate,
+                            ValidationAnchor::ContinuousTrading,
+                            10,
+                            Some(time),
+                        )
+                        .expect("compare");
+                    let state = observer
+                        .anchor_state("600000", ValidationAnchor::ContinuousTrading, 10)
+                        .expect("state");
+                    assert_eq!(state.matched_candidate_time_ns, matched_time);
+                    assert_eq!(state.best_candidate_time_ns, best_time);
+                    assert_eq!(state.best_differences(), best.as_ref());
+                    if state.matched {
+                        assert!(state.diagnostics.is_none());
+                    }
+                }
+                #[cfg(feature = "profiling")]
+                if missing_match {
+                    assert!(observer.scalar_rejected_candidates > 0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn pre_open_accepts_a_state_inside_the_reference_second() {
         let mut expected_book = empty_book();
         add_order(&mut expected_book);
@@ -2429,7 +2383,11 @@ mod tests {
             SymbolReferences {
                 pre_open: Some(ReferenceSnapshot {
                     time_ns: 10_000_000,
-                    view: Some(expected),
+                    view: Some(
+                        expected
+                            .try_into()
+                            .unwrap_or_else(|_| std::process::abort()),
+                    ),
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
@@ -2523,7 +2481,11 @@ mod tests {
                 pre_open: None,
                 continuous_trading: vec![ReferenceSnapshot {
                     time_ns: reference_time,
-                    view: Some(expected),
+                    view: Some(
+                        expected
+                            .try_into()
+                            .unwrap_or_else(|_| std::process::abort()),
+                    ),
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
@@ -2614,7 +2576,11 @@ mod tests {
                 pre_open: None,
                 continuous_trading: vec![ReferenceSnapshot {
                     time_ns: reference_time,
-                    view: Some(expected),
+                    view: Some(
+                        expected
+                            .try_into()
+                            .unwrap_or_else(|_| std::process::abort()),
+                    ),
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
@@ -2673,7 +2639,11 @@ mod tests {
                 pre_open: None,
                 continuous_trading: vec![ReferenceSnapshot {
                     time_ns: reference_time,
-                    view: Some(expected),
+                    view: Some(
+                        expected
+                            .try_into()
+                            .unwrap_or_else(|_| std::process::abort()),
+                    ),
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
@@ -2732,7 +2702,11 @@ mod tests {
                 pre_open: None,
                 continuous_trading: vec![ReferenceSnapshot {
                     time_ns: reference_time,
-                    view: Some(expected),
+                    view: Some(
+                        expected
+                            .try_into()
+                            .unwrap_or_else(|_| std::process::abort()),
+                    ),
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
@@ -2798,7 +2772,11 @@ mod tests {
                 pre_open: None,
                 continuous_trading: vec![ReferenceSnapshot {
                     time_ns: reference_time,
-                    view: Some(expected),
+                    view: Some(
+                        expected
+                            .try_into()
+                            .unwrap_or_else(|_| std::process::abort()),
+                    ),
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
@@ -2855,7 +2833,12 @@ mod tests {
                         pre_open: None,
                         continuous_trading: vec![ReferenceSnapshot {
                             time_ns: 10_000_000_000,
-                            view: Some(expected.clone()),
+                            view: Some(
+                                expected
+                                    .clone()
+                                    .try_into()
+                                    .unwrap_or_else(|_| std::process::abort()),
+                            ),
                             load_error: None,
                             not_comparable_reason: None,
                             pre_close_price_units: None,
@@ -2935,6 +2918,7 @@ mod tests {
                 time_ns: reference_time,
                 view: Some(
                     super::SnapshotBookView::from_book(&expected_book, 10)
+                        .and_then(TryInto::try_into)
                         .unwrap_or_else(|_| std::process::abort()),
                 ),
                 load_error: None,
@@ -3040,6 +3024,7 @@ mod tests {
                     time_ns,
                     view: Some(
                         super::SnapshotBookView::from_book(book, 10)
+                            .and_then(TryInto::try_into)
                             .unwrap_or_else(|_| std::process::abort()),
                     ),
                     load_error: None,
@@ -3098,7 +3083,12 @@ mod tests {
             SymbolReferences {
                 pre_open: Some(ReferenceSnapshot {
                     time_ns: 0,
-                    view: Some(empty.clone()),
+                    view: Some(
+                        empty
+                            .clone()
+                            .try_into()
+                            .unwrap_or_else(|_| std::process::abort()),
+                    ),
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
@@ -3107,7 +3097,12 @@ mod tests {
                 continuous_trading: vec![
                     ReferenceSnapshot {
                         time_ns: 10_000_000_000,
-                        view: Some(expected.clone()),
+                        view: Some(
+                            expected
+                                .clone()
+                                .try_into()
+                                .unwrap_or_else(|_| std::process::abort()),
+                        ),
                         load_error: None,
                         not_comparable_reason: None,
                         pre_close_price_units: None,
@@ -3115,7 +3110,11 @@ mod tests {
                     },
                     ReferenceSnapshot {
                         time_ns: 12_000_000_000,
-                        view: Some(expected),
+                        view: Some(
+                            expected
+                                .try_into()
+                                .unwrap_or_else(|_| std::process::abort()),
+                        ),
                         load_error: None,
                         not_comparable_reason: None,
                         pre_close_price_units: None,
@@ -3124,7 +3123,7 @@ mod tests {
                 ],
                 market_close: Some(ReferenceSnapshot {
                     time_ns: 14_000_000_000,
-                    view: Some(empty),
+                    view: Some(empty.try_into().unwrap_or_else(|_| std::process::abort())),
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
@@ -3180,7 +3179,12 @@ mod tests {
                 continuous_trading: vec![
                     ReferenceSnapshot {
                         time_ns: first_time,
-                        view: Some(expected.clone()),
+                        view: Some(
+                            expected
+                                .clone()
+                                .try_into()
+                                .unwrap_or_else(|_| std::process::abort()),
+                        ),
                         load_error: None,
                         not_comparable_reason: None,
                         pre_close_price_units: None,
@@ -3188,7 +3192,11 @@ mod tests {
                     },
                     ReferenceSnapshot {
                         time_ns: second_time,
-                        view: Some(expected),
+                        view: Some(
+                            expected
+                                .try_into()
+                                .unwrap_or_else(|_| std::process::abort()),
+                        ),
                         load_error: None,
                         not_comparable_reason: None,
                         pre_close_price_units: None,
@@ -3251,7 +3259,11 @@ mod tests {
                 pre_open: None,
                 continuous_trading: vec![ReferenceSnapshot {
                     time_ns: reference_time,
-                    view: Some(expected),
+                    view: Some(
+                        expected
+                            .try_into()
+                            .unwrap_or_else(|_| std::process::abort()),
+                    ),
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,

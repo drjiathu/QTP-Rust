@@ -5,12 +5,13 @@ import os
 import shutil
 import subprocess
 import traceback
-from pathlib import Path
 
 import run_current_full_regression as shared
 
 ROOT = shared.ROOT
 OUT = ROOT / "reports/20260909-p0-optimized-full-regression"
+CAMPAIGN_LABEL = "P0"
+STAGE = "p0_optimized"
 OLD_PRIMARY = ROOT / "reports/20260907-current-full-regression"
 OLD_ADDITIONAL = ROOT / "reports/20260908-additional-random-full"
 DAYS = sorted(
@@ -76,7 +77,10 @@ def write_comparison():
             if not path.exists():
                 continue
             receipt = json.loads(path.read_text())
-            if receipt.get("status") != "completed" or "previous_timing_summary" not in receipt:
+            if (
+                receipt.get("status") != "completed"
+                or "previous_timing_summary" not in receipt
+            ):
                 continue
             old_rss = receipt["previous_peak_rss_kib"]
             new_rss = receipt["peak_rss_kib"]
@@ -107,7 +111,9 @@ def write_comparison():
             continue
         aggregates[market] = {
             "jobs": len(selected),
-            "semantic_reports_equal": all(row["semantic_report_equal"] for row in selected),
+            "semantic_reports_equal": all(
+                row["semantic_report_equal"] for row in selected
+            ),
         }
         for metric in (
             "validation_total",
@@ -135,7 +141,7 @@ def write_comparison():
     comparison = {"updated_at": shared.utc(), "aggregates": aggregates, "rows": rows}
     shared.save(OUT / "comparison.json", comparison)
     lines = [
-        "# P0 优化前后全市场 validation 对比",
+        f"# {CAMPAIGN_LABEL} 优化前后全市场 validation 对比",
         "",
         "旧、新批次均为六进程并发 wall time；同一日市场任务逐份比较完整 JSON 语义报告。",
         "",
@@ -169,7 +175,7 @@ def main():
             ROOT / "Cargo.toml",
             ROOT / "Cargo.lock",
             ROOT / "examples/validation_benchmark.rs",
-            Path(__file__),
+            *ROOT.glob("analysis/*.py"),
         ]
         for path in sorted(sources_to_freeze):
             relative = path.relative_to(ROOT)
@@ -201,15 +207,17 @@ def main():
             ).strip(),
             "working_tree_dirty": True,
             "timing_mode": "exclusive instrumented wall time",
-            "comparison_campaigns": [
-                str(OLD_PRIMARY.relative_to(ROOT)),
-                str(OLD_ADDITIONAL.relative_to(ROOT)),
-            ],
+            "comparison_campaigns": sorted(
+                {
+                    str(OLD_PRIMARY.relative_to(ROOT)),
+                    str(OLD_ADDITIONAL.relative_to(ROOT)),
+                }
+            ),
             "selection_note": "重跑此前已验收的 15 个交易日、沪深两市全部股票和 ETF；完整语义报告必须逐任务相等。",
         }
         shared.save(OUT / "manifest.json", manifest)
         shared.summarize(manifest)
-        passed = shared.stage(manifest, frozen, DAYS, "p0_optimized")
+        passed = shared.stage(manifest, frozen, DAYS, STAGE)
         manifest.update(
             status="completed" if passed else "failed",
             baseline_gate_passed=passed,
@@ -226,7 +234,11 @@ def main():
                 "random_days": [],
                 "random_stage": "not_applicable",
             }
-        manifest.update(status="driver_error", error=traceback.format_exc(), finished_at=shared.utc())
+        manifest.update(
+            status="driver_error",
+            error=traceback.format_exc(),
+            finished_at=shared.utc(),
+        )
         shared.save(OUT / "manifest.json", manifest)
         shared.summarize(manifest)
         write_comparison()
