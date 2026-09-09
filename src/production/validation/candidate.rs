@@ -472,6 +472,7 @@ impl SymbolValidationState {
         counters: &mut CandidateCounters,
     ) -> Result<(), ProductionError> {
         let ctx = CandidateContext {
+            limits: self.limits.as_ref(),
             close_price: self.close_price.as_ref(),
             ..ctx
         };

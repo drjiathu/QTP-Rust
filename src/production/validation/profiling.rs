@@ -108,7 +108,7 @@ pub fn profile_validate_market_day(
         .with_continuous_lookahead(config.continuous_lookahead)?
         .with_max_detail_records(config.max_detail_records);
     observer.phase_audit = references.phase_audit;
-    observer.sz_close_limits = references.sz_close_limits;
+    observer.set_close_limits(references.sz_close_limits);
     let mut request = config.request.clone();
     request.snapshots = None;
     let reference_load = start.elapsed();

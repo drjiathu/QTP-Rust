@@ -36,3 +36,8 @@ pub use validation::profiling::{ValidationTimings, profile_validate_market_day};
 /// One unit represents CNY 0.0001. This is a storage scale, not an exchange tick size.
 pub const PRODUCTION_PRICE_MULTIPLIER: u64 = 10_000;
 pub(crate) const PRODUCTION_PRICE_DECIMAL_PLACES: u8 = 4;
+
+// Borrowed entry lookup allocates an owned key only on insertion. Keep the
+// standard randomized hasher; this is not a hash-algorithm optimization.
+pub(crate) type SymbolMap<T> =
+    hashbrown::HashMap<String, T, std::collections::hash_map::RandomState>;

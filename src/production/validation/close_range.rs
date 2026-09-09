@@ -82,6 +82,41 @@ mod tests {
     }
 
     #[test]
+    fn lazy_sources_preserve_first_source_and_exact_error_context() {
+        use std::cell::Cell;
+        let calls = Cell::new(0);
+        let source = || {
+            calls.set(calls.get() + 1);
+            format!("row{}", calls.get())
+        };
+        let mut limits = DayLimits::default();
+        limits.observe_lazy(Ok((120000, 80000)), source);
+        for _ in 0..100 {
+            limits.observe_lazy(Ok((120000, 80000)), source);
+        }
+        assert_eq!(calls.get(), 1);
+        assert_eq!(limits.source, "row1");
+        limits.observe_lazy(Ok((130000, 80000)), source);
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            limits.error.as_deref(),
+            Some(
+                "conflicting SZ daily price limits: (120000, 80000) at row1 vs (130000, 80000) at row2"
+            )
+        );
+        limits.observe_lazy(Err("later error".to_owned()), source);
+        assert_eq!(calls.get(), 2);
+        for (values, expected) in [
+            (Ok((0, 0)), "invalid SZ daily price limits (0, 0) at bad"),
+            (Err("missing".to_owned()), "missing at bad"),
+        ] {
+            let mut invalid = DayLimits::default();
+            invalid.observe_lazy(values, || "bad".to_owned());
+            assert_eq!(invalid.error.as_deref(), Some(expected));
+        }
+    }
+
+    #[test]
     fn filters_before_depth_and_aggregates_all_eligible_levels_without_mutation() {
         let mut book = book();
         // Ten out-of-band orders must not consume the ten eligible depth slots.
@@ -134,7 +169,16 @@ mod tests {
 }
 
 impl DayLimits {
+    #[cfg(test)]
     pub fn observe(&mut self, values: Result<(i64, i64), String>, source: String) {
+        self.observe_lazy(values, || source);
+    }
+
+    pub fn observe_lazy(
+        &mut self,
+        values: Result<(i64, i64), String>,
+        source: impl FnOnce() -> String,
+    ) {
         if self.error.is_some() {
             return;
         }
@@ -156,25 +200,27 @@ impl DayLimits {
             }
             Ok(values) => {
                 self.error = Some(format!(
-                    "invalid SZ daily price limits {values:?} at {source}"
+                    "invalid SZ daily price limits {values:?} at {}",
+                    source()
                 ));
                 return;
             }
             Err(error) => {
-                self.error = Some(format!("{error} at {source}"));
+                self.error = Some(format!("{error} at {}", source()));
                 return;
             }
         };
         if let Some(previous) = self.values {
             if previous != values {
                 self.error = Some(format!(
-                    "conflicting SZ daily price limits: {previous:?} at {} vs {values:?} at {source}",
-                    self.source
+                    "conflicting SZ daily price limits: {previous:?} at {} vs {values:?} at {}",
+                    self.source,
+                    source()
                 ));
             }
         } else {
             self.values = Some(values);
-            self.source = source;
+            self.source = source();
         }
     }
 

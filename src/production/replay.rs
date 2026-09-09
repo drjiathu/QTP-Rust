@@ -17,7 +17,7 @@ use super::spool::{
 use super::writer::SnapshotWriter;
 use super::{
     BookSnapshot, MarketDayRequest, PRODUCTION_PRICE_DECIMAL_PLACES, ProductionError, SnapshotKind,
-    SnapshotSchedule, parse_market_timestamp,
+    SnapshotSchedule, SymbolMap, parse_market_timestamp,
 };
 use crate::production::snapshot::SnapshotCursor;
 
@@ -324,7 +324,7 @@ fn process_sse_channel(
     report: &mut ReplayReport,
 ) -> Result<(), ProductionError> {
     let mut reader = spool.sse_reader(channel)?;
-    let mut runtimes: HashMap<String, BookRuntime> = HashMap::new();
+    let mut runtimes: SymbolMap<BookRuntime> = SymbolMap::default();
     let mut writer = snapshot_writer(request, channel)?;
     while let Some(row) = reader.next_row()? {
         let runtime = runtime(request, &mut runtimes, &row.symbol)?;
@@ -414,7 +414,7 @@ fn process_sz_channel(
         .map(|reader| reader.next_row())
         .transpose()?
         .flatten();
-    let mut runtimes: HashMap<String, BookRuntime> = HashMap::new();
+    let mut runtimes: SymbolMap<BookRuntime> = SymbolMap::default();
     let mut writer = snapshot_writer(request, channel)?;
     while order.is_some() || execution.is_some() {
         let take_order = match (&order, &execution) {
@@ -626,7 +626,7 @@ fn process_sz_order(
     request: &MarketDayRequest,
     channel: u32,
     row: &SzOrderRow,
-    runtimes: &mut HashMap<String, BookRuntime>,
+    runtimes: &mut SymbolMap<BookRuntime>,
     writer: Option<&mut SnapshotWriter>,
     observer: &mut dyn StateObserver,
     report: &mut ReplayReport,
@@ -701,7 +701,7 @@ fn process_sz_execution(
     request: &MarketDayRequest,
     channel: u32,
     row: &SzExecutionRow,
-    runtimes: &mut HashMap<String, BookRuntime>,
+    runtimes: &mut SymbolMap<BookRuntime>,
     writer: Option<&mut SnapshotWriter>,
     observer: &mut dyn StateObserver,
     report: &mut ReplayReport,
@@ -837,7 +837,7 @@ fn before_row(
 fn finish_channel(
     request: &MarketDayRequest,
     channel: u32,
-    runtimes: &mut HashMap<String, BookRuntime>,
+    runtimes: &mut SymbolMap<BookRuntime>,
     mut writer: Option<&mut SnapshotWriter>,
     observer: &mut dyn StateObserver,
     report: &mut ReplayReport,
@@ -971,7 +971,7 @@ fn apply_sse_row(
                 crossing: CrossingBehavior::Rest,
                 quantity: quantity(row.quantity, &row.symbol, row.sequence)?,
             });
-            apply(runtime, event.clone(), &row.symbol, row.sequence)?;
+            apply(runtime, event, &row.symbol, row.sequence)?;
             runtime.references.insert((side, order_no), key);
             return Ok(());
         }
@@ -1075,18 +1075,18 @@ fn sz_reference(runtime: &BookRuntime, side: Side, order_no: u64) -> OrderRefere
 
 fn runtime<'a>(
     request: &MarketDayRequest,
-    runtimes: &'a mut HashMap<String, BookRuntime>,
+    runtimes: &'a mut SymbolMap<BookRuntime>,
     symbol: &str,
 ) -> Result<&'a mut BookRuntime, ProductionError> {
-    if !runtimes.contains_key(symbol) {
-        runtimes.insert(
-            symbol.to_owned(),
-            BookRuntime::new(request, symbol, request.snapshots.as_ref())?,
-        );
+    use hashbrown::hash_map::EntryRef;
+
+    match runtimes.entry_ref(symbol) {
+        EntryRef::Occupied(entry) => Ok(entry.into_mut()),
+        EntryRef::Vacant(entry) => {
+            let runtime = BookRuntime::new(request, symbol, request.snapshots.as_ref())?;
+            Ok(entry.insert(runtime))
+        }
     }
-    runtimes.get_mut(symbol).ok_or_else(|| {
-        ProductionError::InvalidRequest("failed to create order-book runtime".to_owned())
-    })
 }
 
 fn snapshot_writer(
@@ -1213,9 +1213,79 @@ fn sz_side(side: SzSide) -> Side {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
-    use super::{one_sided_reference, same_second_regression_is_allowed};
-    use crate::Side;
+    use std::time::Duration;
+
+    use super::{SymbolMap, one_sided_reference, runtime, same_second_regression_is_allowed};
+    use crate::{
+        Market, MarketDayRequest, ProductionError, Side, SnapshotSchedule, SzMarketOrderPolicy,
+        TargetUniverse, TradingDay,
+    };
+
+    fn runtime_request() -> MarketDayRequest {
+        MarketDayRequest {
+            raw_root: Default::default(),
+            output_root: Default::default(),
+            temp_root: Default::default(),
+            trading_day: TradingDay::from_yyyymmdd(20_260_828).expect("valid test day"),
+            market: Market::Szse,
+            targets: TargetUniverse::AllStocks,
+            snapshots: None,
+            batch_size: 1,
+            sz_market_order_policy: SzMarketOrderPolicy::RequireEvidence,
+        }
+    }
+
+    #[test]
+    fn runtime_reuses_existing_state_and_keeps_symbols_independent() {
+        let request = runtime_request();
+        let mut runtimes = SymbolMap::default();
+        let first = runtime(&request, &mut runtimes, "000001").expect("create runtime");
+        first.last_quote_time_ns = Some(123);
+        first.market_close_emitted = true;
+
+        let existing = runtime(&request, &mut runtimes, "000001").expect("reuse runtime");
+        assert_eq!(existing.last_quote_time_ns, Some(123));
+        assert!(existing.market_close_emitted);
+        let second = runtime(&request, &mut runtimes, "000002").expect("independent runtime");
+        assert_eq!(second.last_quote_time_ns, None);
+        assert!(!second.market_close_emitted);
+        assert_eq!(runtimes.len(), 2);
+    }
+
+    #[test]
+    fn runtime_creation_failure_does_not_insert_or_reinitialize_existing_state() {
+        let mut request = runtime_request();
+        let mut runtimes = SymbolMap::default();
+        runtime(&request, &mut runtimes, "000001")
+            .expect("create runtime")
+            .last_quote_time_ns = Some(123);
+        // Public fields allow this invalid schedule; cursor creation must fail.
+        request.snapshots = Some(SnapshotSchedule {
+            interval: Duration::from_secs(u64::MAX),
+            depth: 10,
+        });
+        assert!(matches!(
+            runtime(&request, &mut runtimes, "000002"),
+            Err(ProductionError::Arithmetic(_))
+        ));
+        assert_eq!(runtimes.len(), 1);
+        assert!(!runtimes.contains_key("000002"));
+        let existing = runtime(&request, &mut runtimes, "000001").expect("reuse runtime");
+        assert_eq!(existing.last_quote_time_ns, Some(123));
+        assert!(existing.cursor.is_none());
+
+        request.snapshots =
+            Some(SnapshotSchedule::new(Duration::from_secs(30), 10).expect("valid schedule"));
+        assert!(
+            runtime(&request, &mut runtimes, "000002")
+                .expect("retry creation")
+                .cursor
+                .is_some()
+        );
+        assert_eq!(runtimes.len(), 2);
+    }
 
     #[test]
     fn requires_one_cancellation_reference() {

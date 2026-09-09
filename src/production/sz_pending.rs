@@ -38,7 +38,7 @@ impl PendingOrder {
 
     pub fn error(&self, detail: &str) -> ProductionError {
         ProductionError::UnresolvedSzOrder {
-            symbol: self.order.symbol.clone(),
+            symbol: self.order.symbol.to_string(),
             channel: self.order.channel,
             order_sequence: self.order.sequence,
             last_sequence: self.last_sequence,
@@ -157,7 +157,7 @@ mod tests {
             source_row: 1,
             sequence: 10,
             channel: 1,
-            symbol: "000001".into(),
+            symbol: "000001".try_into().expect("symbol"),
             quote_time_ns: 100,
             local_time_ns: 999,
             price_units: 123_456,
@@ -176,7 +176,7 @@ mod tests {
             source_row: sequence,
             sequence,
             channel: 1,
-            symbol: "000001".into(),
+            symbol: "000001".try_into().expect("symbol"),
             quote_time_ns: 100,
             local_time_ns: 1000,
             price_units,
@@ -278,7 +278,7 @@ mod tests {
                     e.kind = SzExecutionKind::Cancel;
                     e.ask_order_no = 0;
                 }
-                _ => e.symbol = "000002".into(),
+                _ => e.symbol = "000002".try_into().expect("symbol"),
             }
             assert!(p.observe(&e).is_err());
             assert_eq!(p.remaining, 300);

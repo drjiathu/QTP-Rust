@@ -932,6 +932,7 @@ dependencies = [
  "arrow",
  "chrono",
  "clap",
+ "hashbrown",
  "parquet",
  "proptest",
  "serde",

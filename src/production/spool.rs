@@ -9,6 +9,47 @@ use super::sequence::{NaturalRuns, SequenceRegression, SequenceRepair};
 
 const MAGIC: &[u8; 4] = b"QTP1";
 
+/// The spool already stores exactly six bytes. Keep them inline when decoding;
+/// construction validates UTF-8, including the reader's historical acceptance
+/// of non-ASCII UTF-8 (the writer still requires ASCII).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SpoolSymbol([u8; 6]);
+
+impl SpoolSymbol {
+    #[allow(clippy::expect_used)] // Both constructors below validate these bytes.
+    pub(crate) fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.0).expect("validated spool symbol")
+    }
+}
+
+impl TryFrom<&str> for SpoolSymbol {
+    type Error = std::io::Error;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        let bytes = value.as_bytes().try_into().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "spool symbol must contain six bytes",
+            )
+        })?;
+        Ok(Self(bytes))
+    }
+}
+
+impl std::ops::Deref for SpoolSymbol {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for SpoolSymbol {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum SseKind {
     Add,
@@ -30,7 +71,7 @@ pub(crate) struct SseRow {
     pub source_row: u64,
     pub sequence: u64,
     pub channel: u32,
-    pub symbol: String,
+    pub symbol: SpoolSymbol,
     pub quote_time_ns: i64,
     pub local_time_ns: i64,
     pub kind: SseKind,
@@ -60,7 +101,7 @@ pub(crate) struct SzOrderRow {
     pub source_row: u64,
     pub sequence: u64,
     pub channel: u32,
-    pub symbol: String,
+    pub symbol: SpoolSymbol,
     pub quote_time_ns: i64,
     pub local_time_ns: i64,
     pub price_units: i64,
@@ -80,7 +121,7 @@ pub(crate) struct SzExecutionRow {
     pub source_row: u64,
     pub sequence: u64,
     pub channel: u32,
-    pub symbol: String,
+    pub symbol: SpoolSymbol,
     pub quote_time_ns: i64,
     pub local_time_ns: i64,
     pub bid_order_no: u64,
@@ -569,7 +610,7 @@ fn write_common(
     write_i64(writer, local_time_ns)
 }
 
-type CommonRow = (u64, u64, u32, String, i64, i64);
+type CommonRow = (u64, u64, u32, SpoolSymbol, i64, i64);
 
 fn read_common(reader: &mut impl Read) -> std::io::Result<Option<CommonRow>> {
     let Some(source_row) = read_first_u64(reader)? else {
@@ -595,11 +636,12 @@ fn write_symbol(writer: &mut impl Write, symbol: &str) -> std::io::Result<()> {
     writer.write_all(symbol.as_bytes())
 }
 
-fn read_symbol(reader: &mut impl Read) -> std::io::Result<String> {
+fn read_symbol(reader: &mut impl Read) -> std::io::Result<SpoolSymbol> {
     let mut bytes = [0_u8; 6];
     reader.read_exact(&mut bytes)?;
-    String::from_utf8(bytes.to_vec())
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid symbol"))
+    std::str::from_utf8(&bytes)
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid symbol"))?;
+    Ok(SpoolSymbol(bytes))
 }
 
 fn sse_kind_byte(value: SseKind) -> u8 {
@@ -701,7 +743,49 @@ fn invalid_data<T>(message: &'static str) -> std::io::Result<T> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::{Aggressor, SpoolSet, SseKind, SseReader, SseRow};
+
+    #[test]
+    fn inline_symbol_preserves_spool_bytes_and_rejection_paths() {
+        use super::{SpoolSymbol, read_symbol, write_symbol};
+        use std::io::ErrorKind;
+        assert_eq!(std::mem::size_of::<SpoolSymbol>(), 6);
+        for value in ["000001", "600000", "159915", "ABCDEF"] {
+            let symbol = SpoolSymbol::try_from(value).expect("six bytes");
+            let mut output = Vec::new();
+            write_symbol(&mut output, &symbol).expect("encode");
+            assert_eq!(output, value.as_bytes());
+            assert_eq!(read_symbol(&mut output.as_slice()).expect("decode"), symbol);
+        }
+        assert!(SpoolSymbol::try_from("00001").is_err());
+        assert!(SpoolSymbol::try_from("0000001").is_err());
+        assert_eq!(
+            read_symbol(&mut b"00001".as_slice())
+                .expect_err("short")
+                .kind(),
+            ErrorKind::UnexpectedEof
+        );
+        assert_eq!(
+            read_symbol(&mut [255_u8; 6].as_slice())
+                .expect_err("UTF-8")
+                .kind(),
+            ErrorKind::InvalidData
+        );
+        let non_ascii = "证券";
+        assert_eq!(
+            read_symbol(&mut non_ascii.as_bytes())
+                .expect("legacy UTF-8")
+                .as_str(),
+            non_ascii
+        );
+        assert_eq!(
+            write_symbol(&mut Vec::new(), non_ascii)
+                .expect_err("ASCII writer")
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+    }
 
     #[test]
     fn round_trips_spool_row() {
@@ -717,7 +801,7 @@ mod tests {
             source_row: 1,
             sequence: 2,
             channel: 3,
-            symbol: "600000".to_owned(),
+            symbol: "600000".try_into().expect("symbol"),
             quote_time_ns: 4,
             local_time_ns: 5,
             kind: SseKind::Add,

@@ -11,6 +11,8 @@ notebook 已清理；旧代码可从 Git 提交 `f3f77c0`（历史整理前 `73a
 | `run_p0_optimized_regression.py` | P0 十五日回归，与历史两批逐份比较语义报告；提供优化回归共用驱动 |
 | `run_p1_optimized_regression.py` | 三项 P1 优化的十五日回归，与冻结 P0 基线比较报告、分项耗时和峰值内存 |
 | `run_callback_validation.py` | validation 回调优化：`abba` 串行样本对照、`full` 十五日全量回归，基线为 `72b7d43` |
+| `run_allocation_validation.py` | 分配与查表优化：三个累计阶段的串行 ABBA、十五日全量回归，基线为 `0b4c37a` |
+| `run_borrowed_lookup_validation.py` | 恢复路径借用键优化：十五日全量回归，基线为上一轮 allocation 冻结版本；额外汇总输入、回放及总耗时 |
 | `extract_validation_symbols.py` | 从 pretty JSON 验证报告提取不匹配证券代码 |
 
 批次日期、输出目录和版本检查固定用于重现已存证据，`--launch` 拒绝覆盖已有目录。
@@ -27,6 +29,30 @@ cargo build --release --locked --features profiling --example validation_benchma
 
 ABBA 在 20260828 使用沪市 `600519,510300`、深市 `000001,159915`，每个市场按旧、新、
 新、旧串行运行；保存二进制指纹、命令、计时和报告一致性。小样本不能代替全市场验收。
+
+分配与查表优化使用 `run_allocation_validation.py stage1|stage2|stage3|full`。
+各 stage 应传入对应阶段的二进制，不能把同一个最终版本依次标成三个阶段：
+
+```bash
+/home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_allocation_validation.py stage2 \
+  --binary target/p1-allocation-stage2-benchmark
+/home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_allocation_validation.py full
+```
+
+三个 stage 均与 `0b4c37a` 对照，是累计版本的评估，不是各项独立收益测量；应串行运行。
+`full` 使用当前已构建的 release example，拒绝 `--binary`，并冻结源码与二进制。
+除报告外，该批次核对观察次数、标量预筛次数、十档构造次数和候选缓存命中次数完全相等。
+
+后续两处恢复路径借用键优化使用独立批次，和上一轮 allocation 结果比较：
+
+```bash
+cargo build --release --locked --features profiling --example validation_benchmark
+/home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_borrowed_lookup_validation.py
+```
+
+入口先检查 15 日输入的路径、行数、Schema、大小和修改时间与基线一致，再按六进程运行。
+结果写入 `reports/20260909-p1-borrowed-lookup-full-regression/`；
+`restore-comparison.json` 增补输入、纯回放、恢复与端到端计时，旧报告不会被覆盖。
 
 `20260907-current-full-regression.ipynb` 和 `20260908-additional-random-validation.ipynb`
 仅用于本地历史结果阅读，已停止跟踪但保留本地文件。`analysis/*.ipynb`、缓存及

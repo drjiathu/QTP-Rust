@@ -16,7 +16,7 @@ use super::spool::{
 };
 use super::time::MarketTimestampParser;
 use super::types::is_supported_symbol;
-use super::{MarketDayRequest, ProductionError};
+use super::{MarketDayRequest, ProductionError, SymbolMap};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct IngestStats {
@@ -27,7 +27,7 @@ pub(crate) struct IngestStats {
     pub excluded_non_stock_rows: u64,
     pub excluded_unselected_stock_rows: u64,
     pub channels: usize,
-    symbol_channels: HashMap<String, u32>,
+    symbol_channels: SymbolMap<u32>,
 }
 
 pub(crate) fn spool_inputs(
@@ -187,7 +187,9 @@ fn ingest_sse(
                 source_row,
                 sequence,
                 channel,
-                symbol: symbol.to_owned(),
+                symbol: symbol.try_into().map_err(|error| {
+                    invalid(&path, source_row, "SecurityID", format!("{error}"))
+                })?,
                 quote_time_ns,
                 local_time_ns,
                 kind,
@@ -288,7 +290,9 @@ fn ingest_sz_orders(
                 source_row,
                 sequence,
                 channel,
-                symbol: symbol.to_owned(),
+                symbol: symbol.try_into().map_err(|error| {
+                    invalid(&path, source_row, "SecurityID", format!("{error}"))
+                })?,
                 quote_time_ns,
                 local_time_ns: parse_timestamp_field(
                     &timestamp_parser,
@@ -380,7 +384,9 @@ fn ingest_sz_executions(
                 source_row,
                 sequence,
                 channel,
-                symbol: symbol.to_owned(),
+                symbol: symbol.try_into().map_err(|error| {
+                    invalid(&path, source_row, "SecurityID", format!("{error}"))
+                })?,
                 quote_time_ns,
                 local_time_ns: parse_timestamp_field(
                     &timestamp_parser,
@@ -833,14 +839,16 @@ fn register_symbol_channel(
     symbol: &str,
     channel: u32,
 ) -> Result<(), ProductionError> {
-    if let Some(first_channel) = stats.symbol_channels.insert(symbol.to_owned(), channel) {
-        if first_channel != channel {
-            return Err(ProductionError::SymbolChannelConflict {
-                symbol: crate::Symbol::from(symbol),
-                first_channel,
-                second_channel: channel,
-            });
-        }
+    let registered = stats.symbol_channels.entry_ref(symbol).or_insert(channel);
+    let first_channel = *registered;
+    if first_channel != channel {
+        // Preserve the previous insert-before-error behavior on conflicts.
+        *registered = channel;
+        return Err(ProductionError::SymbolChannelConflict {
+            symbol: crate::Symbol::from(symbol),
+            first_channel,
+            second_channel: channel,
+        });
     }
     Ok(())
 }
@@ -856,5 +864,40 @@ fn invalid(
         source_row,
         field,
         detail: detail.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{IngestStats, ProductionError, register_symbol_channel};
+
+    #[test]
+    fn registers_symbol_channels_once_and_keeps_symbols_independent() {
+        let mut stats = IngestStats::default();
+        assert!(register_symbol_channel(&mut stats, "600000", 1).is_ok());
+        for _ in 0..3 {
+            assert!(register_symbol_channel(&mut stats, "600000", 1).is_ok());
+        }
+        assert!(register_symbol_channel(&mut stats, "600001", 2).is_ok());
+        assert_eq!(stats.symbol_channels.len(), 2);
+        assert_eq!(stats.symbol_channels.get("600000"), Some(&1));
+        assert_eq!(stats.symbol_channels.get("600001"), Some(&2));
+    }
+
+    #[test]
+    fn channel_conflict_preserves_previous_error_and_overwrite_behavior() {
+        let mut stats = IngestStats::default();
+        assert!(register_symbol_channel(&mut stats, "600000", 1).is_ok());
+        assert!(matches!(
+            register_symbol_channel(&mut stats, "600000", 2),
+            Err(ProductionError::SymbolChannelConflict {
+                symbol,
+                first_channel: 1,
+                second_channel: 2,
+            }) if symbol.as_str() == "600000"
+        ));
+        assert_eq!(stats.symbol_channels.len(), 1);
+        assert_eq!(stats.symbol_channels.get("600000"), Some(&2));
+        assert!(register_symbol_channel(&mut stats, "600000", 2).is_ok());
     }
 }

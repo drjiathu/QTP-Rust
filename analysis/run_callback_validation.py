@@ -16,12 +16,14 @@ FULL = campaign.ROOT / "reports/20260909-p1-callback-full-regression"
 AB = campaign.ROOT / "reports/20260909-p1-callback-abba"
 
 
-def sample_abba():
+def sample_abba(binary=None, counter_fields=()):
     AB.mkdir(parents=True, exist_ok=False)
     old_manifest = json.loads((BASELINE / "manifest.json").read_text())
     old = Path(old_manifest["frozen_binary"])
     new = AB / "validation_benchmark"
-    shutil.copy2(campaign.ROOT / "target/release/examples/validation_benchmark", new)
+    shutil.copy2(
+        binary or campaign.ROOT / "target/release/examples/validation_benchmark", new
+    )
     assert campaign.shared.digest(old) == old_manifest["binary_sha256"]
     manifest = {
         "status": "running",
@@ -37,6 +39,7 @@ def sample_abba():
     try:
         for market, symbols in [("SH", "600519,510300"), ("SZ", "000001,159915")]:
             reference = None
+            reference_stages = None
             for i, variant in enumerate(manifest["sequence"]):
                 name = f"{market.lower()}-{i}-{variant}"
                 report = AB / f"{name}.json"
@@ -75,13 +78,21 @@ def sample_abba():
                     reference = current
                 if current != reference:
                     raise RuntimeError(f"{name} report differs from the first old run")
+                stages = json.loads(timings.read_text())["stages"]
+                if reference_stages is None:
+                    reference_stages = stages
+                if any(stages[key] != reference_stages[key] for key in counter_fields):
+                    raise RuntimeError(
+                        f"{name} candidate counters differ from baseline"
+                    )
                 row = {
                     "market": market,
                     "symbols": symbols,
                     "variant": variant,
                     "report_equal": True,
                     "command": cmd,
-                    "stages": json.loads(timings.read_text())["stages"],
+                    "stages": stages,
+                    "verified_counter_fields": list(counter_fields),
                 }
                 manifest["runs"].append(row)
                 campaign.shared.save(AB / "manifest.json", manifest)
@@ -100,15 +111,20 @@ def sample_abba():
         campaign.shared.save(AB / "manifest.json", manifest)
 
 
-def full():
+def full(
+    *,
+    label="P1 validation 回调（基线 72b7d43）",
+    stage="p1_callbacks",
+    counter_fields=("observation_calls", "scalar_rejected_candidates"),
+):
     campaign.OUT = FULL
     campaign.OLD_PRIMARY = BASELINE
     campaign.OLD_ADDITIONAL = BASELINE
     campaign.DAYS = json.loads((BASELINE / "manifest.json").read_text())[
         "baseline_days"
     ]
-    campaign.CAMPAIGN_LABEL = "P1 validation 回调（基线 72b7d43）"
-    campaign.STAGE = "p1_callbacks"
+    campaign.CAMPAIGN_LABEL = label
+    campaign.STAGE = stage
     campaign.shared.OUT = FULL
     compared_job = campaign.shared.run_job
 
@@ -117,10 +133,8 @@ def full():
         if receipt.get("status") == "completed":
             old = receipt["previous_timing_summary"]
             new = receipt["timing_summary"]
-            equal = all(
-                old[key] == new[key]
-                for key in ("observation_calls", "scalar_rejected_candidates")
-            )
+            equal = all(old[key] == new[key] for key in counter_fields)
+            receipt["verified_counter_fields"] = list(counter_fields)
             receipt["observation_and_pruning_counts_equal"] = equal
             receipt["acceptance_passed"] = receipt["acceptance_passed"] and equal
             name = f"{receipt['date']}-{receipt['market'].lower()}-full-run.json"

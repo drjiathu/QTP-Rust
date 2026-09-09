@@ -1,4 +1,5 @@
 use std::fmt;
+use std::sync::Arc;
 
 /// A required local receive or generation timestamp in Unix epoch nanoseconds.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -32,14 +33,15 @@ impl QuoteTimestampNs {
     }
 }
 
-/// Instrument symbol.
+/// Instrument symbol. Clones share immutable storage; equality, ordering and
+/// hashing remain content-based, including for non-six-digit symbols.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Symbol(Box<str>);
+pub struct Symbol(Arc<str>);
 
 impl Symbol {
     #[must_use]
     pub fn new(value: impl Into<Box<str>>) -> Self {
-        Self(value.into())
+        Self(Arc::from(value.into()))
     }
 
     #[must_use]
@@ -50,7 +52,7 @@ impl Symbol {
 
 impl From<&str> for Symbol {
     fn from(value: &str) -> Self {
-        Self::new(value)
+        Self(Arc::from(value))
     }
 }
 
@@ -295,7 +297,30 @@ impl BookEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{PriceScale, TradingDay};
+    use super::{PriceScale, Symbol, TradingDay};
+
+    #[test]
+    fn symbol_clones_share_storage_and_preserve_content_semantics() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        for value in ["000001", "", "arbitrary-long-symbol", "证券"] {
+            let original = Symbol::new(value);
+            let cloned = original.clone();
+            let independent = Symbol::from(value.to_owned());
+            assert!(std::sync::Arc::ptr_eq(&original.0, &cloned.0));
+            assert_eq!(original, independent);
+            assert_eq!(original.cmp(&independent), std::cmp::Ordering::Equal);
+            assert_eq!(original.to_string(), value);
+            assert_eq!(format!("{original:?}"), format!("Symbol({value:?})"));
+            let hash = |symbol: &Symbol| {
+                let mut state = DefaultHasher::new();
+                symbol.hash(&mut state);
+                state.finish()
+            };
+            assert_eq!(hash(&original), hash(&independent));
+            drop(original);
+            assert_eq!(cloned.as_str(), value);
+        }
+    }
 
     #[test]
     fn validates_trading_days() {

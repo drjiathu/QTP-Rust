@@ -142,12 +142,16 @@ impl OrderBook {
 
     pub fn apply(&mut self, event: BookEvent) -> Result<ApplyOutcome, BookError> {
         self.validate_meta(event.meta())?;
-        let meta = event.meta().clone();
-        let outcome = match event {
+        let outcome = match &event {
             BookEvent::AddOrder(event) => self.apply_add(event),
             BookEvent::OrderCancel(event) => self.apply_cancel(event),
             BookEvent::Trade(event) => self.apply_trade(event),
         }?;
+        let meta = match event {
+            BookEvent::AddOrder(event) => event.meta,
+            BookEvent::OrderCancel(event) => event.meta,
+            BookEvent::Trade(event) => event.meta,
+        };
         self.last_applied_meta = Some(meta);
         self.revision = self.revision.saturating_add(1);
         debug_assert!(self.check_invariants().is_ok());
@@ -210,7 +214,7 @@ impl OrderBook {
         Ok(())
     }
 
-    fn apply_add(&mut self, event: AddOrder) -> Result<ApplyOutcome, BookError> {
+    fn apply_add(&mut self, event: &AddOrder) -> Result<ApplyOutcome, BookError> {
         if self.seen_order_keys.contains(&event.order_key) {
             return Err(BookError::DuplicateOrder(event.order_key));
         }
@@ -262,7 +266,7 @@ impl OrderBook {
         })
     }
 
-    fn apply_cancel(&mut self, event: OrderCancel) -> Result<ApplyOutcome, BookError> {
+    fn apply_cancel(&mut self, event: &OrderCancel) -> Result<ApplyOutcome, BookError> {
         let handle = self
             .active_by_key
             .get(&event.order_key)
@@ -288,7 +292,7 @@ impl OrderBook {
         })
     }
 
-    fn apply_trade(&mut self, event: Trade) -> Result<ApplyOutcome, BookError> {
+    fn apply_trade(&mut self, event: &Trade) -> Result<ApplyOutcome, BookError> {
         let bid_resolution = self.resolve_trade_reference(event.bid_order, Side::Buy)?;
         let ask_resolution = self.resolve_trade_reference(event.ask_order, Side::Sell)?;
         if self.config.unknown_trade_policy == UnknownTradePolicy::Reject {
