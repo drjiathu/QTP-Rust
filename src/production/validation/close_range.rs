@@ -1,5 +1,5 @@
 //! Validation-only E0 projection. Never changes an OrderBook or replay output.
-use super::{SnapshotBookView, SnapshotLevel, round_weighted_to_quantum};
+use super::{SnapshotBookView, SnapshotLevel, SnapshotLevels, round_weighted_to_quantum};
 use crate::{OrderBook, ProductionError, Side};
 use serde::{Deserialize, Serialize};
 
@@ -243,7 +243,7 @@ pub(super) fn project(
     let mut actual = SnapshotBookView::from_book(book, 0)?;
     let mut excluded = [0_u64; 2];
     for (index, side) in [Side::Buy, Side::Sell].into_iter().enumerate() {
-        let mut depth = Vec::new();
+        let mut depth = SnapshotLevels::new();
         let mut total = 0_u64;
         let mut weighted = 0_u128;
         for level in book.levels(side) {

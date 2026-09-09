@@ -441,19 +441,16 @@ fn process_sz_channel(
                 .flatten();
             let book = &runtime(request, &mut runtimes, &row.symbol)?.book;
             let side = sz_side(row.side);
-            let same_best = match side {
-                Side::Buy => book.summary().best_bid,
-                Side::Sell => book.summary().best_ask,
-            };
+            let same_best = book.best_level(side);
             if (row.kind == SzOrderKind::Market
                 && request.sz_market_order_policy
                     != super::SzMarketOrderPolicy::RestAtLastTradePrice)
                 || (row.kind == SzOrderKind::SameSideBest && same_best.is_none())
             {
-                let opposite_best = match side {
-                    Side::Buy => book.summary().best_ask,
-                    Side::Sell => book.summary().best_bid,
-                };
+                let opposite_best = book.best_level(match side {
+                    Side::Buy => Side::Sell,
+                    Side::Sell => Side::Buy,
+                });
                 let mut pending = super::sz_pending::PendingOrder::new(
                     &row,
                     opposite_best.map(|p| p.price.units()),
@@ -647,10 +644,7 @@ fn process_sz_order(
     )?;
     let side = sz_side(row.side);
     let key = order_key(channel, side, row.sequence, &row.symbol, row.sequence)?;
-    let same_side_price_available = match side {
-        Side::Buy => runtime.book.summary().best_bid.is_some(),
-        Side::Sell => runtime.book.summary().best_ask.is_some(),
-    };
+    let same_side_price_available = runtime.book.best_level(side).is_some();
     let pricing = match row.kind {
         SzOrderKind::Market => PricingInstruction::Unpriced,
         SzOrderKind::Limit => {

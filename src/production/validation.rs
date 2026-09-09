@@ -26,8 +26,8 @@ use super::replay::{
 };
 use super::types::{is_chinext_symbol, is_etf_symbol, is_supported_symbol};
 use super::{
-    MarketDayRequest, ProductionError, SnapshotBookView, SnapshotLevel, ValidationAnchor,
-    ValidationConfig,
+    MarketDayRequest, ProductionError, SnapshotBookView, SnapshotLevel, SnapshotLevels,
+    ValidationAnchor, ValidationConfig,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -207,6 +207,7 @@ struct ReferenceSnapshot {
     load_error: Option<String>,
     not_comparable_reason: Option<String>,
     pre_close_price_units: Option<i64>,
+    state: AnchorState,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -237,6 +238,28 @@ impl SymbolReferences {
                 .filter(|reference| reference.time_ns == time_ns),
         }
     }
+
+    fn get_mut(
+        &mut self,
+        anchor: ValidationAnchor,
+        time_ns: i64,
+    ) -> Option<&mut ReferenceSnapshot> {
+        match anchor {
+            ValidationAnchor::ContinuousTrading => self
+                .continuous_trading
+                .binary_search_by_key(&time_ns, |reference| reference.time_ns)
+                .ok()
+                .map(|index| &mut self.continuous_trading[index]),
+            ValidationAnchor::PreOpen => self
+                .pre_open
+                .as_mut()
+                .filter(|reference| reference.time_ns == time_ns),
+            ValidationAnchor::MarketClose => self
+                .market_close
+                .as_mut()
+                .filter(|reference| reference.time_ns == time_ns),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -252,6 +275,24 @@ struct AnchorState {
     best_candidate_raw_sequence: Option<u64>,
     best_differences: Option<Vec<FieldDifference>>,
     match_tag: Option<&'static str>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SymbolValidationState {
+    references: SymbolReferences,
+    continuous_position: usize,
+    seen: bool,
+    close_price: Option<SzClosePriceTracker>,
+    channel: Option<u32>,
+}
+
+impl From<SymbolReferences> for SymbolValidationState {
+    fn from(references: SymbolReferences) -> Self {
+        Self {
+            references,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -377,18 +418,13 @@ const SZ_ETF_PRE_CLOSE_PRICE_TAG: &str = "SZ_ETF_PRE_CLOSE_PRICE";
 struct ValidationObserver {
     sz_close_limits: HashMap<String, DayLimits>,
     market: Market,
-    references: HashMap<String, SymbolReferences>,
-    states: HashMap<(String, ValidationAnchor, i64), AnchorState>,
-    continuous_positions: HashMap<String, usize>,
-    seen_symbols: HashSet<String>,
+    symbols: HashMap<String, SymbolValidationState>,
     pre_open_only: bool,
-    sz_close_prices: HashMap<String, SzClosePriceTracker>,
     continuous_lookback_ns: i64,
     continuous_lookahead_ns: i64,
     lookahead_override: bool,
     diagnostic_window_override: bool,
     phase_audit: BTreeMap<String, PhaseAudit>,
-    symbol_channels: HashMap<String, u32>,
     max_detail_records: Option<usize>,
 }
 
@@ -402,19 +438,57 @@ impl ValidationObserver {
         Self {
             sz_close_limits: HashMap::new(),
             market,
-            references,
-            states: HashMap::new(),
-            continuous_positions: HashMap::new(),
-            seen_symbols: HashSet::new(),
+            symbols: references
+                .into_iter()
+                .map(|(symbol, references)| (symbol, references.into()))
+                .collect(),
             pre_open_only: false,
-            sz_close_prices: HashMap::new(),
             continuous_lookback_ns,
             continuous_lookahead_ns: REFERENCE_SECOND_NS,
             lookahead_override: false,
             diagnostic_window_override: false,
             phase_audit: BTreeMap::new(),
-            symbol_channels: HashMap::new(),
             max_detail_records: None,
+        }
+    }
+
+    #[allow(clippy::map_entry)] // Avoid allocating a String on the hot-path lookup.
+    fn symbol_state_mut(&mut self, symbol: &str) -> &mut SymbolValidationState {
+        if !self.symbols.contains_key(symbol) {
+            self.symbols
+                .insert(symbol.to_owned(), SymbolValidationState::default());
+        }
+        match self.symbols.get_mut(symbol) {
+            Some(state) => state,
+            None => std::process::abort(),
+        }
+    }
+
+    fn anchor_state(
+        &self,
+        symbol: &str,
+        anchor: ValidationAnchor,
+        time_ns: i64,
+    ) -> Option<&AnchorState> {
+        self.symbols
+            .get(symbol)
+            .and_then(|state| state.references.get(anchor, time_ns))
+            .map(|reference| &reference.state)
+    }
+
+    fn anchor_state_mut(
+        &mut self,
+        symbol: &str,
+        anchor: ValidationAnchor,
+        time_ns: i64,
+    ) -> &mut AnchorState {
+        let symbol_state = match self.symbols.get_mut(symbol) {
+            Some(state) => state,
+            None => std::process::abort(),
+        };
+        match symbol_state.references.get_mut(anchor, time_ns) {
+            Some(reference) => &mut reference.state,
+            None => std::process::abort(),
         }
     }
 
@@ -488,9 +562,9 @@ impl ValidationObserver {
         candidate_time_ns: Option<i64>,
     ) -> Result<(), ProductionError> {
         let Some(reference) = self
-            .references
+            .symbols
             .get(symbol)
-            .and_then(|references| references.get(anchor, reference_time_ns))
+            .and_then(|state| state.references.get(anchor, reference_time_ns))
         else {
             return Ok(());
         };
@@ -498,8 +572,7 @@ impl ValidationObserver {
             return Ok(());
         }
         if self
-            .states
-            .get(&(symbol.to_owned(), anchor, reference_time_ns))
+            .anchor_state(symbol, anchor, reference_time_ns)
             .is_some_and(|state| state.matched || state.finalized)
         {
             return Ok(());
@@ -519,9 +592,10 @@ impl ValidationObserver {
             match metadata.unlimited() {
                 Ok(false) => Ok(None),
                 Ok(true) => self
-                    .sz_close_prices
+                    .symbols
                     .get(symbol)
-                    .and_then(|t| t.range_base.as_ref())
+                    .and_then(|state| state.close_price.as_ref())
+                    .and_then(|tracker| tracker.range_base.as_ref())
                     .ok_or_else(|| "missing pre-14:57 successful trade for SZ E0 range".to_owned())
                     .and_then(|base| {
                         close_range::project(book, base, &metadata)
@@ -533,66 +607,66 @@ impl ValidationObserver {
         } else {
             Ok(None)
         };
-        let mut actual = match projection {
-            Ok(Some((view, audit))) => {
-                self.states
-                    .entry((symbol.to_owned(), anchor, reference_time_ns))
-                    .or_default()
-                    .close_price_band = Some(audit);
-                view
-            }
+        let (mut actual, close_price_band) = match projection {
+            Ok(Some((view, audit))) => (view, Some(audit)),
             Ok(None) => {
                 let mut view = SnapshotBookView::from_book(book, 10)?;
                 view.weighted_bid_price_units =
                     published_weighted_price(book, Side::Buy, self.market, symbol)?;
                 view.weighted_ask_price_units =
                     published_weighted_price(book, Side::Sell, self.market, symbol)?;
-                view
+                (view, None)
             }
             Err(error) => {
-                let state = self
-                    .states
-                    .entry((symbol.to_owned(), anchor, reference_time_ns))
-                    .or_default();
+                let state = self.anchor_state_mut(symbol, anchor, reference_time_ns);
                 state.comparison_error = Some(error);
                 state.finalized = true;
                 return Ok(());
             }
         };
-        let mut differences = compare_views(self.market, symbol, expected, &actual);
+        let mut difference_mask = compare_view_mask(self.market, symbol, expected, &actual);
         let match_tag = if self.market == Market::Szse && anchor == ValidationAnchor::MarketClose {
             reconcile_sz_market_close_price(
                 symbol,
                 reference.pre_close_price_units,
-                self.sz_close_prices.get(symbol),
+                self.symbols
+                    .get(symbol)
+                    .and_then(|state| state.close_price.as_ref()),
                 expected,
                 &mut actual,
-                &differences,
+                difference_mask,
             )?
         } else {
             None
         };
         if match_tag.is_some() {
-            differences = compare_views(self.market, symbol, expected, &actual);
+            difference_mask = compare_view_mask(self.market, symbol, expected, &actual);
         }
-        let state = self
-            .states
-            .entry((symbol.to_owned(), anchor, reference_time_ns))
-            .or_default();
-        if differences.is_empty() {
+        let best_differences = if !difference_mask.is_empty()
+            && self
+                .anchor_state(symbol, anchor, reference_time_ns)
+                .and_then(|state| state.best_differences.as_ref())
+                .is_none_or(|best| difference_mask.count() < best.len())
+        {
+            Some(compare_views(self.market, symbol, expected, &actual))
+        } else {
+            None
+        };
+        let state = self.anchor_state_mut(symbol, anchor, reference_time_ns);
+        if close_price_band.is_some() {
+            state.close_price_band = close_price_band;
+        }
+        if difference_mask.is_empty() {
             state.matched = true;
             state.finalized = true;
+            state.best_differences = None;
             state.matched_candidate_time_ns = candidate_time_ns;
             state.matched_candidate_raw_sequence =
                 book.last_applied_meta().map(|m| m.raw_sequence.get());
             state.matched_candidate_apply_sequence =
                 book.last_applied_meta().map(|m| m.apply_sequence.get());
             state.match_tag = match_tag;
-        } else if state
-            .best_differences
-            .as_ref()
-            .is_none_or(|best| differences.len() < best.len())
-        {
+        } else if let Some(differences) = best_differences {
             state.best_differences = Some(differences);
             state.best_candidate_time_ns = candidate_time_ns;
             state.best_candidate_raw_sequence =
@@ -609,9 +683,9 @@ impl ValidationObserver {
         point: ObservationPoint,
     ) -> Result<(), ProductionError> {
         let Some(reference_time) = self
-            .references
+            .symbols
             .get(symbol)
-            .and_then(|references| references.get_single(anchor))
+            .and_then(|state| state.references.get_single(anchor))
             .map(|reference| reference.time_ns)
         else {
             return Ok(());
@@ -650,9 +724,7 @@ impl ValidationObserver {
             self.compare_candidate(symbol, book, anchor, reference_time, Some(candidate_time))?;
         }
         if point_time >= window_end {
-            self.states
-                .entry((symbol.to_owned(), anchor, reference_time))
-                .or_default()
+            self.anchor_state_mut(symbol, anchor, reference_time)
                 .finalized = true;
         }
         Ok(())
@@ -670,16 +742,16 @@ impl ValidationObserver {
             ObservationPoint::MarketClose(_) | ObservationPoint::ChannelFinished => return Ok(()),
         };
         let mut position = self
-            .continuous_positions
+            .symbols
             .get(symbol)
-            .copied()
+            .map(|state| state.continuous_position)
             .unwrap_or_default();
         let mut first_pending = None;
         loop {
             let Some(reference_time) = self
-                .references
+                .symbols
                 .get(symbol)
-                .and_then(|references| references.continuous_trading.get(position))
+                .and_then(|state| state.references.continuous_trading.get(position))
                 .map(|reference| reference.time_ns)
             else {
                 break;
@@ -716,30 +788,22 @@ impl ValidationObserver {
                 )?;
             }
             if point_time >= window_end {
-                self.states
-                    .entry((
-                        symbol.to_owned(),
-                        ValidationAnchor::ContinuousTrading,
-                        reference_time,
-                    ))
-                    .or_default()
-                    .finalized = true;
-            }
-            let finalized = self
-                .states
-                .get(&(
-                    symbol.to_owned(),
+                self.anchor_state_mut(
+                    symbol,
                     ValidationAnchor::ContinuousTrading,
                     reference_time,
-                ))
+                )
+                .finalized = true;
+            }
+            let finalized = self
+                .anchor_state(symbol, ValidationAnchor::ContinuousTrading, reference_time)
                 .is_some_and(|state| state.finalized);
             if !finalized {
                 first_pending.get_or_insert(position);
             }
             position += 1;
         }
-        self.continuous_positions
-            .insert(symbol.to_owned(), first_pending.unwrap_or(position));
+        self.symbol_state_mut(symbol).continuous_position = first_pending.unwrap_or(position);
         Ok(())
     }
 
@@ -749,15 +813,15 @@ impl ValidationObserver {
         book: &OrderBook,
     ) -> Result<(), ProductionError> {
         let mut position = self
-            .continuous_positions
+            .symbols
             .get(symbol)
-            .copied()
+            .map(|state| state.continuous_position)
             .unwrap_or_default();
         loop {
             let Some(reference_time) = self
-                .references
+                .symbols
                 .get(symbol)
-                .and_then(|references| references.continuous_trading.get(position))
+                .and_then(|state| state.references.continuous_trading.get(position))
                 .map(|reference| reference.time_ns)
             else {
                 break;
@@ -774,18 +838,11 @@ impl ValidationObserver {
                 reference_time,
                 Some(candidate_time),
             )?;
-            self.states
-                .entry((
-                    symbol.to_owned(),
-                    ValidationAnchor::ContinuousTrading,
-                    reference_time,
-                ))
-                .or_default()
+            self.anchor_state_mut(symbol, ValidationAnchor::ContinuousTrading, reference_time)
                 .finalized = true;
             position += 1;
         }
-        self.continuous_positions
-            .insert(symbol.to_owned(), position);
+        self.symbol_state_mut(symbol).continuous_position = position;
         Ok(())
     }
 
@@ -795,14 +852,7 @@ impl ValidationObserver {
         retain_matched_records: bool,
     ) -> ValidationReport {
         let market = market_text(self.market).to_owned();
-        let mut symbols = self
-            .references
-            .keys()
-            .chain(&self.seen_symbols)
-            .cloned()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
+        let mut symbols = self.symbols.keys().cloned().collect::<Vec<_>>();
         symbols.sort_unstable();
         let mut records = Vec::new();
         let mut totals = ValidationCounts::default();
@@ -825,7 +875,8 @@ impl ValidationObserver {
             })
             .collect();
         for symbol in symbols {
-            let references = self.references.get(&symbol).cloned().unwrap_or_default();
+            let mut symbol_state = self.symbols.remove(&symbol).unwrap_or_default();
+            let references = std::mem::take(&mut symbol_state.references);
             let mut cases = Vec::with_capacity(references.continuous_trading.len() + 2);
             cases.push((ValidationAnchor::PreOpen, references.pre_open));
             if !self.pre_open_only {
@@ -841,10 +892,11 @@ impl ValidationObserver {
                 cases.push((ValidationAnchor::MarketClose, references.market_close));
             }
 
-            for (anchor, reference) in cases {
+            for (anchor, mut reference) in cases {
                 let reference_time_ns = reference.as_ref().map(|reference| reference.time_ns);
-                let state = reference_time_ns
-                    .and_then(|time_ns| self.states.remove(&(symbol.clone(), anchor, time_ns)));
+                let state = reference
+                    .as_mut()
+                    .map(|reference| std::mem::take(&mut reference.state));
                 let mut matched_candidate_time_ms = state
                     .as_ref()
                     .and_then(|state| state.matched_candidate_time_ns)
@@ -900,16 +952,11 @@ impl ValidationObserver {
                             Vec::new(),
                         )
                     }
-                    (None, _)
-                        if anchor == ValidationAnchor::MarketClose
-                            && self.seen_symbols.contains(&symbol) =>
-                    {
-                        (
-                            ValidationOutcome::MissingSource,
-                            Some("required market-close reference is missing".to_owned()),
-                            Vec::new(),
-                        )
-                    }
+                    (None, _) if anchor == ValidationAnchor::MarketClose && symbol_state.seen => (
+                        ValidationOutcome::MissingSource,
+                        Some("required market-close reference is missing".to_owned()),
+                        Vec::new(),
+                    ),
                     (None, _) => (
                         ValidationOutcome::MissingSource,
                         Some("reference anchor is missing".to_owned()),
@@ -941,7 +988,7 @@ impl ValidationObserver {
                         reference.load_error.clone(),
                         Vec::new(),
                     ),
-                    (Some(_), _) if !self.seen_symbols.contains(&symbol) => (
+                    (Some(_), _) if !symbol_state.seen => (
                         ValidationOutcome::MissingSource,
                         Some("no selected raw order/trade events were observed".to_owned()),
                         Vec::new(),
@@ -1009,7 +1056,7 @@ impl ValidationObserver {
                     matched_candidate_time_ms,
                     matched_candidate_raw_sequence,
                     matched_candidate_apply_sequence,
-                    channel_id: self.symbol_channels.get(&symbol).copied(),
+                    channel_id: symbol_state.channel,
                     best_candidate_time_ms,
                     best_candidate_raw_sequence,
                     match_tag,
@@ -1090,9 +1137,10 @@ impl StateObserver for ValidationObserver {
     ) -> Result<(), ProductionError> {
         self.observe_trade(channel, symbol, quote_time_ns, price_units, quantity)?;
         if let Some(base) = self
-            .sz_close_prices
+            .symbols
             .get_mut(symbol)
-            .and_then(|t| t.range_base.as_mut())
+            .and_then(|state| state.close_price.as_mut())
+            .and_then(|tracker| tracker.range_base.as_mut())
         {
             if base.raw_sequence.is_none() {
                 base.raw_sequence = Some(raw_sequence);
@@ -1109,9 +1157,9 @@ impl StateObserver for ValidationObserver {
         quantity: u64,
     ) -> Result<(), ProductionError> {
         if self.market == Market::Szse && !self.pre_open_only {
-            self.sz_close_prices
-                .entry(symbol.to_owned())
-                .or_default()
+            self.symbol_state_mut(symbol)
+                .close_price
+                .get_or_insert_with(SzClosePriceTracker::default)
                 .observe(quote_time_ns, price_units, quantity)?;
         }
         Ok(())
@@ -1124,8 +1172,9 @@ impl StateObserver for ValidationObserver {
         book: &OrderBook,
         point: ObservationPoint,
     ) -> Result<(), ProductionError> {
-        self.seen_symbols.insert(symbol.to_owned());
-        self.symbol_channels.insert(symbol.to_owned(), channel);
+        let state = self.symbol_state_mut(symbol);
+        state.seen = true;
+        state.channel = Some(channel);
         self.observe_timed_anchor(symbol, book, ValidationAnchor::PreOpen, point)?;
         if !self.pre_open_only {
             self.observe_continuous_trading(symbol, book, point)?;
@@ -1133,9 +1182,9 @@ impl StateObserver for ValidationObserver {
         if !self.pre_open_only {
             if let ObservationPoint::MarketClose(boundary_time_ns) = point {
                 if let Some(reference_time) = self
-                    .references
+                    .symbols
                     .get(symbol)
-                    .and_then(|references| references.market_close.as_ref())
+                    .and_then(|state| state.references.market_close.as_ref())
                     .map(|reference| reference.time_ns)
                 {
                     self.compare_candidate(
@@ -1145,22 +1194,16 @@ impl StateObserver for ValidationObserver {
                         reference_time,
                         Some(boundary_time_ns),
                     )?;
-                    self.states
-                        .entry((
-                            symbol.to_owned(),
-                            ValidationAnchor::MarketClose,
-                            reference_time,
-                        ))
-                        .or_default()
+                    self.anchor_state_mut(symbol, ValidationAnchor::MarketClose, reference_time)
                         .finalized = true;
                 }
             }
         }
         if point == ObservationPoint::ChannelFinished {
             if let Some(reference_time) = self
-                .references
+                .symbols
                 .get(symbol)
-                .and_then(|references| references.pre_open.as_ref())
+                .and_then(|state| state.references.pre_open.as_ref())
                 .map(|reference| reference.time_ns)
             {
                 self.compare_candidate(
@@ -1174,9 +1217,7 @@ impl StateObserver for ValidationObserver {
                             .ok_or(ProductionError::Arithmetic("opening window end"))?,
                     ),
                 )?;
-                self.states
-                    .entry((symbol.to_owned(), ValidationAnchor::PreOpen, reference_time))
-                    .or_default()
+                self.anchor_state_mut(symbol, ValidationAnchor::PreOpen, reference_time)
                     .finalized = true;
             }
             if !self.pre_open_only {
@@ -1350,6 +1391,7 @@ fn load_references(
                 } else {
                     None
                 },
+                state: AnchorState::default(),
             };
             match anchor {
                 ValidationAnchor::ContinuousTrading => {
@@ -1505,8 +1547,8 @@ fn raw_snapshot_reference_view(
         Market::Sse => 3,
         Market::Szse => 6,
     };
-    let mut asks = Vec::new();
-    let mut bids = Vec::new();
+    let mut asks = SnapshotLevels::new();
+    let mut bids = SnapshotLevels::new();
     for (side, target) in [("Ask", &mut asks), ("Bid", &mut bids)] {
         for level in 1..=10 {
             let price = optional_decimal_units(
@@ -1603,6 +1645,97 @@ fn market_text(market: Market) -> &'static str {
     }
 }
 
+const DIFF_BIDS: u16 = 1 << 0;
+const DIFF_ASKS: u16 = 1 << 1;
+const DIFF_TOTAL_BID_QUANTITY: u16 = 1 << 2;
+const DIFF_WEIGHTED_BID_PRICE: u16 = 1 << 3;
+const DIFF_TOTAL_ASK_QUANTITY: u16 = 1 << 4;
+const DIFF_WEIGHTED_ASK_PRICE: u16 = 1 << 5;
+const DIFF_LAST_PRICE: u16 = 1 << 6;
+const DIFF_HIGH_PRICE: u16 = 1 << 7;
+const DIFF_LOW_PRICE: u16 = 1 << 8;
+const DIFF_TRADE_COUNT: u16 = 1 << 9;
+const DIFF_TRADE_QUANTITY: u16 = 1 << 10;
+const DIFF_TURNOVER: u16 = 1 << 11;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct DifferenceMask(u16);
+
+impl DifferenceMask {
+    fn record(&mut self, bit: u16, differs: bool) {
+        if differs {
+            self.0 |= bit;
+        }
+    }
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn count(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    const fn is_only(self, bit: u16) -> bool {
+        self.0 == bit
+    }
+}
+
+fn compare_view_mask(
+    market: Market,
+    symbol: &str,
+    expected: &SnapshotBookView,
+    actual: &SnapshotBookView,
+) -> DifferenceMask {
+    let mut mask = DifferenceMask::default();
+    mask.record(DIFF_BIDS, expected.bids != actual.bids);
+    mask.record(DIFF_ASKS, expected.asks != actual.asks);
+    mask.record(
+        DIFF_TOTAL_BID_QUANTITY,
+        expected.total_bid_quantity != actual.total_bid_quantity,
+    );
+    mask.record(
+        DIFF_WEIGHTED_BID_PRICE,
+        !weighted_prices_match(
+            expected.weighted_bid_price_units,
+            validation_price(market, symbol, actual.weighted_bid_price_units),
+        ),
+    );
+    mask.record(
+        DIFF_TOTAL_ASK_QUANTITY,
+        expected.total_ask_quantity != actual.total_ask_quantity,
+    );
+    mask.record(
+        DIFF_WEIGHTED_ASK_PRICE,
+        !weighted_prices_match(
+            expected.weighted_ask_price_units,
+            validation_price(market, symbol, actual.weighted_ask_price_units),
+        ),
+    );
+    mask.record(
+        DIFF_LAST_PRICE,
+        expected.last_price_units != actual.last_price_units,
+    );
+    mask.record(
+        DIFF_HIGH_PRICE,
+        expected.high_price_units != actual.high_price_units,
+    );
+    mask.record(
+        DIFF_LOW_PRICE,
+        expected.low_price_units != actual.low_price_units,
+    );
+    mask.record(DIFF_TRADE_COUNT, expected.trade_count != actual.trade_count);
+    mask.record(
+        DIFF_TRADE_QUANTITY,
+        expected.trade_quantity != actual.trade_quantity,
+    );
+    mask.record(
+        DIFF_TURNOVER,
+        expected.turnover_units != actual.turnover_units,
+    );
+    mask
+}
+
 fn compare_views(
     market: Market,
     symbol: &str,
@@ -1682,9 +1815,9 @@ fn reconcile_sz_market_close_price(
     tracker: Option<&SzClosePriceTracker>,
     expected: &SnapshotBookView,
     actual: &mut SnapshotBookView,
-    differences: &[FieldDifference],
+    differences: DifferenceMask,
 ) -> Result<Option<&'static str>, ProductionError> {
-    if differences.len() != 1 || differences[0].field != "last_price_units" {
+    if !differences.is_only(DIFF_LAST_PRICE) {
         return Ok(None);
     }
 
@@ -1724,14 +1857,7 @@ fn compare_weighted_price(
     expected: Option<i64>,
     actual: Option<i64>,
 ) {
-    let matches = match (expected, actual) {
-        (None, None) => true,
-        (Some(expected), Some(actual)) => {
-            expected.abs_diff(actual) <= WEIGHTED_PRICE_TOLERANCE_UNITS
-        }
-        _ => false,
-    };
-    if !matches {
+    if !weighted_prices_match(expected, actual) {
         differences.push(FieldDifference {
             field: field.to_owned(),
             expected: format!(
@@ -1740,6 +1866,16 @@ fn compare_weighted_price(
             ),
             actual: format!("{actual:?}"),
         });
+    }
+}
+
+fn weighted_prices_match(expected: Option<i64>, actual: Option<i64>) -> bool {
+    match (expected, actual) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            expected.abs_diff(actual) <= WEIGHTED_PRICE_TOLERANCE_UNITS
+        }
+        _ => false,
     }
 }
 
@@ -1762,26 +1898,11 @@ fn published_weighted_price(
     market: Market,
     symbol: &str,
 ) -> Result<Option<i64>, ProductionError> {
-    let mut weighted = 0_u128;
-    let mut total = 0_u128;
-    for level in book.levels(side) {
-        let price = u128::try_from(level.price.units())
-            .map_err(|_| ProductionError::Arithmetic("published weighted price"))?;
-        let quantity = u128::from(level.total_quantity);
-        weighted = weighted
-            .checked_add(
-                price
-                    .checked_mul(quantity)
-                    .ok_or(ProductionError::Arithmetic("published weighted price"))?,
-            )
-            .ok_or(ProductionError::Arithmetic("published weighted price"))?;
-        total = total
-            .checked_add(quantity)
-            .ok_or(ProductionError::Arithmetic("published weighted quantity"))?;
-    }
+    let (total, weighted) = book.visible_aggregate(side);
     if total == 0 {
         return Ok(None);
     }
+    let total = u128::from(total);
     let quantum = u128::try_from(validation_price_quantum(market, symbol))
         .map_err(|_| ProductionError::Arithmetic("published weighted quantum"))?;
     let rounded_units = round_weighted_to_quantum(weighted, total, quantum)?;
@@ -2102,8 +2223,8 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        ObservationPoint, ReferenceSnapshot, ReplayReport, StateObserver, SymbolReferences,
-        ValidationAnchor, ValidationObserver, ValidationOutcome,
+        AnchorState, ObservationPoint, ReferenceSnapshot, ReplayReport, StateObserver,
+        SymbolReferences, ValidationAnchor, ValidationObserver, ValidationOutcome,
     };
     use crate::{
         AddOrder, ApplySequence, BookConfig, BookEvent, BookKey, ChannelId, CrossingBehavior,
@@ -2161,6 +2282,7 @@ mod tests {
                         load_error: None,
                         not_comparable_reason: None,
                         pre_close_price_units: None,
+                        state: AnchorState::default(),
                     }),
                     ..SymbolReferences::default()
                 },
@@ -2195,7 +2317,8 @@ mod tests {
                 )
                 .expect("close");
             assert_eq!(
-                observer.references[symbol]
+                observer.symbols[symbol]
+                    .references
                     .market_close
                     .as_ref()
                     .expect("reference")
@@ -2263,6 +2386,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: Some(pre_close_price_units),
+                    state: AnchorState::default(),
                 }),
             },
         )])
@@ -2309,6 +2433,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }),
                 continuous_trading: Vec::new(),
                 market_close: None,
@@ -2402,6 +2527,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }],
                 market_close: None,
             },
@@ -2492,6 +2618,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }],
                 market_close: None,
             },
@@ -2550,6 +2677,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }],
                 market_close: None,
             },
@@ -2608,6 +2736,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }],
                 market_close: None,
             },
@@ -2673,6 +2802,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }],
                 market_close: None,
             },
@@ -2729,6 +2859,7 @@ mod tests {
                             load_error: None,
                             not_comparable_reason: None,
                             pre_close_price_units: None,
+                            state: AnchorState::default(),
                         }],
                         market_close: None,
                     },
@@ -2809,6 +2940,7 @@ mod tests {
                 load_error: None,
                 not_comparable_reason: None,
                 pre_close_price_units: None,
+                state: AnchorState::default(),
             };
             let references = HashMap::from([(
                 "159501".to_owned(),
@@ -2913,6 +3045,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 })
                 .collect(),
                 market_close: None,
@@ -2969,6 +3102,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }),
                 continuous_trading: vec![
                     ReferenceSnapshot {
@@ -2977,6 +3111,7 @@ mod tests {
                         load_error: None,
                         not_comparable_reason: None,
                         pre_close_price_units: None,
+                        state: AnchorState::default(),
                     },
                     ReferenceSnapshot {
                         time_ns: 12_000_000_000,
@@ -2984,6 +3119,7 @@ mod tests {
                         load_error: None,
                         not_comparable_reason: None,
                         pre_close_price_units: None,
+                        state: AnchorState::default(),
                     },
                 ],
                 market_close: Some(ReferenceSnapshot {
@@ -2992,6 +3128,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }),
             },
         )]);
@@ -3047,6 +3184,7 @@ mod tests {
                         load_error: None,
                         not_comparable_reason: None,
                         pre_close_price_units: None,
+                        state: AnchorState::default(),
                     },
                     ReferenceSnapshot {
                         time_ns: second_time,
@@ -3054,6 +3192,7 @@ mod tests {
                         load_error: None,
                         not_comparable_reason: None,
                         pre_close_price_units: None,
+                        state: AnchorState::default(),
                     },
                 ],
                 market_close: None,
@@ -3116,6 +3255,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: None,
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }],
                 market_close: None,
             },
@@ -3169,10 +3309,15 @@ mod tests {
         let mut actual = expected.clone();
         actual.weighted_bid_price_units = actual.weighted_bid_price_units.map(|value| value + 10);
         assert!(super::compare_views(Market::Sse, "600000", &expected, &actual).is_empty());
+        assert!(super::compare_view_mask(Market::Sse, "600000", &expected, &actual).is_empty());
 
         actual.weighted_bid_price_units = expected.weighted_bid_price_units.map(|value| value + 20);
         let differences = super::compare_views(Market::Sse, "600000", &expected, &actual);
         assert_eq!(differences.len(), 1);
+        assert_eq!(
+            super::compare_view_mask(Market::Sse, "600000", &expected, &actual).count(),
+            differences.len()
+        );
         assert_eq!(differences[0].field, "weighted_bid_price_units");
 
         let mut actual = expected.clone();
@@ -3182,6 +3327,10 @@ mod tests {
         actual.trade_count += 1;
         let differences = super::compare_views(Market::Sse, "600000", &expected, &actual);
         assert_eq!(differences.len(), 4);
+        assert_eq!(
+            super::compare_view_mask(Market::Sse, "600000", &expected, &actual).count(),
+            differences.len()
+        );
         assert_eq!(differences[0].field, "bids");
         assert_eq!(differences[1].field, "total_bid_quantity");
         assert_eq!(differences[2].field, "last_price_units");
@@ -3444,6 +3593,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: Some("suspended PreOpen phase status B1".to_owned()),
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }),
                 continuous_trading: vec![ReferenceSnapshot {
                     time_ns: 200,
@@ -3451,6 +3601,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: Some("suspended continuous phase status T1".to_owned()),
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }],
                 market_close: Some(ReferenceSnapshot {
                     time_ns: 300,
@@ -3458,6 +3609,7 @@ mod tests {
                     load_error: None,
                     not_comparable_reason: Some("suspended close phase status E1".to_owned()),
                     pre_close_price_units: None,
+                    state: AnchorState::default(),
                 }),
             },
         )]);

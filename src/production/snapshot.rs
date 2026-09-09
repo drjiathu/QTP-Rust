@@ -1,23 +1,26 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::{LocalTimestampNs, OrderBook, Price, QuoteTimestampNs, Side};
 
 use super::{ProductionError, SnapshotKind, SnapshotSchedule, parse_market_timestamp};
 use crate::TradingDay;
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotLevel {
     pub price_units: i64,
     pub quantity: u64,
     pub order_count: u64,
 }
 
+pub type SnapshotLevels = SmallVec<[SnapshotLevel; 10]>;
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotBookView {
-    pub bids: Vec<SnapshotLevel>,
-    pub asks: Vec<SnapshotLevel>,
+    pub bids: SnapshotLevels,
+    pub asks: SnapshotLevels,
     pub total_bid_quantity: u64,
     pub weighted_bid_price_units: Option<i64>,
     pub total_ask_quantity: u64,
@@ -32,35 +35,12 @@ pub struct SnapshotBookView {
 
 impl SnapshotBookView {
     pub fn from_book(book: &OrderBook, depth: usize) -> Result<Self, ProductionError> {
-        let depth_view = book.depth(depth);
         let (total_bid_quantity, weighted_bid_price_units) = aggregate_side(book, Side::Buy)?;
         let (total_ask_quantity, weighted_ask_price_units) = aggregate_side(book, Side::Sell)?;
         let statistics = book.summary().statistics;
         Ok(Self {
-            bids: depth_view
-                .bids
-                .into_iter()
-                .map(|level| {
-                    Ok(SnapshotLevel {
-                        price_units: level.price.units(),
-                        quantity: level.total_quantity,
-                        order_count: u64::try_from(level.order_count)
-                            .map_err(|_| ProductionError::Arithmetic("level order count"))?,
-                    })
-                })
-                .collect::<Result<Vec<_>, ProductionError>>()?,
-            asks: depth_view
-                .asks
-                .into_iter()
-                .map(|level| {
-                    Ok(SnapshotLevel {
-                        price_units: level.price.units(),
-                        quantity: level.total_quantity,
-                        order_count: u64::try_from(level.order_count)
-                            .map_err(|_| ProductionError::Arithmetic("level order count"))?,
-                    })
-                })
-                .collect::<Result<Vec<_>, ProductionError>>()?,
+            bids: snapshot_levels(book, Side::Buy, depth)?,
+            asks: snapshot_levels(book, Side::Sell, depth)?,
             total_bid_quantity,
             weighted_bid_price_units,
             total_ask_quantity,
@@ -75,23 +55,26 @@ impl SnapshotBookView {
     }
 }
 
+fn snapshot_levels(
+    book: &OrderBook,
+    side: Side,
+    depth: usize,
+) -> Result<SnapshotLevels, ProductionError> {
+    let mut result = SnapshotLevels::new();
+    book.try_visit_levels(side, depth, |level| {
+        result.push(SnapshotLevel {
+            price_units: level.price.units(),
+            quantity: level.total_quantity,
+            order_count: u64::try_from(level.order_count)
+                .map_err(|_| ProductionError::Arithmetic("level order count"))?,
+        });
+        Ok(())
+    })?;
+    Ok(result)
+}
+
 fn aggregate_side(book: &OrderBook, side: Side) -> Result<(u64, Option<i64>), ProductionError> {
-    let mut total = 0_u64;
-    let mut weighted = 0_u128;
-    for level in book.levels(side) {
-        total = total
-            .checked_add(level.total_quantity)
-            .ok_or(ProductionError::Arithmetic("side quantity"))?;
-        let price = u128::try_from(level.price.units())
-            .map_err(|_| ProductionError::Arithmetic("weighted price"))?;
-        weighted = weighted
-            .checked_add(
-                price
-                    .checked_mul(u128::from(level.total_quantity))
-                    .ok_or(ProductionError::Arithmetic("weighted price"))?,
-            )
-            .ok_or(ProductionError::Arithmetic("weighted price"))?;
-    }
+    let (total, weighted) = book.visible_aggregate(side);
     if total == 0 {
         return Ok((0, None));
     }

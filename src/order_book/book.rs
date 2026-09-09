@@ -53,6 +53,8 @@ pub struct OrderBook {
     active_by_key: HashMap<OrderKey, OrderHandle>,
     seen_order_keys: HashSet<OrderKey>,
     orders: OrderStorage,
+    bid_aggregate: SideAggregate,
+    ask_aggregate: SideAggregate,
     statistics: TradeStatistics,
     last_applied_meta: Option<EventMeta>,
 }
@@ -63,6 +65,7 @@ struct KnownTradePlan {
     state: OrderState,
     new_remaining: u64,
     new_effective_price: Option<Price>,
+    side_aggregate: Option<SideAggregate>,
     reenter: bool,
 }
 
@@ -71,6 +74,13 @@ struct AttachPlan {
     total_quantity: u64,
     order_count: usize,
     previous: Option<OrderHandle>,
+    side_aggregate: SideAggregate,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct SideAggregate {
+    total_quantity: u64,
+    weighted_price_quantity: u128,
 }
 
 struct TradeReferenceResolution {
@@ -88,6 +98,8 @@ impl OrderBook {
             active_by_key: HashMap::new(),
             seen_order_keys: HashSet::new(),
             orders: OrderStorage::with_key(),
+            bid_aggregate: SideAggregate::default(),
+            ask_aggregate: SideAggregate::default(),
             statistics: TradeStatistics::default(),
             last_applied_meta: None,
         }
@@ -251,12 +263,12 @@ impl OrderBook {
             .get(handle)
             .cloned()
             .ok_or(BookError::InvariantViolation("active handle is missing"))?;
-        if state.location == OrderLocation::Resting {
-            self.validate_detach(handle, &state)?;
-        }
+        let side_aggregate = (state.location == OrderLocation::Resting)
+            .then(|| self.validate_detach(handle, &state))
+            .transpose()?;
         let cancelled_quantity = state.remaining_quantity;
-        if state.location == OrderLocation::Resting {
-            self.commit_detach(handle, &state);
+        if let Some(side_aggregate) = side_aggregate {
+            self.commit_detach(handle, &state, side_aggregate);
         }
         self.active_by_key.remove(&event.order_key);
         self.orders.remove(handle);
@@ -426,7 +438,7 @@ impl OrderBook {
                 trade: trade_quantity,
             },
         )?;
-        if state.location == OrderLocation::Resting {
+        let side_aggregate = if state.location == OrderLocation::Resting {
             let price = state.effective_price.ok_or(BookError::InvariantViolation(
                 "resting order has no effective price",
             ))?;
@@ -444,10 +456,14 @@ impl OrderBook {
                     .checked_sub(trade_quantity)
                     .ok_or(BookError::ArithmeticUnderflow("price-level quantity"))?;
             }
-        }
+            Some(self.validate_aggregate_sub(state.key.side, price, trade_quantity)?)
+        } else {
+            None
+        };
         Ok(KnownTradePlan {
             handle,
             new_effective_price: state.effective_price,
+            side_aggregate,
             state,
             new_remaining,
             reenter: false,
@@ -492,11 +508,13 @@ impl OrderBook {
         price: Price,
         quantity: u64,
     ) -> Result<AttachPlan, BookError> {
+        let side_aggregate = self.validate_aggregate_add(side, price, quantity)?;
         match self.level(side, price) {
             None => Ok(AttachPlan {
                 total_quantity: quantity,
                 order_count: 1,
                 previous: None,
+                side_aggregate,
             }),
             Some(level) => {
                 if let Some(tail) = level.tail {
@@ -516,12 +534,14 @@ impl OrderBook {
                         .checked_add(1)
                         .ok_or(BookError::ArithmeticOverflow("price-level order count"))?,
                     previous: level.tail,
+                    side_aggregate,
                 })
             }
         }
     }
 
     fn commit_attach(&mut self, side: Side, price: Price, handle: OrderHandle, plan: AttachPlan) {
+        *self.side_aggregate_mut(side) = plan.side_aggregate;
         if let Some(previous) = plan.previous {
             if let Some(previous_state) = self.orders.get_mut(previous) {
                 previous_state.next = Some(handle);
@@ -536,7 +556,11 @@ impl OrderBook {
         level.order_count = plan.order_count;
     }
 
-    fn validate_detach(&self, handle: OrderHandle, state: &OrderState) -> Result<(), BookError> {
+    fn validate_detach(
+        &self,
+        handle: OrderHandle,
+        state: &OrderState,
+    ) -> Result<SideAggregate, BookError> {
         let price = state.effective_price.ok_or(BookError::InvariantViolation(
             "resting order has no effective price",
         ))?;
@@ -579,10 +603,15 @@ impl OrderBook {
             }
             None => {}
         }
-        Ok(())
+        self.validate_aggregate_sub(state.key.side, price, state.remaining_quantity)
     }
 
-    fn commit_detach(&mut self, _handle: OrderHandle, state: &OrderState) {
+    fn commit_detach(
+        &mut self,
+        _handle: OrderHandle,
+        state: &OrderState,
+        side_aggregate: SideAggregate,
+    ) {
         let Some(price) = state.effective_price else {
             return;
         };
@@ -615,6 +644,7 @@ impl OrderBook {
         if remove_level {
             self.level_map_mut(state.key.side).remove(&price);
         }
+        *self.side_aggregate_mut(state.key.side) = side_aggregate;
     }
 
     fn best_after_trade(&self, side: Side, plan: Option<&KnownTradePlan>) -> Option<Price> {
@@ -665,7 +695,9 @@ impl OrderBook {
     fn commit_trade_plan(&mut self, plan: &KnownTradePlan, trade_quantity: u64) {
         if plan.state.location == OrderLocation::Resting {
             if plan.new_remaining == 0 {
-                self.commit_detach(plan.handle, &plan.state);
+                if let Some(aggregate) = plan.side_aggregate {
+                    self.commit_detach(plan.handle, &plan.state, aggregate);
+                }
             } else {
                 if let Some(price) = plan.state.effective_price {
                     if let Some(level) = self.level_map_mut(plan.state.key.side).get_mut(&price) {
@@ -674,6 +706,9 @@ impl OrderBook {
                 }
                 if let Some(state) = self.orders.get_mut(plan.handle) {
                     state.remaining_quantity = plan.new_remaining;
+                }
+                if let Some(aggregate) = plan.side_aggregate {
+                    *self.side_aggregate_mut(plan.state.key.side) = aggregate;
                 }
             }
         } else if let Some(state) = self.orders.get_mut(plan.handle) {
@@ -722,30 +757,138 @@ impl OrderBook {
         }
     }
 
+    fn side_aggregate(&self, side: Side) -> SideAggregate {
+        match side {
+            Side::Buy => self.bid_aggregate,
+            Side::Sell => self.ask_aggregate,
+        }
+    }
+
+    fn side_aggregate_mut(&mut self, side: Side) -> &mut SideAggregate {
+        match side {
+            Side::Buy => &mut self.bid_aggregate,
+            Side::Sell => &mut self.ask_aggregate,
+        }
+    }
+
+    fn validate_aggregate_add(
+        &self,
+        side: Side,
+        price: Price,
+        quantity: u64,
+    ) -> Result<SideAggregate, BookError> {
+        let aggregate = self.side_aggregate(side);
+        let weighted = price_quantity(price, quantity)?;
+        Ok(SideAggregate {
+            total_quantity: aggregate
+                .total_quantity
+                .checked_add(quantity)
+                .ok_or(BookError::ArithmeticOverflow("side quantity"))?,
+            weighted_price_quantity: aggregate
+                .weighted_price_quantity
+                .checked_add(weighted)
+                .ok_or(BookError::ArithmeticOverflow("side weighted price"))?,
+        })
+    }
+
+    fn validate_aggregate_sub(
+        &self,
+        side: Side,
+        price: Price,
+        quantity: u64,
+    ) -> Result<SideAggregate, BookError> {
+        let aggregate = self.side_aggregate(side);
+        let weighted = price_quantity(price, quantity)?;
+        Ok(SideAggregate {
+            total_quantity: aggregate
+                .total_quantity
+                .checked_sub(quantity)
+                .ok_or(BookError::ArithmeticUnderflow("side quantity"))?,
+            weighted_price_quantity: aggregate
+                .weighted_price_quantity
+                .checked_sub(weighted)
+                .ok_or(BookError::ArithmeticUnderflow("side weighted price"))?,
+        })
+    }
+
+    pub(crate) fn visible_aggregate(&self, side: Side) -> (u64, u128) {
+        let aggregate = self.side_aggregate(side);
+        (aggregate.total_quantity, aggregate.weighted_price_quantity)
+    }
+
     fn level(&self, side: Side, price: Price) -> Option<&PriceLevelState> {
         self.level_map(side).get(&price)
     }
 
     #[must_use]
     pub fn levels(&self, side: Side) -> Vec<LevelView> {
-        let make = |(price, level): (&Price, &PriceLevelState)| LevelView {
-            side,
-            price: *price,
-            total_quantity: level.total_quantity,
-            order_count: level.order_count,
-        };
         match side {
-            Side::Buy => self.bids.iter().rev().map(make).collect(),
-            Side::Sell => self.asks.iter().map(make).collect(),
+            Side::Buy => self
+                .bids
+                .iter()
+                .rev()
+                .map(|(price, level)| level_view(side, price, level))
+                .collect(),
+            Side::Sell => self
+                .asks
+                .iter()
+                .map(|(price, level)| level_view(side, price, level))
+                .collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn best_level(&self, side: Side) -> Option<LevelView> {
+        match side {
+            Side::Buy => self
+                .bids
+                .last_key_value()
+                .map(|(price, level)| level_view(side, price, level)),
+            Side::Sell => self
+                .asks
+                .first_key_value()
+                .map(|(price, level)| level_view(side, price, level)),
         }
     }
 
     #[must_use]
     pub fn depth(&self, levels: usize) -> DepthView {
         DepthView {
-            bids: self.levels(Side::Buy).into_iter().take(levels).collect(),
-            asks: self.levels(Side::Sell).into_iter().take(levels).collect(),
+            bids: self
+                .bids
+                .iter()
+                .rev()
+                .take(levels)
+                .map(|(price, level)| level_view(Side::Buy, price, level))
+                .collect(),
+            asks: self
+                .asks
+                .iter()
+                .take(levels)
+                .map(|(price, level)| level_view(Side::Sell, price, level))
+                .collect(),
         }
+    }
+
+    pub(crate) fn try_visit_levels<E>(
+        &self,
+        side: Side,
+        levels: usize,
+        mut visitor: impl FnMut(LevelView) -> Result<(), E>,
+    ) -> Result<(), E> {
+        match side {
+            Side::Buy => {
+                for (price, level) in self.bids.iter().rev().take(levels) {
+                    visitor(level_view(side, price, level))?;
+                }
+            }
+            Side::Sell => {
+                for (price, level) in self.asks.iter().take(levels) {
+                    visitor(level_view(side, price, level))?;
+                }
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -778,8 +921,8 @@ impl OrderBook {
 
     #[must_use]
     pub fn summary(&self) -> BookSummary {
-        let best_bid = self.levels(Side::Buy).into_iter().next();
-        let best_ask = self.levels(Side::Sell).into_iter().next();
+        let best_bid = self.best_level(Side::Buy);
+        let best_ask = self.best_level(Side::Sell);
         let statistics = TradeStatisticsView {
             last_price: self.statistics.last_price,
             high_price: self.statistics.high_price,
@@ -831,6 +974,8 @@ impl OrderBook {
 
         let mut visited = HashSet::new();
         for side in [Side::Buy, Side::Sell] {
+            let mut side_total = 0_u64;
+            let mut side_weighted = 0_u128;
             for (price, level) in self.level_map(side) {
                 if level.order_count == 0 || level.head.is_none() || level.tail.is_none() {
                     return Err(BookError::InvariantViolation("empty visible level"));
@@ -872,6 +1017,20 @@ impl OrderBook {
                 {
                     return Err(BookError::InvariantViolation("level aggregate mismatch"));
                 }
+                side_total = side_total
+                    .checked_add(level.total_quantity)
+                    .ok_or(BookError::ArithmeticOverflow("invariant side total"))?;
+                side_weighted = side_weighted
+                    .checked_add(price_quantity(*price, level.total_quantity)?)
+                    .ok_or(BookError::ArithmeticOverflow("invariant side weighted"))?;
+            }
+            if self.side_aggregate(side)
+                != (SideAggregate {
+                    total_quantity: side_total,
+                    weighted_price_quantity: side_weighted,
+                })
+            {
+                return Err(BookError::InvariantViolation("side aggregate mismatch"));
             }
         }
         for (handle, state) in &self.orders {
@@ -904,6 +1063,13 @@ fn opposite(side: Side) -> Side {
     }
 }
 
+fn price_quantity(price: Price, quantity: u64) -> Result<u128, BookError> {
+    u128::try_from(price.units())
+        .map_err(|_| BookError::ArithmeticOverflow("side weighted price"))?
+        .checked_mul(u128::from(quantity))
+        .ok_or(BookError::ArithmeticOverflow("side weighted price"))
+}
+
 fn validate_reference_side(expected: Side, actual: Side) -> Result<(), BookError> {
     if expected == actual {
         Ok(())
@@ -919,6 +1085,15 @@ fn order_view(state: &OrderState) -> OrderView {
         original_quantity: state.original_quantity,
         remaining_quantity: state.remaining_quantity,
         location: state.location,
+    }
+}
+
+fn level_view(side: Side, price: &Price, level: &PriceLevelState) -> LevelView {
+    LevelView {
+        side,
+        price: *price,
+        total_quantity: level.total_quantity,
+        order_count: level.order_count,
     }
 }
 

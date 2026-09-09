@@ -82,6 +82,41 @@ fn maintains_price_priority_fifo_and_aggregates() {
 }
 
 #[test]
+fn best_level_and_depth_stop_at_requested_price_levels() {
+    let mut book = strict_book();
+    assert!(
+        book.apply(add(1, 1, key(Side::Buy, 1, 111), 100_000, 100))
+            .is_ok()
+    );
+    assert!(
+        book.apply(add(2, 2, key(Side::Buy, 1, 112), 99_000, 200))
+            .is_ok()
+    );
+    assert!(
+        book.apply(add(3, 3, key(Side::Sell, 1, 113), 101_000, 300))
+            .is_ok()
+    );
+    assert!(
+        book.apply(add(4, 4, key(Side::Sell, 1, 114), 102_000, 400))
+            .is_ok()
+    );
+
+    assert_eq!(
+        book.best_level(Side::Buy).map(|level| level.price),
+        Some(price(100_000))
+    );
+    assert_eq!(
+        book.best_level(Side::Sell).map(|level| level.price),
+        Some(price(101_000))
+    );
+    let depth = book.depth(1);
+    assert_eq!(depth.bids.len(), 1);
+    assert_eq!(depth.asks.len(), 1);
+    assert_eq!(depth.bids[0].price, price(100_000));
+    assert_eq!(depth.asks[0].price, price(101_000));
+}
+
+#[test]
 fn partially_filled_order_is_cancelled_for_all_remaining_quantity() {
     let mut book = strict_book();
     let bid = key(Side::Buy, 1, 201);

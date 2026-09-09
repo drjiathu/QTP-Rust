@@ -15,7 +15,7 @@ mod writer;
 pub use error::ProductionError;
 pub use replay::{ReplayReport, replay_market_day};
 pub use sequence::{SequenceRegression, SequenceRepair};
-pub use snapshot::{BookSnapshot, SnapshotBookView, SnapshotLevel};
+pub use snapshot::{BookSnapshot, SnapshotBookView, SnapshotLevel, SnapshotLevels};
 pub use time::{parse_duration, parse_market_timestamp};
 pub use types::{
     MarketDayRequest, SnapshotKind, SnapshotSchedule, SzMarketOrderPolicy, TargetUniverse,
