@@ -1,85 +1,59 @@
-# 当前保留的分析工具
+# 当前分析工具
 
-保留最新批次入口和通用定位工具。依赖旧快照、临时提取文件或旧策略的一次性脚本及
-notebook 已清理；旧代码可从 Git 提交 `f3f77c0`（历史整理前 `73adb97`）恢复。
-当前跟踪下列 Python 工具与本文档，不属于生产接口。
+保留最新全量回归入口、它所需的共享驱动以及通用诊断工具。
+这些脚本不属于生产 API，运行需要本机原始数据和独立保存的历史证据。
 
-| 文件 | 用途 |
+| 文件 | 当前用途 |
 | --- | --- |
-| `run_current_full_regression.py` | 十日驱动及共享执行、报告审计、profiling 汇总函数 |
-| `run_additional_random_validation.py` | 新增五日驱动，复用上述模块 |
-| `run_p0_optimized_regression.py` | P0 十五日回归，与历史两批逐份比较语义报告；提供优化回归共用驱动 |
-| `run_p1_optimized_regression.py` | 三项 P1 优化的十五日回归，与冻结 P0 基线比较报告、分项耗时和峰值内存 |
-| `run_callback_validation.py` | validation 回调优化：`abba` 串行样本对照、`full` 十五日全量回归，基线为 `72b7d43` |
-| `run_allocation_validation.py` | 分配与查表优化：三个累计阶段的串行 ABBA、十五日全量回归，基线为 `0b4c37a` |
-| `run_borrowed_lookup_validation.py` | 恢复路径借用键优化：十五日全量回归，基线为上一轮 allocation 冻结版本；额外汇总输入、回放及总耗时 |
-| `extract_validation_symbols.py` | 从 pretty JSON 验证报告提取不匹配证券代码 |
+| `run_borrowed_lookup_validation.py` | 最近一轮十五日全量回归入口；核对输入身份、语义报告、四项候选计数及耗时 |
+| `run_callback_validation.py` | 上述入口依赖的 ABBA／全量比较封装 |
+| `run_p0_optimized_regression.py` | 比较报告、冻结源码及汇总的共享驱动 |
+| `run_current_full_regression.py` | 读取输入清单、执行任务、验收报告及汇总的底层工具 |
+| `extract_validation_symbols.py` | 从验证报告提取不匹配证券代码 |
 
-批次日期、输出目录和版本检查固定用于重现已存证据，`--launch` 拒绝覆盖已有目录。
-P0/P1 入口直接执行即启动，使用已构建的 release profiling example，目标目录已存在则拒绝运行。
-运行新批次应使用独立批次实现/目录，不覆盖旧结果。需要 PyArrow 的脚本使用 Clara Python。
+后三个驱动中的历史命名与批次常量保留，避免为目录清理引入执行逻辑改动。
+依赖链为 `borrowed_lookup → callback → p0 → current`，不能只按文件名或日期删除。
 
-回调优化的运行顺序（先构建 release profiling example）：
+## 全量回归
 
-```bash
-cargo build --release --locked --features profiling --example validation_benchmark
-/home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_callback_validation.py abba
-/home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_callback_validation.py full
-```
-
-ABBA 在 20260828 使用沪市 `600519,510300`、深市 `000001,159915`，每个市场按旧、新、
-新、旧串行运行；保存二进制指纹、命令、计时和报告一致性。小样本不能代替全市场验收。
-
-分配与查表优化使用 `run_allocation_validation.py stage1|stage2|stage3|full`。
-各 stage 应传入对应阶段的二进制，不能把同一个最终版本依次标成三个阶段：
-
-```bash
-/home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_allocation_validation.py stage2 \
-  --binary target/p1-allocation-stage2-benchmark
-/home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_allocation_validation.py full
-```
-
-三个 stage 均与 `0b4c37a` 对照，是累计版本的评估，不是各项独立收益测量；应串行运行。
-`full` 使用当前已构建的 release example，拒绝 `--binary`，并冻结源码与二进制。
-除报告外，该批次核对观察次数、标量预筛次数、十档构造次数和候选缓存命中次数完全相等。
-
-后续两处恢复路径借用键优化使用独立批次，和上一轮 allocation 结果比较：
+先构建正常版本，不要使用历史试验二进制：
 
 ```bash
 cargo build --release --locked --features profiling --example validation_benchmark
 /home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_borrowed_lookup_validation.py
 ```
 
-入口先检查 15 日输入的路径、行数、Schema、大小和修改时间与基线一致，再按六进程运行。
-结果写入 `reports/20260909-p1-borrowed-lookup-full-regression/`；
-`restore-comparison.json` 增补输入、纯回放、恢复与端到端计时，旧报告不会被覆盖。
+该入口用于复现固定批次，基线为
+`reports/20260909-p1-allocation-full-regression/`，输出为
+`reports/20260909-p1-borrowed-lookup-full-regression/`，已有输出时拒绝覆盖。
+本机该批次已完成，因此直接重跑会被拒绝；新批次须先指定独立输出目录和适当基线。
+导入共享驱动还依赖历史十日／五日 manifest，不是克隆后即可直接运行的通用 CLI。
+日常回放与单日验证使用[使用手册](../docs/Guidance.md)中的生产入口。
 
-`20260907-current-full-regression.ipynb` 和 `20260908-additional-random-validation.ipynb`
-仅用于本地历史结果阅读，已停止跟踪但保留本地文件。`analysis/*.ipynb`、缓存及
-整个 `reports/` 由 Git 忽略；克隆仓库不会获得这些文件。脚本需要的输入、报告和冻结
-二进制必须单独准备，不因保留脚本就能在空环境复现历史结果。
+需要 PyArrow 的脚本使用 Clara Python。输入清单核对路径、行数、Schema、大小和修改时间，
+不声称进行全文件内容哈希核验。成功明细省略时，报告相等不等于逐帧成功候选元数据相等；
+后者由核心差分测试补充覆盖。六进程 wall time 不等于独占 CPU 基准。
 
-读取/刷新现存汇总，不会重新回放：
-
-```bash
-/home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_current_full_regression.py --summarize
-/home/jxw06/workspace/proj/clara/.venv/bin/python analysis/run_additional_random_validation.py --summarize
-python3 analysis/extract_validation_symbols.py reports/20260908-additional-random-full/20260813-sz-full.json
-```
-
-已提交的结果摘要见[验证基线](../docs/real-data-validation.md)，详细证据位于本地 `reports/`。
-优化回归的 `comparison.json`/`comparison.md` 比较同日同市场结果与时间。
-语义报告比较包括汇总、阶段审计、排除项和失败明细；不包含已省略的成功逐帧候选元数据。
-首次命中和最佳失败候选的保真另由差分单元测试覆盖。六进程并发耗时不能视为独占 CPU 基准。
-批次内 `source-snapshot/analysis`
-是不可变运行版本，允许保留旧路径，不作为当前执行入口；不要为清理而改写源码快照。
-
-## 代码检查
+## 诊断与只读检查
 
 ```bash
+python3 analysis/extract_validation_symbols.py reports/example-validation.json
 ruff check analysis
 ruff format --check analysis
 ```
 
-只检查受维护的 Python 工具，不对本地 notebook 或冻结报告源码批量修复。
-修复 lint 时保留非零子进程退出码审计；worker 异常必须写入失败收据并令批次验收失败。
+详细报告、收据、输入清单与源码快照均保存在本地 `reports/`，由 Git 忽略。
+当前验收范围与计时结果见[验证基线](../docs/real-data-validation.md)。
+
+## 已结束的工具与恢复
+
+2026-09-10 清理了旧五日扩展、旧 P1 回归、allocation 阶段试验、三项 P1 可行性试验入口，
+以及两个旧 notebook 和 Python 缓存。没有删除原始行情、运行报告、实验源码或冻结二进制。
+
+清理前的完整 `analysis/`、`docs/` 位于
+`reports/20260910-analysis-docs-cleanup/`，包括尚未提交的可行性试验脚本；
+该备份不随 Git 分发。已提交旧文件也可从 `33bf3bb` 恢复。
+早期、更旧的工具见 Git 提交 `f3f77c0`（历史整理前 `73adb97`）。
+
+需要重现历史试验时，从备份或对应批次的冻结源码恢复配套文件到原路径布局，
+不要原地改写旧报告／源码快照。三项可行性原型没有合入生产代码，也不再作为待实施计划。

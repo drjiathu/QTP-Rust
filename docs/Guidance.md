@@ -190,7 +190,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 完整 API 可通过 `cargo doc --locked --no-deps --open` 查看。
 旧 `LegacyReplay/normalize`、`OrderRecord/TradeRecord/MarketDataRecord` 等接口已退役，
-这属于公共 API 破坏性变更；旧代码和字段映射仅在[历史归档](archive/cpp-to-rust-migration-plan.md)追溯。
+这属于公共 API 破坏性变更；旧代码和字段映射可在 Git 历史中追溯，
+例如 `git show 33bf3bb:docs/archive/cpp-to-rust-migration-plan.md`，不作为当前接口文档。
 
 ## 核心回归与性能冒烟
 

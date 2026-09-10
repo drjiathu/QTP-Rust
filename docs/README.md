@@ -10,7 +10,7 @@
 | 哪个版本在哪些数据上验证过 | [验证基线与计时](real-data-validation.md) | 冻结版本、数据范围、证据链接和 profiling 口径 |
 
 当前包版本仍为 `0.1.0`；旧 QTP 接口和 C++ oracle 已移除，固定 golden 与 Rust 回归测试保留。
-历史十五日全量验证与接口退役后的 20260828 回归分别存证，提交与二进制指纹以验证基线为准。
+最新十五日全量验收对应 `33bf3bb` 的生产代码；历史批次分别存证，提交与二进制指纹以验证基线为准。
 文档整理不等同于创建发布 tag，也不扩大已验证范围。开发检查见
 [CONTRIBUTING](../CONTRIBUTING.md#required-checks)，后续任务使用 Issue 跟踪。
 
@@ -24,11 +24,14 @@
 提交的结果摘要见[验证基线](real-data-validation.md)，当前分析工具见
 [analysis/](../analysis/README.md)。本地 notebook 也不跟踪，大规模逐帧报告不复制到 docs。
 
-## 合并与历史归档
+## 清理与历史追溯
 
 - 原 `order-book-replay-guide.md` 已合并；旧 QTP 接口退役后，使用手册改为核心 Rust API。
 - 原 `sz-order-replay.md` 和使用手册中的内部顺序处理合入实现说明。
 - 原 `validation-performance.md` 合入验证基线的“Profiling”。
-- [C++ 迁移方案](archive/cpp-to-rust-migration-plan.md)、
-  [早期 20260828 调查](archive/real-data-validation-20260828-investigation.md) 保留为历史，
-  不再定义当前行为；归档正文、官方 PDF 和报告源码快照不因本次合并而重写。
+- C++ 迁移方案与早期 20260828 调查已于 2026-09-10 从本目录移除，
+  可从 `33bf3bb:docs/archive/` 的 Git 历史追溯，不再定义当前行为。
+- 已结束的性能阶段日志收敛为验证基线摘要；三项后续优化不再单独投入。
+- 本次清理前的完整目录（包括未提交试验脚本和本地 notebook）保存在
+  `reports/20260910-analysis-docs-cleanup/`，该备份仅在本机，不随 Git 分发。
+  官方 PDF、现行验收规则及各批次冻结源码保持不变。
