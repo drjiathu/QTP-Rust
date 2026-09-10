@@ -6,14 +6,15 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-09-10
+
 ### Added
 
 - Strongly typed order-book events and SH/SZ Parquet replay and validation.
 - FIFO order-book reconstruction with add, trade, and full-remainder cancel.
 - Reviewed golden fixtures, Rust core regression tests, and property tests.
-- Summaries for five additional validation dates and the post-retirement
-  20260828 SH/SZ full-market regression; all comparable snapshots matched.
-  Detailed evidence is stored locally, outside version control.
+- A production `qtp-replay` CLI with stock/ETF selection, scheduled snapshots,
+  raw snapshot validation, and optional profiling tools.
 
 ### Changed
 
@@ -24,8 +25,14 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   event sequences, checkpoint labels and expected values.
 - `replay_benchmark` now measures prebuilt core events through `OrderBook::apply`,
   not legacy normalization/replay; its timings are not comparable to old runs.
-- Consolidated maintained documentation into usage, implementation, acceptance
-  rules and validation evidence, with shared Markdown lint configuration.
+- Optimized replay allocations, symbol lookups, reference loading, and validation
+  callbacks while preserving regression results.
+- Consolidated maintained Chinese documentation into usage, implementation, and
+  acceptance rules, with shared Markdown lint configuration. Machine-specific
+  validation and performance baselines remain local under ignored `reports/`;
+  general profiling instructions are maintained in the usage guide.
+- Updated the project description and configured Taplo to use Cargo's official
+  manifest schema without weakening Rust or Clippy lint settings.
 - Pruned superseded reports and one-off analysis artifacts, retaining complete
   local evidence, compact diagnostics and a cleanup inventory.
 - Removed `reports/` from unpublished commit trees without rewriting published
