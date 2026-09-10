@@ -20,6 +20,8 @@ pub enum BookError {
         side: Side,
         instruction: &'static str,
     },
+    #[error("an unpriced order must remain hidden")]
+    UnpricedVisibleOrder,
     #[error("unknown cancellation target: {0:?}")]
     UnknownCancellation(OrderKey),
     #[error("trade reference side {actual:?} does not match expected side {expected:?}")]

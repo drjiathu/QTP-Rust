@@ -16,7 +16,7 @@ pub struct LevelView {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OrderView {
     pub key: OrderKey,
-    pub effective_price: Price,
+    pub effective_price: Option<Price>,
     pub original_quantity: Quantity,
     pub remaining_quantity: u64,
     pub location: OrderLocation,
@@ -55,7 +55,7 @@ pub struct BookSummary {
 pub enum ApplyOutcome {
     Added {
         key: OrderKey,
-        effective_price: Price,
+        effective_price: Option<Price>,
         quantity: Quantity,
         location: OrderLocation,
     },

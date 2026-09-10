@@ -19,19 +19,34 @@ Run these commands before opening a pull request:
 ```bash
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets
-cargo test --locked --doc
-RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps
+cargo test --locked --all-targets --all-features
+cargo test --locked --doc --all-features
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --all-features --no-deps
 cargo deny check
 ```
 
 `cargo deny check` requires a current standalone `cargo-deny` binary. It may be
-installed with a newer Rust toolchain without changing this crate's Rust 1.85.1
-minimum supported version.
+installed with a newer Rust toolchain without changing the project's pinned
+Rust toolchain.
 
-Changes to legacy compatibility behaviour must update the C++ oracle or explain
-why no golden change is required. Never replace the golden fixture without
-reviewing the state transition that changed.
+For Markdown changes, also run (Node.js 22 or newer):
+
+```bash
+npx --yes markdownlint-cli2@0.23.2
+```
+
+The checked-in `.markdownlint-cli2.jsonc` defines the maintained document scope
+and formatting rules, shared with the VS Code markdownlint extension. Code blocks
+and tables are exempt from the 80-character prose limit. Frozen validation
+reports and source snapshots are excluded; do not reformat evidence artifacts.
+`reports/` and `analysis/*.ipynb` are local-only and ignored by Git. Keep reusable
+analysis Python tools and their README in version control. Run `ruff check
+analysis` and `ruff format --check analysis` when changing those tools; preparing
+historical reports and input data is separate from cloning this repository.
+
+Core behavior changes must explain their effect on the fixed golden expectations.
+Do not accept implementation output merely to make a test pass; scope and update
+rules are in the [golden test notes](tests/fixtures/golden/README.md).
 
 ## Licensing
 

@@ -3,7 +3,7 @@ name = "qtp-core"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
-description = "A Rust rewrite of the QTP quantitative trading core"
+description = "Rust order book reconstruction for SH/SZ stocks and ETFs."
 license = "LGPL-3.0-only"
 repository = "https://github.com/drjiathu/QTP-Rust"
 readme = "README.md"
@@ -13,9 +13,25 @@ publish = false
 name = "qtp_core"
 path = "src/lib.rs"
 
+[features]
+profiling = []
+
+[[example]]
+name = "validation_benchmark"
+required-features = ["profiling"]
+
 [dependencies]
+arrow = { version = "56.2", default-features = false }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+clap = { version = "4.5", features = ["derive"] }
+hashbrown = { version = "0.16.1", default-features = false }
+parquet = { version = "56.2", features = ["arrow", "zstd"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 slotmap = "1.0"
+smallvec = { version = "1.15", features = ["serde"] }
 thiserror = "2.0"
+tempfile = "3.20"
 
 [dev-dependencies]
 proptest = "1.6"

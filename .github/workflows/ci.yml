@@ -21,27 +21,13 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
       - name: Run tests
-        run: cargo test --locked --all-targets
+        run: cargo test --locked --all-targets --all-features
       - name: Run documentation tests
         run: cargo test --locked --doc
       - name: Build API documentation
         env:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --locked --no-deps
-
-  cpp-oracle:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build the lightweight C++ oracle
-        run: >-
-          g++ -std=c++17 -O2 tests/cpp_oracle/order_book_oracle.cpp
-          -o /tmp/qtp-order-book-oracle
-      - name: Verify the reviewed golden output
-        run: >-
-          diff -u tests/fixtures/legacy_golden/order_book.txt
-          <(/tmp/qtp-order-book-oracle)
-        shell: bash
 
   dependencies:
     runs-on: ubuntu-latest

@@ -2,10 +2,9 @@
 
 use qtp_core::{
     AddOrder, ApplySequence, BookConfig, BookEvent, BookKey, ChannelId, CrossingBehavior,
-    EventMeta, LegacyContext, LocalTimestampNs, Market, OrderBook, OrderCancel, OrderId, OrderKey,
-    OrderRecord, OrderReference, Price, PriceScale, PricingInstruction, Quantity, QuoteTimestampNs,
-    RawEventTime, RawOrderSide, RawOrderType, RawSequence, RawTradeSide, RawTradeType, Side,
-    Symbol, Trade, TradeRecord, TradingDay, UnknownTradePolicy,
+    EventMeta, LocalTimestampNs, Market, OrderBook, OrderCancel, OrderId, OrderKey, OrderReference,
+    Price, PriceScale, PricingInstruction, Quantity, QuoteTimestampNs, RawSequence, Side, Symbol,
+    Trade, TradingDay, UnknownTradePolicy,
 };
 
 pub fn some_or_abort<T>(value: Option<T>) -> T {
@@ -36,63 +35,6 @@ pub fn compatibility_book() -> OrderBook {
         BookConfig::new(book_key(), price_scale())
             .with_unknown_trade_policy(UnknownTradePolicy::UpdateKnownAndStatistics),
     )
-}
-
-pub fn legacy_context() -> LegacyContext {
-    LegacyContext {
-        book_key: book_key(),
-        price_scale: price_scale(),
-    }
-}
-
-pub fn raw_time(sequence: i64) -> RawEventTime {
-    RawEventTime {
-        steady_time: None,
-        local_time: LocalTimestampNs::from_nanos(1_000 + sequence),
-        quote_time: QuoteTimestampNs::from_nanos(2_000 + sequence),
-    }
-}
-
-pub fn raw_order(
-    sequence: i64,
-    side: RawOrderSide,
-    channel_no: i32,
-    order_id: i64,
-    display_price: f64,
-    quantity: u64,
-) -> OrderRecord {
-    OrderRecord {
-        event_time: raw_time(sequence),
-        symbol: book_key().symbol,
-        kind: RawOrderType::LimitPrice,
-        side,
-        channel_no,
-        sequence,
-        order_id,
-        price: display_price,
-        quantity,
-    }
-}
-
-pub fn raw_trade(
-    sequence: i64,
-    display_price: f64,
-    quantity: u64,
-    bid_order_id: i64,
-    ask_order_id: i64,
-) -> TradeRecord {
-    TradeRecord {
-        event_time: raw_time(sequence),
-        symbol: book_key().symbol,
-        kind: RawTradeType::Trade,
-        side: RawTradeSide::Unknown,
-        channel_no: 1,
-        sequence,
-        price: display_price,
-        quantity,
-        bid_order_id,
-        ask_order_id,
-    }
 }
 
 pub fn key(side: Side, channel: u32, order_id: u64) -> OrderKey {

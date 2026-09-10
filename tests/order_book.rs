@@ -9,6 +9,58 @@ use qtp_core::{
 };
 
 #[test]
+fn crossing_rest_orders_keep_fifo_until_source_trade_and_cancel() {
+    let mut book = strict_book();
+    let ask = key(Side::Sell, 1, 901);
+    let first = key(Side::Buy, 1, 902);
+    let second = key(Side::Buy, 1, 903);
+    assert!(book.apply(add(1, 1, ask, 100_000, 200)).is_ok());
+    assert!(book.apply(add(2, 2, first, 105_000, 100)).is_ok());
+    assert!(book.apply(add(3, 3, second, 105_000, 50)).is_ok());
+    // Crossing itself produces neither a trade nor a hidden order.
+    assert_eq!(book.summary().statistics.trade_count, 0);
+    assert_eq!(book.levels(Side::Buy)[0].total_quantity, 150);
+    assert_eq!(book.levels(Side::Sell)[0].total_quantity, 200);
+    assert!(
+        book.apply(trade(
+            4,
+            4,
+            OrderReference::Resolved(first),
+            OrderReference::Resolved(ask),
+            100_000,
+            40,
+        ))
+        .is_ok()
+    );
+    let bids = book.orders_at(Side::Buy, price(105_000));
+    assert_eq!(
+        bids.iter()
+            .map(|o| (o.key, o.remaining_quantity))
+            .collect::<Vec<_>>(),
+        vec![(first, 60), (second, 50)]
+    );
+    assert!(bids.iter().all(|o| o.location == OrderLocation::Resting));
+    assert!(book.apply(cancel(5, 5, first)).is_ok());
+    assert_eq!(book.levels(Side::Buy)[0].total_quantity, 50);
+    assert_eq!(book.orders_at(Side::Buy, price(105_000))[0].key, second);
+    assert!(
+        book.apply(trade(
+            6,
+            6,
+            OrderReference::Resolved(second),
+            OrderReference::Resolved(ask),
+            100_000,
+            50,
+        ))
+        .is_ok()
+    );
+    assert!(book.levels(Side::Buy).is_empty());
+    assert_eq!(book.levels(Side::Sell)[0].total_quantity, 110);
+    assert_eq!(book.summary().statistics.total_quantity, 90);
+    assert!(book.check_invariants().is_ok());
+}
+
+#[test]
 fn maintains_price_priority_fifo_and_aggregates() {
     let mut book = strict_book();
     let first = key(Side::Buy, 1, 101);
@@ -27,6 +79,41 @@ fn maintains_price_priority_fifo_and_aggregates() {
         vec![first, second]
     );
     assert!(book.check_invariants().is_ok());
+}
+
+#[test]
+fn best_level_and_depth_stop_at_requested_price_levels() {
+    let mut book = strict_book();
+    assert!(
+        book.apply(add(1, 1, key(Side::Buy, 1, 111), 100_000, 100))
+            .is_ok()
+    );
+    assert!(
+        book.apply(add(2, 2, key(Side::Buy, 1, 112), 99_000, 200))
+            .is_ok()
+    );
+    assert!(
+        book.apply(add(3, 3, key(Side::Sell, 1, 113), 101_000, 300))
+            .is_ok()
+    );
+    assert!(
+        book.apply(add(4, 4, key(Side::Sell, 1, 114), 102_000, 400))
+            .is_ok()
+    );
+
+    assert_eq!(
+        book.best_level(Side::Buy).map(|level| level.price),
+        Some(price(100_000))
+    );
+    assert_eq!(
+        book.best_level(Side::Sell).map(|level| level.price),
+        Some(price(101_000))
+    );
+    let depth = book.depth(1);
+    assert_eq!(depth.bids.len(), 1);
+    assert_eq!(depth.asks.len(), 1);
+    assert_eq!(depth.bids[0].price, price(100_000));
+    assert_eq!(depth.asks[0].price, price(101_000));
 }
 
 #[test]
@@ -94,6 +181,188 @@ fn hidden_crossing_order_reenters_after_opposite_level_is_consumed() {
     ));
     assert_eq!(book.levels(Side::Buy)[0].total_quantity, 50);
     assert!(book.order(&ask).is_none());
+}
+
+#[test]
+fn always_hidden_order_never_rests_or_reenters() {
+    let mut book = strict_book();
+    let bid = key(Side::Buy, 1, 303);
+    let added = book.apply(BookEvent::AddOrder(AddOrder {
+        meta: meta(1, 1),
+        order_key: bid,
+        pricing: PricingInstruction::Unpriced,
+        crossing: CrossingBehavior::AlwaysHide,
+        quantity: common::quantity(100),
+    }));
+    assert!(matches!(
+        added,
+        Ok(ApplyOutcome::Added {
+            effective_price: None,
+            location: OrderLocation::Aggressive,
+            ..
+        })
+    ));
+    assert!(book.levels(Side::Buy).is_empty());
+
+    assert!(
+        book.apply(trade(
+            2,
+            2,
+            OrderReference::Resolved(bid),
+            OrderReference::Absent,
+            55_000,
+            40,
+        ))
+        .is_ok()
+    );
+    assert!(matches!(
+        book.order(&bid),
+        Some(order)
+            if order.location == OrderLocation::Aggressive
+                && order.remaining_quantity == 60
+    ));
+    assert!(book.levels(Side::Buy).is_empty());
+    assert!(book.apply(cancel(3, 3, bid)).is_ok());
+    assert!(book.order(&bid).is_none());
+}
+
+#[test]
+fn market_remainder_reprices_to_last_trade_and_reenters_after_crossing_ends() {
+    let mut book = strict_book();
+    let ask = key(Side::Sell, 1, 304);
+    let market_bid = key(Side::Buy, 1, 305);
+    assert!(book.apply(add(1, 1, ask, 55_000, 100)).is_ok());
+    let added = book.apply(BookEvent::AddOrder(AddOrder {
+        meta: meta(2, 2),
+        order_key: market_bid,
+        // The raw market-order boundary is not its eventual resting price.
+        pricing: PricingInstruction::Provided(price(60_000)),
+        crossing: CrossingBehavior::RestAtLastTradePrice,
+        quantity: common::quantity(150),
+    }));
+    assert!(matches!(
+        added,
+        Ok(ApplyOutcome::Added {
+            effective_price: Some(value),
+            location: OrderLocation::Aggressive,
+            ..
+        }) if value == price(60_000)
+    ));
+
+    assert!(
+        book.apply(trade(
+            3,
+            3,
+            OrderReference::Resolved(market_bid),
+            OrderReference::Resolved(ask),
+            55_000,
+            40,
+        ))
+        .is_ok()
+    );
+    assert!(matches!(
+        book.order(&market_bid),
+        Some(order)
+            if order.location == OrderLocation::Aggressive
+                && order.effective_price == Some(price(55_000))
+                && order.remaining_quantity == 110
+    ));
+    assert!(book.levels(Side::Buy).is_empty());
+
+    assert!(
+        book.apply(trade(
+            4,
+            4,
+            OrderReference::Resolved(market_bid),
+            OrderReference::Resolved(ask),
+            55_000,
+            60,
+        ))
+        .is_ok()
+    );
+    assert!(matches!(
+        book.order(&market_bid),
+        Some(order)
+            if order.location == OrderLocation::Resting
+                && order.effective_price == Some(price(55_000))
+                && order.remaining_quantity == 50
+    ));
+    assert_eq!(book.levels(Side::Buy)[0].price, price(55_000));
+    assert_eq!(book.levels(Side::Buy)[0].total_quantity, 50);
+    assert!(book.check_invariants().is_ok());
+}
+
+#[test]
+fn unpriced_visible_order_is_rejected_atomically() {
+    let mut book = strict_book();
+    let bid = key(Side::Buy, 1, 304);
+    let event = BookEvent::AddOrder(AddOrder {
+        meta: meta(1, 1),
+        order_key: bid,
+        pricing: PricingInstruction::Unpriced,
+        crossing: CrossingBehavior::Rest,
+        quantity: common::quantity(100),
+    });
+    assert_eq!(book.apply(event), Err(BookError::UnpricedVisibleOrder));
+    assert!(book.is_empty());
+    assert!(book.last_applied_meta().is_none());
+}
+
+#[test]
+fn practical_ioc_path_can_rest_temporarily_but_real_cancel_clears_it() {
+    // Deliberate limitation fixture, NOT an assertion of exact IOC placement.
+    let mut book = strict_book();
+    let first = key(Side::Sell, 1, 310);
+    let second = key(Side::Sell, 1, 311);
+    let bid = key(Side::Buy, 1, 312);
+    assert!(book.apply(add(1, 1, first, 100_000, 100)).is_ok());
+    assert!(book.apply(add(2, 2, second, 100_100, 100)).is_ok());
+    assert!(
+        book.apply(BookEvent::AddOrder(AddOrder {
+            meta: meta(3, 3),
+            order_key: bid,
+            pricing: PricingInstruction::Unpriced,
+            crossing: CrossingBehavior::RestAtLastTradePrice,
+            quantity: common::quantity(300),
+        }))
+        .is_ok()
+    );
+    assert!(
+        book.apply(trade(
+            4,
+            4,
+            OrderReference::Resolved(bid),
+            OrderReference::Resolved(first),
+            100_000,
+            100
+        ))
+        .is_ok()
+    );
+    assert!(
+        matches!(book.order(&bid), Some(o) if o.location == OrderLocation::Resting
+        && o.remaining_quantity == 200 && o.effective_price == Some(price(100_000)))
+    );
+    assert!(
+        book.apply(trade(
+            5,
+            5,
+            OrderReference::Resolved(bid),
+            OrderReference::Resolved(second),
+            100_100,
+            100
+        ))
+        .is_ok()
+    );
+    // Once resting, the practical market-order behavior does not reprice again.
+    assert!(
+        matches!(book.order(&bid), Some(o) if o.remaining_quantity == 100
+        && o.effective_price == Some(price(100_000)))
+    );
+    assert!(book.apply(cancel(6, 6, bid)).is_ok());
+    assert!(book.order(&bid).is_none());
+    assert!(book.levels(Side::Buy).is_empty());
+    assert!(book.levels(Side::Sell).is_empty());
+    assert!(book.check_invariants().is_ok());
 }
 
 #[test]

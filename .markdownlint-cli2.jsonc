@@ -1,0 +1,28 @@
+{
+  // Human-maintained Markdown only; frozen validation reports are evidence.
+  "globs": [
+    "*.md",
+    "docs/**/*.md",
+    "analysis/*.md",
+    "tests/**/*.md"
+  ],
+  "ignores": [
+    "LICENSE",
+    "COPYING",
+    "target/**",
+    "**/node_modules/**",
+    "reports/**",
+    "**/source-snapshot/**"
+  ],
+  "config": {
+    "default": true,
+    "MD013": {
+      "line_length": 80,
+      "code_blocks": false,
+      "tables": false
+    },
+    "MD060": {
+      "style": "compact"
+    }
+  }
+}

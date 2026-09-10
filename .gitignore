@@ -1,5 +1,10 @@
 /target/
 
+# Local analysis caches and extracted vendor data are not source artifacts.
+/analysis/__pycache__/
+/analysis/*.ipynb
+/reports/
+
 *.log
 *.profraw
 

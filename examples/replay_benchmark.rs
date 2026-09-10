@@ -1,60 +1,71 @@
+//! Core-only apply benchmark; excludes event construction and production file processing.
 use std::error::Error;
+use std::io;
 use std::time::Instant;
 
 use qtp_core::{
-    BookConfig, BookKey, LegacyContext, LegacyReplay, LocalTimestampNs, Market, OrderBook,
-    OrderRecord, PriceScale, QuoteTimestampNs, RawEventTime, RawOrderSide, RawOrderType, Symbol,
-    TradingDay,
+    AddOrder, ApplySequence, BookConfig, BookEvent, BookKey, ChannelId, CrossingBehavior,
+    EventMeta, LocalTimestampNs, Market, OrderBook, OrderId, OrderKey, Price, PriceScale,
+    PricingInstruction, Quantity, QuoteTimestampNs, RawSequence, Side, Symbol, TradingDay,
 };
+
+fn required<T>(value: Option<T>) -> Result<T, io::Error> {
+    value.ok_or_else(|| io::Error::other("invalid benchmark scalar"))
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let record_count = std::env::args()
         .nth(1)
-        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.parse::<u64>())
+        .transpose()?
         .unwrap_or(100_000);
-    let trading_day = TradingDay::from_yyyymmdd(20_250_102)
-        .ok_or_else(|| std::io::Error::other("invalid benchmark trading day"))?;
-    let price_scale = PriceScale::from_decimal_places(4)
-        .ok_or_else(|| std::io::Error::other("invalid benchmark price scale"))?;
+    let price_scale = required(PriceScale::from_decimal_places(4))?;
     let book_key = BookKey {
         market: Market::Sse,
-        trading_day,
-        symbol: Symbol::from("600000.SH"),
+        trading_day: required(TradingDay::from_yyyymmdd(20_250_102))?,
+        symbol: Symbol::from("600000"),
     };
-    let context = LegacyContext {
-        book_key: book_key.clone(),
-        price_scale,
-    };
-    let orders = (1..=record_count)
-        .map(|index| OrderRecord {
-            event_time: RawEventTime {
-                steady_time: None,
-                local_time: LocalTimestampNs::from_nanos(index as i64),
-                quote_time: QuoteTimestampNs::from_nanos(index as i64),
-            },
-            symbol: book_key.symbol.clone(),
-            kind: RawOrderType::LimitPrice,
-            side: if index % 2 == 0 {
-                RawOrderSide::Buy
+    let events = (1..=record_count)
+        .map(|sequence| -> Result<BookEvent, Box<dyn Error>> {
+            let timestamp = i64::try_from(sequence)?;
+            let side = if sequence % 2 == 0 {
+                Side::Buy
             } else {
-                RawOrderSide::Sell
-            },
-            channel_no: 1,
-            sequence: index as i64,
-            order_id: index as i64,
-            price: 10.0 + (index % 100) as f64 / 10_000.0,
-            quantity: 100,
+                Side::Sell
+            };
+            let price_units = match side {
+                Side::Buy => 100_000 - timestamp % 100,
+                Side::Sell => 101_000 + timestamp % 100,
+            };
+            Ok(BookEvent::AddOrder(AddOrder {
+                meta: EventMeta {
+                    book_key: book_key.clone(),
+                    raw_sequence: required(RawSequence::new(sequence))?,
+                    apply_sequence: required(ApplySequence::new(sequence))?,
+                    local_time: LocalTimestampNs::from_nanos(timestamp),
+                    quote_time: QuoteTimestampNs::from_nanos(timestamp),
+                },
+                order_key: OrderKey {
+                    channel_id: required(ChannelId::new(1))?,
+                    side,
+                    order_id: required(OrderId::new(sequence))?,
+                },
+                pricing: PricingInstruction::Provided(required(Price::from_units(price_units))?),
+                crossing: CrossingBehavior::Rest,
+                quantity: required(Quantity::new(100))?,
+            }))
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>, _>>()?;
     let mut book = OrderBook::new(BookConfig::new(book_key, price_scale));
-    let mut replay = LegacyReplay::new(context);
 
     let started = Instant::now();
-    replay.replay(&mut book, &orders, &[])?;
+    for event in events {
+        book.apply(event)?;
+    }
     let elapsed = started.elapsed();
 
     println!(
-        "records={record_count} elapsed={elapsed:?} active_orders={}",
+        "mode=core_apply records={record_count} elapsed={elapsed:?} active_orders={}",
         book.summary().active_order_count
     );
     Ok(())

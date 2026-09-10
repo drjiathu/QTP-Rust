@@ -5,6 +5,3 @@ R4|last=100500|range=100500/100500|qty=40|turnover=4020000|trades=1|bids=100000:
 R5|last=100500|range=100500/100500|qty=40|turnover=4020000|trades=1|bids=100000:60[101:60]|asks=101000:80[201:80]|active=101:60:R,201:80:R
 R6|last=100700|range=100500/100700|qty=100|turnover=10062000|trades=2|bids=-|asks=101000:20[201:20]|active=201:20:R
 R7|last=100700|range=100500/100700|qty=100|turnover=10062000|trades=2|bids=-|asks=-|active=-
-H1|last=-|range=-/-|qty=0|turnover=0|trades=0|bids=-|asks=100000:100[301:100]|active=301:100:R
-H2|last=-|range=-/-|qty=0|turnover=0|trades=0|bids=-|asks=100000:100[301:100]|active=301:100:R,302:150:A
-H3|last=100000|range=100000/100000|qty=100|turnover=10000000|trades=1|bids=101000:50[302:50]|asks=-|active=302:50:R

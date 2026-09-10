@@ -1,20 +1,5 @@
 use std::fmt;
-
-/// A monotonic timestamp carried only by legacy QTP input.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct LegacySteadyTimestampNs(i64);
-
-impl LegacySteadyTimestampNs {
-    #[must_use]
-    pub const fn from_nanos(nanoseconds: i64) -> Self {
-        Self(nanoseconds)
-    }
-
-    #[must_use]
-    pub const fn as_nanos(self) -> i64 {
-        self.0
-    }
-}
+use std::sync::Arc;
 
 /// A required local receive or generation timestamp in Unix epoch nanoseconds.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -48,22 +33,15 @@ impl QuoteTimestampNs {
     }
 }
 
-/// Source timestamps attached to a raw market-data record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct RawEventTime {
-    pub steady_time: Option<LegacySteadyTimestampNs>,
-    pub local_time: LocalTimestampNs,
-    pub quote_time: QuoteTimestampNs,
-}
-
-/// Instrument symbol.
+/// Instrument symbol. Clones share immutable storage; equality, ordering and
+/// hashing remain content-based, including for non-six-digit symbols.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub struct Symbol(Box<str>);
+pub struct Symbol(Arc<str>);
 
 impl Symbol {
     #[must_use]
     pub fn new(value: impl Into<Box<str>>) -> Self {
-        Self(value.into())
+        Self(Arc::from(value.into()))
     }
 
     #[must_use]
@@ -74,7 +52,7 @@ impl Symbol {
 
 impl From<&str> for Symbol {
     fn from(value: &str) -> Self {
-        Self::new(value)
+        Self(Arc::from(value))
     }
 }
 
@@ -90,7 +68,13 @@ impl fmt::Display for Symbol {
     }
 }
 
-/// Supported exchange.
+/// Supported securities exchange.
+///
+/// The variants use the exchanges' standard English abbreviations:
+/// `Sse` means Shanghai Stock Exchange and `Szse` means Shenzhen Stock
+/// Exchange.
+/// Rust spells enum variants in UpperCamelCase; external CLI,
+/// directory and report market codes remain `SH` and `SZ`.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Market {
     Sse,
@@ -235,82 +219,14 @@ pub struct EventMeta {
     pub quote_time: QuoteTimestampNs,
 }
 
-/// Legacy QTP order side before normalization.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RawOrderSide {
-    Buy,
-    Sell,
-    Borrow,
-    Loan,
-}
-
-/// Legacy QTP order type before normalization.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RawOrderType {
-    MarketPrice,
-    LimitPrice,
-    ForwardBestPrice,
-    ReverseBestPrice,
-    Cancelled,
-}
-
-/// Legacy QTP transaction type before normalization.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RawTradeType {
-    Trade,
-    Cancelled,
-}
-
-/// Legacy QTP aggressor flag retained for audit.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RawTradeSide {
-    Unknown,
-    Buy,
-    Sell,
-}
-
-/// Raw legacy order record. Signed identifiers and `f64` prices are preserved.
-#[derive(Clone, Debug, PartialEq)]
-pub struct OrderRecord {
-    pub event_time: RawEventTime,
-    pub symbol: Symbol,
-    pub kind: RawOrderType,
-    pub side: RawOrderSide,
-    pub channel_no: i32,
-    pub sequence: i64,
-    pub order_id: i64,
-    pub price: f64,
-    pub quantity: u64,
-}
-
-/// Raw legacy trade or cancellation record.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TradeRecord {
-    pub event_time: RawEventTime,
-    pub symbol: Symbol,
-    pub kind: RawTradeType,
-    pub side: RawTradeSide,
-    pub channel_no: i32,
-    pub sequence: i64,
-    pub price: f64,
-    pub quantity: u64,
-    pub bid_order_id: i64,
-    pub ask_order_id: i64,
-}
-
-/// Raw input accepted by legacy normalization.
-#[derive(Clone, Debug, PartialEq)]
-pub enum MarketDataRecord {
-    Order(OrderRecord),
-    Trade(TradeRecord),
-}
-
 /// Price resolution performed against the current book at apply time.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PricingInstruction {
     Provided(Price),
     SameSideBest,
     OppositeBest,
+    /// No effective price is available or needed for an always-hidden order.
+    Unpriced,
 }
 
 /// Placement behavior after the effective price is resolved.
@@ -318,6 +234,14 @@ pub enum PricingInstruction {
 pub enum CrossingBehavior {
     Rest,
     HideIfCrossing,
+    /// Start as an aggressive hidden order, then price any unfilled remainder
+    /// at the latest trade price and let it rest once it no longer crosses.
+    ///
+    /// Used by the practical production SZ policy, not a complete exchange
+    /// market-order rule. Strict SZ policies resolve pending responses separately.
+    RestAtLastTradePrice,
+    /// Keep the order out of visible depth for its entire lifetime.
+    AlwaysHide,
 }
 
 /// Reference to one side of a trade.
@@ -373,7 +297,30 @@ impl BookEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{PriceScale, TradingDay};
+    use super::{PriceScale, Symbol, TradingDay};
+
+    #[test]
+    fn symbol_clones_share_storage_and_preserve_content_semantics() {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        for value in ["000001", "", "arbitrary-long-symbol", "证券"] {
+            let original = Symbol::new(value);
+            let cloned = original.clone();
+            let independent = Symbol::from(value.to_owned());
+            assert!(std::sync::Arc::ptr_eq(&original.0, &cloned.0));
+            assert_eq!(original, independent);
+            assert_eq!(original.cmp(&independent), std::cmp::Ordering::Equal);
+            assert_eq!(original.to_string(), value);
+            assert_eq!(format!("{original:?}"), format!("Symbol({value:?})"));
+            let hash = |symbol: &Symbol| {
+                let mut state = DefaultHasher::new();
+                symbol.hash(&mut state);
+                state.finish()
+            };
+            assert_eq!(hash(&original), hash(&independent));
+            drop(original);
+            assert_eq!(cloned.as_str(), value);
+        }
+    }
 
     #[test]
     fn validates_trading_days() {
