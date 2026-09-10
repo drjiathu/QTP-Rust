@@ -28,7 +28,7 @@ cargo build --release --locked --features profiling --example validation_benchma
 `reports/20260909-p1-borrowed-lookup-full-regression/`，已有输出时拒绝覆盖。
 本机该批次已完成，因此直接重跑会被拒绝；新批次须先指定独立输出目录和适当基线。
 导入共享驱动还依赖历史十日／五日 manifest，不是克隆后即可直接运行的通用 CLI。
-日常回放与单日验证使用[使用手册](../docs/Guidance.md)中的生产入口。
+日常回放与单日验证使用[使用手册](../docs/使用手册.md)中的生产入口。
 
 需要 PyArrow 的脚本使用 Clara Python。输入清单核对路径、行数、Schema、大小和修改时间，
 不声称进行全文件内容哈希核验。成功明细省略时，报告相等不等于逐帧成功候选元数据相等；

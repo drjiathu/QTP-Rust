@@ -20,7 +20,7 @@ target/release/qtp-replay validate \
 ```
 
 默认数据根目录为 `/hdd/data/stock/raw_level2_parquet`；输入布局和全市场／ETF 参数见
-[使用手册](docs/Guidance.md)。生产截面严格包含 `quote_time < T` 的成功事件，
+[使用手册](docs/使用手册.md)。生产截面严格包含 `quote_time < T` 的成功事件，
 验证候选窗口不改变它；参考源是 raw snapshot，不是 canonical snapshot。
 
 ## 验证基线与边界
@@ -31,7 +31,7 @@ target/release/qtp-replay validate \
 深市 CLI 默认 RestAtLastTradePrice：市价单先隐藏，按自身实际成交价更新隐藏余量，
 不再穿越时入簿，入簿后不重定价。限价单直接入簿，本方最优一次定价。
 快照匹配不证明市价单每个中间态或严格待决路径精确；
-Rust 枚举默认 RequireEvidence，与 CLI 默认不同，见[实现说明](docs/order-book-implementation.md)。
+Rust 枚举默认 RequireEvidence，与 CLI 默认不同，见[实现说明](docs/订单簿恢复实现说明.md)。
 
 ## 价格单位
 
@@ -48,10 +48,10 @@ Rust 枚举默认 RequireEvidence，与 CLI 默认不同，见[实现说明](doc
 
 ## 文档与开发
 
-[文档索引](docs/README.md)分为四份正文：使用手册、实现说明、验收规范、验证基线。
-[验收规范](docs/snapshot-validation-rules.md)是匹配规则的唯一来源，PDF 与历史归档仅作参考。
+[文档索引](docs/文档索引.md)分为四份正文：使用手册、实现说明、验收规范、验证基线。
+[验收规范](docs/截面数据验证匹配规则.md)是匹配规则的唯一来源，PDF 与历史资料仅作参考。
 
-模块职责见[实现说明](docs/order-book-implementation.md)，分析工具见 [analysis/](analysis/README.md)。
+模块职责见[实现说明](docs/订单簿恢复实现说明.md)，分析工具见 [analysis/](analysis/README.md)。
 详细报告 `reports/` 和分析 notebook 仅本地保存，不随 Git 克隆提供。
 
 开发检查和贡献流程见 [CONTRIBUTING](CONTRIBUTING.md)，变化记录见 [CHANGELOG](CHANGELOG.md)，
