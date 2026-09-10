@@ -43,7 +43,8 @@ ruff format --check analysis
 ```
 
 详细报告、收据、输入清单与源码快照均保存在本地 `reports/`，由 Git 忽略。
-当前验收范围与计时结果见[验证基线](../docs/real-data-validation.md)。
+当前验收范围与计时结果仅在本地 `reports/real-data-validation.md` 留存，不随仓库提供。
+通用测量方法见[使用手册](../docs/使用手册.md#profiling)。
 
 ## 已结束的工具与恢复
 

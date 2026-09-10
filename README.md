@@ -23,10 +23,10 @@ target/release/qtp-replay validate \
 [使用手册](docs/使用手册.md)。生产截面严格包含 `quote_time < T` 的成功事件，
 验证候选窗口不改变它；参考源是 raw snapshot，不是 canonical snapshot。
 
-## 验证基线与边界
+## 验证与适用边界
 
-已完成历史十五日验证及接口退役后的 20260828 回归，可比股票／ETF snapshot 均匹配，
-停牌排除单列。不同版本的指纹、覆盖范围和耗时统一维护在[验证基线](docs/real-data-validation.md)。
+验收规则见[验收规范](docs/截面数据验证匹配规则.md)。具体版本的数据覆盖、结果及性能记录
+仅在本地 `reports/` 留存，不随 Git 分发；耗时依赖硬件、输入及运行负载，不作为通用性能承诺。
 
 深市 CLI 默认 RestAtLastTradePrice：市价单先隐藏，按自身实际成交价更新隐藏余量，
 不再穿越时入簿，入簿后不重定价。限价单直接入簿，本方最优一次定价。
@@ -48,7 +48,7 @@ Rust 枚举默认 RequireEvidence，与 CLI 默认不同，见[实现说明](doc
 
 ## 文档与开发
 
-[文档索引](docs/文档索引.md)分为四份正文：使用手册、实现说明、验收规范、验证基线。
+[文档索引](docs/文档索引.md)分为三份正文：使用手册、实现说明、验收规范。
 [验收规范](docs/截面数据验证匹配规则.md)是匹配规则的唯一来源，PDF 与历史资料仅作参考。
 
 模块职责见[实现说明](docs/订单簿恢复实现说明.md)，分析工具见 [analysis/](analysis/README.md)。

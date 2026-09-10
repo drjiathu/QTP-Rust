@@ -1,0 +1,7 @@
+# Use Cargo's official manifest schema for editor validation.
+[[rule]]
+include = ["Cargo.toml"]
+
+[rule.schema]
+path = "https://raw.githubusercontent.com/rust-lang/cargo/refs/heads/master/crates/cargo-util-schemas/manifest.schema.json"
+enabled = true
