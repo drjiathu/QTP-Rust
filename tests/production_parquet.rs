@@ -133,7 +133,11 @@ fn write_batch_with_metadata(
     let metadata = [
         (
             "clara.raw.market",
-            if feed == "MarketData" { "SH" } else { "SZ" },
+            if matches!(feed, "MarketData" | "mdl_4_24_0") {
+                "SH"
+            } else {
+                "SZ"
+            },
         ),
         ("clara.raw.feed", feed),
         ("clara.raw.document_version", "4.1"),
@@ -323,6 +327,316 @@ fn streams_sse_parquet_and_keeps_equal_time_event_out_of_snapshot() {
         boundaries.value(4),
         parse_market_timestamp(day(), "15:00:01.000").expect("market close checkpoint")
     );
+}
+
+// S is published first, but the following auction order carries an earlier
+// business timestamp. The second order is exactly on the scheduled boundary.
+fn write_sse_status_clock_fixture(root: &TempDir, status_time: &str, order_time: &str) {
+    write_sse_fixture(root, vec![Some("15:00:10.000"); 6]);
+    let phase = if status_time.starts_with("09:") {
+        "TRADE"
+    } else {
+        "CCALL"
+    };
+    let path = root
+        .path()
+        .join("raw/date=20260828/mdl_4_24_0/part-0.parquet");
+    let batch = ParquetRecordBatchReaderBuilder::try_new(File::open(&path).expect("fixture"))
+        .expect("reader")
+        .build()
+        .expect("batches")
+        .next()
+        .expect("batch")
+        .expect("valid batch");
+    let mut columns = batch.columns().to_vec();
+    let replacements: Vec<(&str, ArrayRef)> = vec![
+        (
+            "SecurityID",
+            Arc::new(LargeStringArray::from_iter_values(["600000"; 6])),
+        ),
+        (
+            "TickTime",
+            Arc::new(LargeStringArray::from_iter_values([
+                status_time,
+                order_time,
+                status_time,
+                "15:00:00.000",
+                "15:00:01.000",
+                "15:00:02.000",
+            ])),
+        ),
+        (
+            "Type",
+            Arc::new(LargeStringArray::from_iter_values([
+                "S", "A", "A", "T", "S", "S",
+            ])),
+        ),
+        (
+            "TickBSFlag",
+            Arc::new(LargeStringArray::from_iter_values([
+                phase, "B", "S", "N", "CLOSE", "CLOSE",
+            ])),
+        ),
+        (
+            "BuyOrderNO",
+            Arc::new(UInt64Array::from_iter_values([0, 2, 0, 2, 0, 0])),
+        ),
+        (
+            "SellOrderNO",
+            Arc::new(UInt64Array::from_iter_values([0, 0, 3, 3, 0, 0])),
+        ),
+        (
+            "Price",
+            Arc::new(
+                Decimal128Array::from_iter_values([0, 10_000, 11_000, 10_500, 0, 0])
+                    .with_precision_and_scale(38, 3)
+                    .expect("decimal"),
+            ),
+        ),
+        (
+            "Qty",
+            Arc::new(Int64Array::from_iter_values([0, 100, 200, 40, 0, 0])),
+        ),
+    ];
+    for (name, column) in replacements {
+        columns[batch.schema().index_of(name).expect("field")] = column;
+    }
+    write_batch_with_metadata(&path, batch.schema(), columns, "mdl_4_24_0");
+}
+
+fn write_sse_status_clock_reference(root: &TempDir, reference_time: &str) {
+    let mut fields = Vec::new();
+    let mut columns: Vec<ArrayRef> = Vec::new();
+    for (name, values) in [
+        ("SecurityID", ["600000"; 4]),
+        (
+            "UpdateTime",
+            [
+                "09:24:59.000",
+                reference_time,
+                "14:57:01.000",
+                "15:00:01.000",
+            ],
+        ),
+        ("InstruStatus", ["OCALL", "TRADE", "CCALL", "CLOSE"]),
+    ] {
+        fields.push(Field::new(name, DataType::LargeUtf8, false));
+        columns.push(Arc::new(LargeStringArray::from_iter_values(values)));
+    }
+    fields.push(Field::new("source_row_no", DataType::UInt64, false));
+    columns.push(Arc::new(UInt64Array::from_iter_values([1, 2, 3, 4])));
+    fields.push(Field::new("TradNumber", DataType::UInt32, false));
+    columns.push(Arc::new(UInt32Array::from_iter_values([0, 0, 0, 1])));
+    let mut decimals = vec![
+        ("LastPrice".to_owned(), 0, 10_500, 3),
+        ("HighPrice".to_owned(), 0, 10_500, 3),
+        ("LowPrice".to_owned(), 0, 10_500, 3),
+        ("Turnover".to_owned(), 0, 42_000_000, 5),
+        ("TradVolume".to_owned(), 0, 40_000, 3),
+        ("TotalBidVol".to_owned(), 100_000, 60_000, 3),
+        ("TotalAskVol".to_owned(), 0, 160_000, 3),
+        ("WAvgBidPri".to_owned(), 10_000, 10_000, 3),
+        ("WAvgAskPri".to_owned(), 0, 11_000, 3),
+    ];
+    for side in ["Ask", "Bid"] {
+        for level in 1..=10 {
+            let first_bid = side == "Bid" && level == 1;
+            let price = if level != 1 {
+                0
+            } else if side == "Bid" {
+                10_000
+            } else {
+                11_000
+            };
+            let quantity = if level != 1 {
+                0
+            } else if side == "Bid" {
+                60_000
+            } else {
+                160_000
+            };
+            decimals.push((
+                format!("{side}Price{level}"),
+                if first_bid { 10_000 } else { 0 },
+                price,
+                3,
+            ));
+            decimals.push((
+                format!("{side}Volume{level}"),
+                if first_bid { 100_000 } else { 0 },
+                quantity,
+                3,
+            ));
+            fields.push(Field::new(
+                format!("NumOrders{}{level}", if side == "Bid" { "B" } else { "S" }),
+                DataType::UInt32,
+                false,
+            ));
+            columns.push(Arc::new(UInt32Array::from_iter_values([
+                0,
+                u32::from(first_bid),
+                0,
+                u32::from(level == 1),
+            ])));
+        }
+    }
+    for (name, candidate, close, scale) in decimals {
+        fields.push(Field::new(name, DataType::Decimal128(38, scale), false));
+        columns.push(Arc::new(
+            Decimal128Array::from_iter_values([0, candidate, 0, close])
+                .with_precision_and_scale(38, scale)
+                .expect("decimal"),
+        ));
+    }
+    write_batch_with_metadata(
+        &root
+            .path()
+            .join("raw/date=20260828/MarketData/part-0.parquet"),
+        Arc::new(Schema::new(fields)),
+        columns,
+        "MarketData",
+    );
+}
+
+#[test]
+fn shanghai_status_does_not_expire_preopen_or_continuous_candidates() {
+    for (status, order, reference, anchor) in [
+        (
+            "14:57:01.000",
+            "14:57:00.990",
+            "14:57:00.000",
+            ValidationAnchor::ContinuousTrading,
+        ),
+        (
+            "09:25:01.000",
+            "09:25:00.990",
+            "09:25:00.000",
+            ValidationAnchor::PreOpen,
+        ),
+    ] {
+        let root = TempDir::new().expect("temporary directory");
+        write_sse_status_clock_fixture(&root, status, order);
+        write_sse_status_clock_reference(&root, reference);
+        let config = ValidationConfig {
+            request: request(&root, None),
+            continuous_lookback: None,
+            continuous_lookahead: None,
+            retain_matched_records: true,
+            max_detail_records: None,
+        };
+        let report = validate_market_day(&config).expect("status/business time separation");
+        let candidate = report
+            .records
+            .iter()
+            .find(|r| r.anchor == anchor)
+            .expect("candidate");
+        assert_eq!(candidate.outcome, ValidationOutcome::Matched);
+        assert_eq!(candidate.matched_candidate_raw_sequence, Some(2));
+        let close = report
+            .records
+            .iter()
+            .find(|r| r.anchor == ValidationAnchor::MarketClose)
+            .expect("close");
+        assert_eq!(close.outcome, ValidationOutcome::Matched);
+        assert_eq!(close.matched_candidate_raw_sequence, Some(4));
+        assert_eq!(report.replay.status_events, 3);
+        assert_eq!(report.replay.applied_events, 3);
+        assert_eq!(report.replay.market_close_snapshots, 1);
+        assert_eq!(report.replay.same_second_quote_time_regressions, 0);
+        if anchor == ValidationAnchor::PreOpen {
+            let preopen = validate_pre_open_market_day(&config).expect("cutoff replay");
+            let candidate = preopen
+                .records
+                .iter()
+                .find(|r| r.anchor == anchor)
+                .expect("preopen");
+            assert_eq!(candidate.outcome, ValidationOutcome::Matched);
+            assert_eq!(candidate.matched_candidate_raw_sequence, Some(2));
+        }
+    }
+}
+
+#[test]
+fn shanghai_status_does_not_advance_scheduled_snapshots() {
+    for (interval, status, order) in [
+        (Duration::from_millis(100), "14:57:01.000", "14:57:00.990"),
+        (Duration::from_secs(30), "14:57:30.000", "14:57:29.990"),
+    ] {
+        let root = TempDir::new().expect("temporary directory");
+        write_sse_status_clock_fixture(&root, status, order);
+        let schedule = SnapshotSchedule::new(interval, 1).expect("schedule");
+        let report = replay_market_day(&request(&root, Some(schedule))).expect("scheduled replay");
+        assert_eq!(report.market_close_snapshots, 1);
+        let output = root
+            .path()
+            .join("output/date=20260828/market=SH/channel=1/part-0.parquet");
+        let reader = ParquetRecordBatchReaderBuilder::try_new(File::open(output).expect("output"))
+            .expect("reader")
+            .build()
+            .expect("batches");
+        let boundary = parse_market_timestamp(day(), status).expect("boundary");
+        let mut found = false;
+        let mut kinds_seen = Vec::new();
+        for batch in reader {
+            let batch = batch.expect("batch");
+            let times = batch
+                .column_by_name("boundary_time")
+                .expect("time")
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("timestamps");
+            let kinds = batch
+                .column_by_name("snapshot_kind")
+                .expect("kind")
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("strings");
+            let bids = batch
+                .column_by_name("bid_quantity_1")
+                .expect("bid")
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("quantities");
+            let asks = batch
+                .column_by_name("ask_quantity_1")
+                .expect("ask")
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .expect("quantities");
+            let last_quote = batch
+                .column_by_name("last_quote_time")
+                .expect("last quote")
+                .as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .expect("timestamps");
+            for row in 0..batch.num_rows() {
+                if times.value(row) == boundary && kinds.value(row) == "scheduled" {
+                    assert_eq!(bids.value(row), 100);
+                    assert!(asks.is_null(row), "order exactly at T is excluded");
+                    assert_eq!(
+                        last_quote.value(row),
+                        parse_market_timestamp(day(), order).expect("time")
+                    );
+                    found = true;
+                }
+                if times.value(row) >= parse_market_timestamp(day(), "15:00:00.000").expect("close")
+                {
+                    kinds_seen.push(kinds.value(row).to_owned());
+                    if kinds.value(row) == "scheduled" {
+                        assert_eq!(bids.value(row), 100, "15:00 trade excluded from left limit");
+                    } else {
+                        assert_eq!(bids.value(row), 60, "closing trade included");
+                        assert_eq!(
+                            last_quote.value(row),
+                            parse_market_timestamp(day(), "15:00:00.000").expect("time")
+                        );
+                    }
+                }
+            }
+        }
+        assert!(found);
+        assert_eq!(kinds_seen, ["scheduled", "market_close"]);
+    }
 }
 
 #[test]
