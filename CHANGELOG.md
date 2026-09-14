@@ -1,10 +1,53 @@
 # Changelog
 
+<!-- markdownlint-configure-file {"MD024": {"siblings_only": true}} -->
+
 All notable changes to this project will be documented in this file. The format
 is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this
 project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+## [0.2.0] - 2026-09-14
+
+### Added
+
+- Independent reference-selection audits, coverage summaries, original source
+  row identities, and explicit no-eligible-reference run outcomes.
+- A reusable full-market validation controller with frozen inputs and binaries,
+  resource-gated concurrency, resume checks, and optional stop-on-failure behavior.
+- Regression tests for phase selection, interrupted trading, precision
+  compatibility, report accounting, and controller cancellation boundaries.
+
+### Changed
+
+- Breaking report/API change: validation reports now use schema version 2 and
+  represent only selected, real reference frames. Outcomes are `Matched`,
+  `Mismatched`, `DataError`, and `MissingSource`; virtual anchors and status-based
+  exclusions are removed. Rust rejects unsupported report versions; the analysis
+  controller reads v1/v2 separately without mixing their denominators.
+- Missing phase predecessors and inapplicable reference frames now enter bounded
+  selection audits instead of manufacturing comparison failures. Later valid
+  transitions remain eligible, and invalid selected fields still fail.
+- CLI summaries display coverage and `N/A` for zero comparisons. Validation
+  documentation now describes the v2 migration and audit fields.
+
+### Fixed
+
+- Shanghai phase transitions follow native sequence and market-status boundaries
+  independently of business-event quote timestamps, including the closing call
+  auction boundary.
+- References missing both `SeqNo` and `LocalTime` can match the known 12-significant-
+  digit turnover rounding pattern. The known Shenzhen upper-limit sentinel variant
+  is normalized only when its own source row meets the same missingness gate.
+  Other differences still fail; compatibility is audited and never changes replay
+  state, original turnover values, or cached candidates.
+
+### Removed
+
+- Superseded fixed-campaign optimization scripts and their old regression-driver
+  chain from `analysis/`. The full-date controller, its tests, and the mismatched
+  symbol extraction utility remain. Historical evidence stays local in `reports/`.
 
 ## [0.1.0] - 2026-09-10
 

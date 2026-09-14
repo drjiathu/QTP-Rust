@@ -182,15 +182,19 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 std::fs::write(path, json.as_bytes())?;
                 println!(
-                    "report={} matched={} mismatched={} excluded_by_status={} data_errors={} missing_source={} standard_acceptance={} match_rate={:.2}% match_tags={:?}",
+                    "report={} matched={} mismatched={} result={:?} data_errors={} missing_source={} standard_acceptance={} match_rate={} coverage={}/{} symbols match_tags={:?}",
                     path.display(),
                     validation.matched,
                     validation.mismatched,
-                    validation.excluded_by_status,
+                    validation.run_outcome,
                     validation.data_errors,
                     validation.missing_source,
                     validation.is_standard_acceptance(),
-                    validation.match_rate.unwrap_or(0.0) * 100.0,
+                    validation
+                        .match_rate
+                        .map_or_else(|| "N/A".to_owned(), |rate| format!("{:.2}%", rate * 100.0)),
+                    validation.coverage.symbols_with_selected_references,
+                    validation.coverage.symbols,
                     validation.match_tags,
                 );
             } else {

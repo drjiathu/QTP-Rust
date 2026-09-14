@@ -23,9 +23,10 @@ pub use types::{
     is_supported_symbol,
 };
 pub use validation::{
-    ClosePriceBandAudit, FieldDifference, PhaseAudit, PhaseIssue, ValidationCounts,
-    ValidationOutcome, ValidationRecord, ValidationReport, validate_market_day,
-    validate_pre_open_market_day,
+    ClosePriceBandAudit, CoverageCounts, CoverageSummary, FieldDifference, ReferenceCoverage,
+    RunOutcome, SelectionAudit, SelectionSample, SkipReason, TurnoverPrecisionAudit,
+    UpperLimitNormalizationAudit, ValidationCounts, ValidationOutcome, ValidationRecord,
+    ValidationReport, validate_market_day, validate_pre_open_market_day,
 };
 
 #[cfg(feature = "profiling")]

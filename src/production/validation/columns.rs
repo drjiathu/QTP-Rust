@@ -131,6 +131,8 @@ struct LevelColumns<'a> {
     count: &'a UInt32Array,
 }
 pub(super) struct RawSnapshotColumns<'a> {
+    local_time: &'a LargeStringArray,
+    seq_no: &'a Int64Array,
     asks: Vec<LevelColumns<'a>>,
     bids: Vec<LevelColumns<'a>>,
     total_bid: QuantityField<'a>,
@@ -200,6 +202,8 @@ impl<'a> RawSnapshotColumns<'a> {
             ),
         };
         Ok(Self {
+            local_time: large_string(path, batch, "LocalTime")?,
+            seq_no: int64(path, batch, "SeqNo")?,
             asks: levels("Ask")?,
             bids: levels("Bid")?,
             total_bid: QuantityField::bind(path, batch, bid, market, false)?,
@@ -220,6 +224,11 @@ impl<'a> RawSnapshotColumns<'a> {
                 .map_err(|e| e.to_string()),
         })
     }
+    pub fn missing_reception(&self, row: usize) -> bool {
+        self.seq_no.is_null(row)
+            && (self.local_time.is_null(row) || self.local_time.value(row).trim().is_empty())
+    }
+
     pub fn pre_close(&self, row: usize) -> Result<Option<i64>, ProductionError> {
         self.pre_close
             .as_ref()
@@ -309,6 +318,8 @@ pub(super) fn projection(
         "LowPrice",
         "Turnover",
         "source_row_no",
+        "LocalTime",
+        "SeqNo",
     ]
     .into_iter()
     .map(str::to_owned)

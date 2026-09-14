@@ -237,8 +237,11 @@ struct BookRuntime {
     book: OrderBook,
     references: HashMap<(Side, u64), OrderKey>,
     cursor: Option<SnapshotCursor>,
-    last_quote_time_ns: Option<i64>,
+    // Product-status timestamps do not establish a business-event watermark.
+    last_business_quote_time_ns: Option<i64>,
     market_close_emitted: bool,
+    // Capture SH close at its native position, write after EOF drains Scheduled.
+    pending_close_snapshot: Option<Box<BookSnapshot>>,
 }
 
 impl BookRuntime {
@@ -266,17 +269,18 @@ impl BookRuntime {
             cursor: schedule
                 .map(|schedule| SnapshotCursor::new(request.trading_day, schedule))
                 .transpose()?,
-            last_quote_time_ns: None,
+            last_business_quote_time_ns: None,
             market_close_emitted: false,
+            pending_close_snapshot: None,
         })
     }
 
-    fn check_quote_time(
+    fn check_business_quote_time(
         &mut self,
         symbol: &str,
         quote_time_ns: i64,
     ) -> Result<bool, ProductionError> {
-        if let Some(previous) = self.last_quote_time_ns {
+        if let Some(previous) = self.last_business_quote_time_ns {
             if quote_time_ns < previous {
                 if !same_second_regression_is_allowed(
                     previous,
@@ -292,7 +296,7 @@ impl BookRuntime {
                 return Ok(true);
             }
         }
-        self.last_quote_time_ns = Some(quote_time_ns);
+        self.last_business_quote_time_ns = Some(quote_time_ns);
         Ok(false)
     }
 
@@ -328,25 +332,12 @@ fn process_sse_channel(
     let mut writer = snapshot_writer(request, channel)?;
     while let Some(row) = reader.next_row()? {
         let runtime = runtime(request, &mut runtimes, &row.symbol)?;
-        before_row(
-            request,
-            channel,
-            &row.symbol,
-            row.quote_time_ns,
-            runtime,
-            writer.as_mut(),
-            observer,
-            report,
-        )?;
         match row.kind {
             SseKind::Status => {
+                // Auction orders can be published after CCALL with an earlier
+                // TickTime. Keep native BizIndex order, but never let S advance
+                // scheduled snapshots or expire ordinary validation windows.
                 report.status_events += 1;
-                observer.observe(
-                    channel,
-                    &row.symbol,
-                    &runtime.book,
-                    ObservationPoint::AfterEvent(row.quote_time_ns),
-                )?;
                 if row.status == 2 && !runtime.market_close_emitted {
                     emit_market_close(
                         request,
@@ -361,6 +352,23 @@ fn process_sse_channel(
                 }
             }
             SseKind::Add | SseKind::Delete | SseKind::Trade => {
+                if runtime.market_close_emitted {
+                    return Err(normalize_error(
+                        &row.symbol,
+                        row.sequence,
+                        "business event after Shanghai CLOSE checkpoint",
+                    ));
+                }
+                before_business_event(
+                    request,
+                    channel,
+                    &row.symbol,
+                    row.quote_time_ns,
+                    runtime,
+                    writer.as_mut(),
+                    observer,
+                    report,
+                )?;
                 apply_sse_row(runtime, request, &row)?;
                 report.applied_events += 1;
                 observer.observe(
@@ -490,7 +498,7 @@ fn process_sz_channel(
                 let disposition = pending.finish(request.sz_market_order_policy, next_sequence)?;
                 // Classification happens before any book mutation. All responses
                 // have the order's quote time; do not expose speculative states.
-                before_row(
+                before_business_event(
                     request,
                     channel,
                     &row.symbol,
@@ -632,7 +640,7 @@ fn process_sz_order(
     report: &mut ReplayReport,
 ) -> Result<(), ProductionError> {
     let runtime = runtime(request, runtimes, &row.symbol)?;
-    before_row(
+    before_business_event(
         request,
         channel,
         &row.symbol,
@@ -707,7 +715,7 @@ fn process_sz_execution(
     report: &mut ReplayReport,
 ) -> Result<(), ProductionError> {
     let runtime = runtime(request, runtimes, &row.symbol)?;
-    before_row(
+    before_business_event(
         request,
         channel,
         &row.symbol,
@@ -792,7 +800,7 @@ fn process_sz_execution(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn before_row(
+fn before_business_event(
     request: &MarketDayRequest,
     channel: u32,
     symbol: &str,
@@ -802,7 +810,7 @@ fn before_row(
     observer: &mut dyn StateObserver,
     report: &mut ReplayReport,
 ) -> Result<(), ProductionError> {
-    if runtime.check_quote_time(symbol, quote_time_ns)? {
+    if runtime.check_business_quote_time(symbol, quote_time_ns)? {
         report.same_second_quote_time_regressions = report
             .same_second_quote_time_regressions
             .checked_add(1)
@@ -870,7 +878,7 @@ fn finish_channel(
             // E0 is on a separate feed, so only exhausting both native-sequence
             // streams completes this offline replay. Never finalize before a
             // later event. A post-15:00 final state requires phase review.
-            let boundary = close.max(runtime.last_quote_time_ns.unwrap_or(close));
+            let boundary = close.max(runtime.last_business_quote_time_ns.unwrap_or(close));
             emit_market_close(
                 request,
                 channel,
@@ -881,6 +889,11 @@ fn finish_channel(
                 observer,
                 report,
             )?;
+        }
+        if let (Some(snapshot), Some(output)) =
+            (runtime.pending_close_snapshot.take(), writer.as_deref_mut())
+        {
+            output.push(*snapshot)?;
         }
         observer.observe(
             channel,
@@ -911,13 +924,18 @@ fn emit_market_close(
             .snapshots
             .as_ref()
             .map_or(10, |schedule| schedule.depth);
-        output.push(BookSnapshot::capture(
+        let snapshot = BookSnapshot::capture(
             &runtime.book,
             channel,
             SnapshotKind::MarketClose,
             boundary_time_ns,
             depth,
-        )?)?;
+        )?;
+        if request.market == Market::Sse {
+            runtime.pending_close_snapshot = Some(Box::new(snapshot));
+        } else {
+            output.push(snapshot)?;
+        }
     }
     observer.observe(
         channel,
@@ -1242,14 +1260,14 @@ mod tests {
         let request = runtime_request();
         let mut runtimes = SymbolMap::default();
         let first = runtime(&request, &mut runtimes, "000001").expect("create runtime");
-        first.last_quote_time_ns = Some(123);
+        first.last_business_quote_time_ns = Some(123);
         first.market_close_emitted = true;
 
         let existing = runtime(&request, &mut runtimes, "000001").expect("reuse runtime");
-        assert_eq!(existing.last_quote_time_ns, Some(123));
+        assert_eq!(existing.last_business_quote_time_ns, Some(123));
         assert!(existing.market_close_emitted);
         let second = runtime(&request, &mut runtimes, "000002").expect("independent runtime");
-        assert_eq!(second.last_quote_time_ns, None);
+        assert_eq!(second.last_business_quote_time_ns, None);
         assert!(!second.market_close_emitted);
         assert_eq!(runtimes.len(), 2);
     }
@@ -1260,7 +1278,7 @@ mod tests {
         let mut runtimes = SymbolMap::default();
         runtime(&request, &mut runtimes, "000001")
             .expect("create runtime")
-            .last_quote_time_ns = Some(123);
+            .last_business_quote_time_ns = Some(123);
         // Public fields allow this invalid schedule; cursor creation must fail.
         request.snapshots = Some(SnapshotSchedule {
             interval: Duration::from_secs(u64::MAX),
@@ -1273,7 +1291,7 @@ mod tests {
         assert_eq!(runtimes.len(), 1);
         assert!(!runtimes.contains_key("000002"));
         let existing = runtime(&request, &mut runtimes, "000001").expect("reuse runtime");
-        assert_eq!(existing.last_quote_time_ns, Some(123));
+        assert_eq!(existing.last_business_quote_time_ns, Some(123));
         assert!(existing.cursor.is_none());
 
         request.snapshots =
@@ -1308,5 +1326,135 @@ mod tests {
             13 * 3_600_000_000_000 - 1_000_000,
             false,
         ));
+    }
+
+    #[derive(Default)]
+    struct RecordingObserver(Vec<(super::ObservationPoint, crate::BookSnapshot)>);
+
+    impl super::StateObserver for RecordingObserver {
+        fn observe(
+            &mut self,
+            channel: u32,
+            _symbol: &str,
+            book: &crate::OrderBook,
+            point: super::ObservationPoint,
+        ) -> Result<(), ProductionError> {
+            self.0.push((
+                point,
+                crate::BookSnapshot::capture(book, channel, crate::SnapshotKind::Scheduled, 0, 10)?,
+            ));
+            Ok(())
+        }
+    }
+
+    fn replay_sse_rows(
+        rows: &[(super::SseKind, &str, u8)],
+    ) -> (
+        Result<(), ProductionError>,
+        super::ReplayReport,
+        RecordingObserver,
+    ) {
+        let root = tempfile::TempDir::new().expect("temporary directory");
+        let mut request = runtime_request();
+        request.market = Market::Sse;
+        request.temp_root = root.path().to_path_buf();
+        let mut spool =
+            crate::production::spool::SpoolSet::create(root.path(), "status-test").expect("spool");
+        for (index, &(kind, time, status)) in rows.iter().enumerate() {
+            let sequence = index as u64 + 1;
+            let time = super::parse_market_timestamp(request.trading_day, time).expect("time");
+            spool
+                .write_sse(&super::SseRow {
+                    source_row: sequence,
+                    sequence,
+                    channel: 1,
+                    symbol: "600000".try_into().expect("symbol"),
+                    quote_time_ns: time,
+                    local_time_ns: time + 123,
+                    kind,
+                    buy_order_no: sequence,
+                    sell_order_no: 0,
+                    price_units: 100_000,
+                    quantity: 10,
+                    flag: super::Aggressor::Buy,
+                    status,
+                })
+                .expect("row");
+        }
+        let spool = spool.finish().expect("finished spool");
+        let mut report = super::ReplayReport::default();
+        let mut observer = RecordingObserver::default();
+        let result = super::process_sse_channel(&request, &spool, 1, &mut observer, &mut report);
+        (result, report, observer)
+    }
+
+    #[test]
+    fn sse_status_only_and_repeated_close_do_not_emit_business_observations() {
+        use super::{ObservationPoint, SseKind::Status};
+        let (result, report, observer) = replay_sse_rows(&[
+            (Status, "14:57:01.000", 1),
+            (Status, "15:00:01.000", 2),
+            (Status, "15:00:02.000", 2),
+        ]);
+        result.expect("status-only stream");
+        assert_eq!(report.status_events, 3);
+        assert_eq!(report.applied_events, 0);
+        assert_eq!(report.market_close_snapshots, 1);
+        assert_eq!(observer.0.len(), 2);
+        assert!(matches!(observer.0[0].0, ObservationPoint::MarketClose(_)));
+        assert_eq!(observer.0[1].0, ObservationPoint::ChannelFinished);
+        for (_, snapshot) in observer.0 {
+            assert_eq!(snapshot.last_quote_time_ns, None);
+            assert_eq!(snapshot.last_local_time_ns, None);
+            assert!(snapshot.book.bids.is_empty());
+        }
+    }
+
+    #[test]
+    fn sse_business_after_close_is_rejected_before_observation_or_mutation() {
+        use super::{
+            ObservationPoint,
+            SseKind::{Add, Status},
+        };
+        let (result, report, observer) = replay_sse_rows(&[
+            (Add, "14:56:00.000", 0),
+            (Status, "15:00:01.000", 2),
+            (Add, "15:00:02.000", 0),
+        ]);
+        assert!(matches!(
+            result,
+            Err(ProductionError::Normalize { sequence: 3, .. })
+        ));
+        assert_eq!(report.applied_events, 1);
+        assert_eq!(observer.0.len(), 3);
+        let (point, snapshot) = observer.0.last().expect("close");
+        assert!(matches!(point, ObservationPoint::MarketClose(_)));
+        assert_eq!(snapshot.book.total_bid_quantity, 10);
+        let time = super::parse_market_timestamp(runtime_request().trading_day, "14:56:00.000")
+            .expect("time");
+        assert_eq!(snapshot.last_quote_time_ns, Some(time));
+        assert_eq!(snapshot.last_local_time_ns, Some(time + 123));
+    }
+
+    #[test]
+    fn sse_cross_second_business_regression_still_fails_without_mutation() {
+        use super::{
+            ObservationPoint,
+            SseKind::{Add, Status},
+        };
+        let (result, report, observer) = replay_sse_rows(&[
+            (Add, "14:57:01.000", 0),
+            (Status, "14:57:02.000", 1),
+            (Add, "14:57:00.990", 0),
+        ]);
+        assert!(matches!(
+            result,
+            Err(ProductionError::QuoteTimeRegression { .. })
+        ));
+        assert_eq!(report.applied_events, 1);
+        assert_eq!(observer.0.len(), 2);
+        let (point, snapshot) = observer.0.last().expect("last successful event");
+        assert!(matches!(point, ObservationPoint::AfterEvent(_)));
+        assert_eq!(snapshot.book.total_bid_quantity, 10);
     }
 }
