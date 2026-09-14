@@ -59,7 +59,8 @@ mod tests {
             time_ns: 10,
             view: Some(view.try_into().expect("compact")),
             load_error: None,
-            not_comparable_reason: None,
+            source_row_no: 1,
+            missing_reception: false,
             pre_close_price_units: None,
             state: AnchorState::default(),
         }
@@ -72,6 +73,86 @@ mod tests {
             book,
             limits: None,
             close_price: None,
+        }
+    }
+
+    #[test]
+    fn turnover_compatibility_is_per_reference_and_preserves_other_differences() {
+        for market in [Market::Sse, Market::Szse] {
+            let symbol = if market == Market::Sse {
+                "510300"
+            } else {
+                "159915"
+            };
+            let mut book = book(market, symbol);
+            book.apply(BookEvent::Trade(crate::Trade {
+                meta: EventMeta {
+                    book_key: book.config().book_key.clone(),
+                    raw_sequence: RawSequence::new(1).expect("seq"),
+                    apply_sequence: ApplySequence::new(1).expect("seq"),
+                    local_time: LocalTimestampNs::from_nanos(10),
+                    quote_time: QuoteTimestampNs::from_nanos(10),
+                },
+                bid_order: crate::OrderReference::Absent,
+                ask_order: crate::OrderReference::Absent,
+                price: Price::from_units(100_100).expect("price"),
+                quantity: Quantity::new(1_000_000_001).expect("quantity"),
+            }))
+            .expect("trade");
+            let original = SnapshotBookView::from_book(&book, 10).expect("view");
+            let mut cache = CandidateCache::default();
+            let mut counters = CandidateCounters::default();
+            for anchor in [
+                ValidationAnchor::PreOpen,
+                ValidationAnchor::ContinuousTrading,
+                ValidationAnchor::MarketClose,
+            ] {
+                for (missing, extra_difference) in [(true, false), (false, false), (true, true)] {
+                    let mut expected = original.clone();
+                    expected.turnover_units = 100_100_000_100_000;
+                    if extra_difference {
+                        expected.total_bid_quantity += 1;
+                    }
+                    let mut frame = reference(expected);
+                    frame.missing_reception = missing;
+                    compare_candidate(
+                        context(&book, symbol),
+                        &mut frame,
+                        &mut cache,
+                        &mut counters,
+                        anchor,
+                        Some(10),
+                    )
+                    .expect("compare");
+                    assert_eq!(frame.state.matched, missing && !extra_difference);
+                    if frame.state.matched {
+                        let audit = frame
+                            .state
+                            .diagnostics
+                            .as_ref()
+                            .expect("diagnostics")
+                            .turnover_precision
+                            .as_ref()
+                            .expect("precision audit");
+                        assert_eq!(audit.actual_units, original.turnover_units);
+                        assert_eq!(audit.quantum_units, 1000);
+                    } else {
+                        let differences = frame.state.best_differences().expect("differences");
+                        assert_eq!(
+                            differences.iter().any(|d| d.field == "turnover_units"),
+                            !missing
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                SnapshotBookView::from_book(&book, 10).expect("unchanged"),
+                original
+            );
+            assert_eq!(
+                cache.view.as_ref().expect("cache").turnover_units,
+                original.turnover_units
+            );
         }
     }
 
@@ -314,10 +395,7 @@ pub(super) fn compare_candidate(
     anchor: ValidationAnchor,
     candidate_time_ns: Option<i64>,
 ) -> Result<(), ProductionError> {
-    if reference.not_comparable_reason.is_some()
-        || reference.state.matched
-        || reference.state.finalized
-    {
+    if reference.state.matched || reference.state.finalized {
         return Ok(());
     }
     let Some(expected) = reference.view.as_ref() else {
@@ -368,6 +446,14 @@ pub(super) fn compare_candidate(
             .ok_or(ProductionError::Arithmetic("missing candidate cache"))?
     };
     let mut mask = compare_reference_scalars(ctx.market, ctx.symbol, expected, actual);
+    let turnover_precision = turnover_precision(
+        reference.missing_reception,
+        expected.turnover_units,
+        actual.turnover_units,
+    );
+    if turnover_precision.is_some() {
+        mask.0 &= !DIFF_TURNOVER;
+    }
     if !is_close
         && !mask.is_empty()
         && reference
@@ -408,6 +494,9 @@ pub(super) fn compare_candidate(
     };
     if match_tag.is_some() {
         mask = compare_reference_scalars(ctx.market, ctx.symbol, expected, actual);
+        if turnover_precision.is_some() {
+            mask.0 &= !DIFF_TURNOVER;
+        }
         mask.0 |= expected.depth_differences(actual).0;
     }
     let best = if !mask.is_empty()
@@ -416,12 +505,11 @@ pub(super) fn compare_candidate(
             .best_differences()
             .is_none_or(|best| mask.count() < best.len())
     {
-        Some(compare_views(
-            ctx.market,
-            ctx.symbol,
-            &expected.expand(),
-            actual,
-        ))
+        let mut differences = compare_views(ctx.market, ctx.symbol, &expected.expand(), actual);
+        if turnover_precision.is_some() {
+            differences.retain(|d| d.field != "turnover_units");
+        }
+        Some(differences)
     } else {
         None
     };
@@ -430,16 +518,19 @@ pub(super) fn compare_candidate(
         state.diagnostics_mut().close_price_band = close_price_band;
     }
     if mask.is_empty() {
+        if let Some(audit) = turnover_precision {
+            state.diagnostics_mut().turnover_precision = Some(audit);
+        }
         state.matched = true;
         state.finalized = true;
         if let Some(d) = state.diagnostics.as_mut() {
             d.best_differences = None;
         }
-        if state
-            .diagnostics
-            .as_ref()
-            .is_some_and(|d| d.close_price_band.is_none() && d.comparison_error.is_none())
-        {
+        if state.diagnostics.as_ref().is_some_and(|d| {
+            d.close_price_band.is_none()
+                && d.comparison_error.is_none()
+                && d.turnover_precision.is_none()
+        }) {
             state.diagnostics = None;
         }
         state.matched_candidate_time_ns = candidate_time_ns;

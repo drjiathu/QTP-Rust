@@ -1,9 +1,11 @@
 //! Validation-only E0 projection. Never changes an OrderBook or replay output.
+use super::UpperLimitNormalizationAudit;
 use super::{SnapshotBookView, SnapshotLevel, SnapshotLevels, round_weighted_to_quantum};
 use crate::{OrderBook, ProductionError, Side};
 use serde::{Deserialize, Serialize};
 
 pub(super) const NO_UPPER_LIMIT: i64 = 9_999_999_999_999;
+const ROUNDED_NO_UPPER_LIMIT: i64 = 10_000_000_000_000;
 const TICK: i64 = 100;
 
 #[derive(Clone, Debug, Default)]
@@ -11,6 +13,7 @@ pub(super) struct DayLimits {
     pub values: Option<(i64, i64)>,
     pub source: String,
     pub error: Option<String>,
+    pub upper_limit_normalization: Option<UpperLimitNormalizationAudit>,
 }
 
 #[cfg(test)]
@@ -49,6 +52,35 @@ mod tests {
             quantity: Quantity::new(quantity).expect("qty"),
         }))
         .expect("apply");
+    }
+
+    #[test]
+    fn rounded_sentinel_requires_both_missing_and_exact_known_pair() {
+        let mut limits = DayLimits::default();
+        for source in ["first", "second"] {
+            limits.observe_reference(Ok((ROUNDED_NO_UPPER_LIMIT, TICK)), true, || source.into());
+        }
+        limits.observe_reference(Ok((NO_UPPER_LIMIT, TICK)), false, || "normal".into());
+        assert_eq!(limits.unlimited(), Ok(true));
+        let audit = limits.upper_limit_normalization.as_ref().expect("audit");
+        assert_eq!(audit.records, 2);
+        assert_eq!(audit.first_source, "first");
+        for (missing, pair) in [
+            (false, (ROUNDED_NO_UPPER_LIMIT, TICK)),
+            (true, (ROUNDED_NO_UPPER_LIMIT + 1, TICK)),
+            (true, (ROUNDED_NO_UPPER_LIMIT, TICK + 1)),
+        ] {
+            let mut invalid = DayLimits::default();
+            invalid.observe_reference(Ok(pair), missing, || "bad".into());
+            assert!(invalid.unlimited().is_err());
+            invalid.observe_reference(Ok((ROUNDED_NO_UPPER_LIMIT, TICK)), true, || "later".into());
+            assert!(
+                invalid.unlimited().is_err(),
+                "compatibility must not clear earlier errors"
+            );
+        }
+        limits.observe_reference(Ok((120000, 80000)), true, || "conflict".into());
+        assert!(limits.unlimited().is_err());
     }
 
     #[test]
@@ -169,6 +201,34 @@ mod tests {
 }
 
 impl DayLimits {
+    pub fn observe_reference(
+        &mut self,
+        values: Result<(i64, i64), String>,
+        missing_reception: bool,
+        source: impl FnOnce() -> String,
+    ) {
+        if self.error.is_some() {
+            return;
+        }
+        if missing_reception && values == Ok((ROUNDED_NO_UPPER_LIMIT, TICK)) {
+            let source = source();
+            self.observe_lazy(Ok((NO_UPPER_LIMIT, TICK)), || source.clone());
+            if self.error.is_none() {
+                let audit =
+                    self.upper_limit_normalization
+                        .get_or_insert(UpperLimitNormalizationAudit {
+                            records: 0,
+                            first_source: source,
+                            raw_upper_units: ROUNDED_NO_UPPER_LIMIT,
+                            normalized_upper_units: NO_UPPER_LIMIT,
+                        });
+                audit.records += 1;
+            }
+        } else {
+            self.observe_lazy(values, source);
+        }
+    }
+
     #[cfg(test)]
     pub fn observe(&mut self, values: Result<(i64, i64), String>, source: String) {
         self.observe_lazy(values, || source);
@@ -244,6 +304,8 @@ pub(super) struct RangeBase {
 /// Rule context, present on successful and failed projected comparisons alike.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ClosePriceBandAudit {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upper_limit_normalization: Option<UpperLimitNormalizationAudit>,
     pub rule: String,
     pub base_price_units: i64,
     pub base_quote_time_ms: i64,
@@ -344,6 +406,7 @@ pub(super) fn project(
     Ok((
         actual,
         ClosePriceBandAudit {
+            upper_limit_normalization: metadata.upper_limit_normalization.clone(),
             rule: "SZ_UNLIMITED_STOCK_E0_PRICE_BAND".to_owned(),
             base_price_units: base.price,
             base_quote_time_ms: base.time_ms,

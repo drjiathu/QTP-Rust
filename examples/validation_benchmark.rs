@@ -27,7 +27,7 @@ struct Args {
     report: PathBuf,
     #[arg(long)]
     timings: PathBuf,
-    /// Maximum retained failure/exclusion records; zero retains all details.
+    /// Maximum retained failure records; zero retains all details.
     #[arg(long, default_value_t = 5000)]
     max_detail_records: usize,
 }
@@ -83,10 +83,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     std::fs::write(&args.timings, serde_json::to_vec_pretty(&measurements)?)?;
     println!(
-        "matched={} mismatched={} excluded={} data_errors={} missing_source={}",
+        "matched={} mismatched={} result={:?} data_errors={} missing_source={}",
         report.matched,
         report.mismatched,
-        report.excluded_by_status,
+        report.run_outcome,
         report.data_errors,
         report.missing_source
     );

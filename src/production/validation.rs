@@ -8,7 +8,6 @@ use arrow::array::{
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use serde::{Deserialize, Serialize};
 
 mod candidate;
 use candidate::{CandidateCache, CandidateContext, CandidateCounters, WindowConfig};
@@ -16,14 +15,22 @@ mod close_range;
 mod columns;
 use columns::RawSnapshotColumns;
 mod phases;
+mod precision;
 mod reference;
 pub use close_range::ClosePriceBandAudit;
 use close_range::{DayLimits, RangeBase};
+use precision::{TURNOVER_PRECISION_TAG, UPPER_LIMIT_PRECISION_TAG, turnover_precision};
+pub use precision::{TurnoverPrecisionAudit, UpperLimitNormalizationAudit};
 use reference::ReferenceBookView;
 #[cfg(feature = "profiling")]
 pub(crate) mod profiling;
 use phases::PhaseTracker;
-pub use phases::{PhaseAudit, PhaseIssue};
+pub use phases::{ReferenceCoverage, SelectionAudit, SelectionSample, SkipReason};
+mod report;
+pub use report::{
+    CoverageCounts, CoverageSummary, FieldDifference, RunOutcome, ValidationCounts,
+    ValidationOutcome, ValidationRecord, ValidationReport,
+};
 
 use crate::{Market, OrderBook, QuoteTimestampNs, Side};
 
@@ -36,182 +43,13 @@ use super::{
     ValidationAnchor, ValidationConfig,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct FieldDifference {
-    pub field: String,
-    pub expected: String,
-    pub actual: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ValidationOutcome {
-    Matched,
-    Mismatched,
-    ExcludedByStatus,
-    DataError,
-    MissingSource,
-    /// Kept for reading historical reports; new reports use explicit categories.
-    NotComparable,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ValidationRecord {
-    /// Validation-only projection context; not a waiver or a matching tag.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub close_price_band: Option<ClosePriceBandAudit>,
-    pub market: String,
-    pub symbol: String,
-    pub anchor: ValidationAnchor,
-    pub outcome: ValidationOutcome,
-    pub reference_time_ms: Option<i64>,
-    #[serde(default)]
-    pub matched_candidate_time_ms: Option<i64>,
-    #[serde(default)]
-    pub matched_candidate_raw_sequence: Option<u64>,
-    #[serde(default)]
-    pub matched_candidate_apply_sequence: Option<u64>,
-    #[serde(default)]
-    pub channel_id: Option<u32>,
-    #[serde(default)]
-    pub best_candidate_time_ms: Option<i64>,
-    #[serde(default)]
-    pub best_candidate_raw_sequence: Option<u64>,
-    /// Explains a rule-based semantic normalization used for a successful match.
-    #[serde(default)]
-    pub match_tag: Option<String>,
-    pub reason: Option<String>,
-    pub differences: Vec<FieldDifference>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ValidationReport {
-    pub replay: ReplayReport,
-    /// Milliseconds inspected before each continuous reference timestamp.
-    #[serde(default)]
-    pub continuous_lookback_ms: i64,
-    /// Base horizon in milliseconds; the effective per-symbol horizons are in
-    /// `continuous_lookahead_ms_by_symbol` (SZ ETFs and ChiNext differ by default).
-    #[serde(default = "default_continuous_lookahead_ms")]
-    pub continuous_lookahead_ms: i64,
-    /// Explicit window overrides are diagnostics, never standard-rule acceptance.
-    #[serde(default)]
-    pub diagnostic_window_override: bool,
-    #[serde(default)]
-    pub continuous_lookahead_ms_by_symbol: BTreeMap<String, i64>,
-    #[serde(default)]
-    pub phase_audit: Vec<PhaseAudit>,
-    pub total_anchors: u64,
-    pub comparable_anchors: u64,
-    pub matched: u64,
-    pub mismatched: u64,
-    pub not_comparable: u64,
-    #[serde(default)]
-    pub excluded_by_status: u64,
-    #[serde(default)]
-    pub data_errors: u64,
-    #[serde(default)]
-    pub missing_source: u64,
-    pub match_rate: Option<f64>,
-    pub not_comparable_rate: Option<f64>,
-    pub mismatch_fields: BTreeMap<String, u64>,
-    pub mismatch_reasons: BTreeMap<String, u64>,
-    pub not_comparable_reasons: BTreeMap<String, u64>,
-    /// Number of distinct symbols with at least one mismatched frame.
-    #[serde(default)]
-    pub mismatched_symbols: u64,
-    /// Distinct mismatched symbols grouped by their three-digit prefix.
-    #[serde(default)]
-    pub mismatch_symbol_prefixes: BTreeMap<String, u64>,
-    /// Counts successful rule-based semantic matches, keyed by a stable tag.
-    #[serde(default)]
-    pub match_tags: BTreeMap<String, u64>,
-    /// Counts for every evaluated frame, keyed by `<stock|etf>.<anchor>`.
-    #[serde(default)]
-    pub breakdown: BTreeMap<String, ValidationCounts>,
-    /// Successful records excluded from `records` in compact-report mode.
-    #[serde(default)]
-    pub omitted_matched_records: u64,
-    #[serde(default)]
-    pub omitted_mismatched_records: u64,
-    #[serde(default)]
-    pub omitted_not_comparable_records: u64,
-    pub records: Vec<ValidationRecord>,
-}
-
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
-pub struct ValidationCounts {
-    pub total: u64,
-    pub comparable: u64,
-    pub matched: u64,
-    pub mismatched: u64,
-    pub not_comparable: u64,
-    #[serde(default)]
-    pub excluded_by_status: u64,
-    #[serde(default)]
-    pub data_errors: u64,
-    #[serde(default)]
-    pub missing_source: u64,
-}
-
-impl ValidationCounts {
-    fn observe(&mut self, outcome: &ValidationOutcome) {
-        self.total += 1;
-        match outcome {
-            ValidationOutcome::Matched => {
-                self.comparable += 1;
-                self.matched += 1;
-            }
-            ValidationOutcome::Mismatched => {
-                self.comparable += 1;
-                self.mismatched += 1;
-            }
-            ValidationOutcome::NotComparable => self.not_comparable += 1,
-            ValidationOutcome::ExcludedByStatus => {
-                self.not_comparable += 1;
-                self.excluded_by_status += 1;
-            }
-            ValidationOutcome::DataError => {
-                self.not_comparable += 1;
-                self.data_errors += 1;
-            }
-            ValidationOutcome::MissingSource => {
-                self.not_comparable += 1;
-                self.missing_source += 1;
-            }
-        }
-    }
-}
-
-impl ValidationReport {
-    #[must_use]
-    pub const fn is_success(&self) -> bool {
-        self.mismatched == 0
-            && self.data_errors == 0
-            && self.missing_source == 0
-            && self.total_anchors > 0
-            && self.replay.sz_after_close_events == 0
-    }
-
-    /// A diagnostic override may have no mismatches but is not standard acceptance.
-    #[must_use]
-    pub const fn is_standard_acceptance(&self) -> bool {
-        self.is_success()
-            && self.replay.sz_pending_resolution_version == 1
-            && !self.diagnostic_window_override
-            && matches!(
-                self.replay.sz_market_order_policy,
-                super::SzMarketOrderPolicy::RequireEvidence
-            )
-    }
-}
-
 #[derive(Clone, Debug)]
 struct ReferenceSnapshot {
     time_ns: i64,
     view: Option<ReferenceBookView>,
     load_error: Option<String>,
-    not_comparable_reason: Option<String>,
+    source_row_no: u64,
+    missing_reception: bool,
     pre_close_price_units: Option<i64>,
     state: AnchorState,
 }
@@ -287,6 +125,7 @@ struct AnchorDiagnostics {
     comparison_error: Option<String>,
     close_price_band: Option<ClosePriceBandAudit>,
     best_differences: Option<Vec<FieldDifference>>,
+    turnover_precision: Option<TurnoverPrecisionAudit>,
 }
 
 impl AnchorState {
@@ -450,7 +289,7 @@ struct ValidationObserver {
     continuous_lookahead_ns: i64,
     lookahead_override: bool,
     diagnostic_window_override: bool,
-    phase_audit: BTreeMap<String, PhaseAudit>,
+    selection_audit: BTreeMap<String, SelectionAudit>,
     max_detail_records: Option<usize>,
 }
 
@@ -473,7 +312,7 @@ impl ValidationObserver {
             continuous_lookahead_ns: REFERENCE_SECOND_NS,
             lookahead_override: false,
             diagnostic_window_override: false,
-            phase_audit: BTreeMap::new(),
+            selection_audit: BTreeMap::new(),
             max_detail_records: None,
         }
     }
@@ -628,14 +467,14 @@ impl ValidationObserver {
         let mut records = Vec::new();
         let mut totals = ValidationCounts::default();
         let mut breakdown = BTreeMap::<String, ValidationCounts>::new();
+        let mut coverage = CoverageSummary::default();
         let mut mismatch_fields = BTreeMap::new();
         let mut mismatch_reasons = BTreeMap::new();
-        let mut not_comparable_reasons = BTreeMap::new();
+        let mut failure_reasons = BTreeMap::new();
         let mut mismatched_symbols = BTreeSet::new();
         let mut match_tags = BTreeMap::new();
         let mut omitted_matched_records = 0_u64;
-        let mut omitted_mismatched_records = 0_u64;
-        let mut omitted_not_comparable_records = 0_u64;
+        let mut omitted_failure_records = 0_u64;
         let continuous_lookahead_ms_by_symbol = symbols
             .iter()
             .map(|symbol| {
@@ -648,263 +487,207 @@ impl ValidationObserver {
         for symbol in symbols {
             let mut symbol_state = self.symbols.remove(&symbol).unwrap_or_default();
             let references = std::mem::take(&mut symbol_state.references);
+            let class = if is_etf_symbol(self.market, &symbol) {
+                "etf"
+            } else {
+                "stock"
+            };
+            let audit = self
+                .selection_audit
+                .entry(symbol.clone())
+                .or_insert_with(|| SelectionAudit::empty(symbol.clone()));
+            coverage.observe(&market, class, audit, self.pre_open_only);
             let mut cases = Vec::with_capacity(references.continuous_trading.len() + 2);
-            cases.push((ValidationAnchor::PreOpen, references.pre_open));
-            if !self.pre_open_only {
-                if references.continuous_trading.is_empty() {
-                    cases.push((ValidationAnchor::ContinuousTrading, None));
-                } else {
-                    cases.extend(
-                        references.continuous_trading.into_iter().map(|reference| {
-                            (ValidationAnchor::ContinuousTrading, Some(reference))
-                        }),
-                    );
-                }
-                cases.push((ValidationAnchor::MarketClose, references.market_close));
+            if let Some(reference) = references.pre_open {
+                cases.push((ValidationAnchor::PreOpen, reference));
             }
-
+            if !self.pre_open_only {
+                cases.extend(
+                    references
+                        .continuous_trading
+                        .into_iter()
+                        .map(|reference| (ValidationAnchor::ContinuousTrading, reference)),
+                );
+                if let Some(reference) = references.market_close {
+                    cases.push((ValidationAnchor::MarketClose, reference));
+                }
+            }
             for (anchor, mut reference) in cases {
-                let reference_time_ns = reference.as_ref().map(|reference| reference.time_ns);
-                let state = reference
+                let mut state = std::mem::take(&mut reference.state);
+                let mut diagnostics = state.diagnostics.take();
+                let close_price_band = diagnostics.as_mut().and_then(|d| d.close_price_band.take());
+                let turnover_precision = diagnostics
                     .as_mut()
-                    .map(|reference| std::mem::take(&mut reference.state));
-                let mut matched_candidate_time_ms = state
-                    .as_ref()
-                    .and_then(|state| state.matched_candidate_time_ns)
-                    .map(timestamp_ns_to_ms);
-                let mut matched_candidate_raw_sequence = state
-                    .as_ref()
-                    .and_then(|s| s.matched_candidate_raw_sequence);
-                let mut matched_candidate_apply_sequence = state
-                    .as_ref()
-                    .and_then(|s| s.matched_candidate_apply_sequence);
-                let best_candidate_time_ms = state
-                    .as_ref()
-                    .and_then(|s| s.best_candidate_time_ns)
-                    .map(timestamp_ns_to_ms);
-                let best_candidate_raw_sequence =
-                    state.as_ref().and_then(|s| s.best_candidate_raw_sequence);
-                let mut match_tag = state
-                    .as_ref()
-                    .and_then(|state| state.match_tag)
-                    .map(str::to_owned);
-                let close_price_band = state
-                    .as_ref()
-                    .and_then(|s| s.diagnostics.as_ref())
-                    .and_then(|d| d.close_price_band.clone());
-                let (outcome, reason, differences) = match (reference.as_ref(), state) {
-                    _ if self
-                        .phase_audit
-                        .get(&symbol)
-                        .and_then(|audit| audit.issue(anchor))
-                        .is_some() =>
-                    {
-                        let issue = &self.phase_audit[&symbol].issues[anchor_text(anchor)];
-                        (
-                            ValidationOutcome::DataError,
-                            Some(format!(
-                                "{}: {:?} -> {} at {} source_row={}",
-                                issue.reason,
-                                issue.previous_status,
-                                issue.status,
-                                issue.time_ms,
-                                issue.source_row_no
-                            )),
-                            Vec::new(),
-                        )
-                    }
-                    (None, _)
-                        if self
-                            .phase_audit
-                            .get(&symbol)
-                            .and_then(|audit| audit.excluded_reason(anchor))
-                            .is_some() =>
-                    {
-                        (
-                            ValidationOutcome::ExcludedByStatus,
-                            self.phase_audit[&symbol].excluded_reason(anchor).cloned(),
-                            Vec::new(),
-                        )
-                    }
-                    (None, _) if anchor == ValidationAnchor::MarketClose && symbol_state.seen => (
-                        ValidationOutcome::MissingSource,
-                        Some("required market-close reference is missing".to_owned()),
-                        Vec::new(),
-                    ),
-                    (None, _) => (
-                        ValidationOutcome::MissingSource,
-                        Some("reference anchor is missing".to_owned()),
-                        Vec::new(),
-                    ),
-                    (Some(_), state)
-                        if self.market == Market::Szse
-                            && anchor == ValidationAnchor::MarketClose
-                            && replay.sz_after_close_events_by_symbol.contains_key(&symbol) =>
-                    {
-                        (
-                            ValidationOutcome::DataError,
-                            Some(format!(
-                                "unclassified SZ events after 15:00:00.000: {}; phase review required before E0 acceptance",
-                                replay.sz_after_close_events_by_symbol[&symbol]
-                            )),
-                            state
-                                .and_then(|state| state.diagnostics)
-                                .and_then(|d| d.best_differences)
-                                .unwrap_or_default(),
-                        )
-                    }
-                    (Some(reference), _) if reference.not_comparable_reason.is_some() => (
-                        ValidationOutcome::ExcludedByStatus,
-                        reference.not_comparable_reason.clone(),
-                        Vec::new(),
-                    ),
-                    (Some(reference), _) if reference.load_error.is_some() => (
+                    .and_then(|d| d.turnover_precision.take());
+                let best_candidate_time_ms = state.best_candidate_time_ns.map(timestamp_ns_to_ms);
+                let best_candidate_raw_sequence = state.best_candidate_raw_sequence;
+                let comparison_error = diagnostics.as_mut().and_then(|d| d.comparison_error.take());
+                let differences = diagnostics
+                    .and_then(|mut d| d.best_differences.take())
+                    .unwrap_or_default();
+                let (outcome, reason) = if self.market == Market::Szse
+                    && anchor == ValidationAnchor::MarketClose
+                    && replay.sz_after_close_events_by_symbol.contains_key(&symbol)
+                {
+                    (
                         ValidationOutcome::DataError,
-                        reference.load_error.clone(),
-                        Vec::new(),
-                    ),
-                    (Some(_), _) if !symbol_state.seen => (
+                        Some(format!(
+                            "unclassified SZ events after 15:00:00.000: {}; phase review required before E0 acceptance",
+                            replay.sz_after_close_events_by_symbol[&symbol]
+                        )),
+                    )
+                } else if let Some(error) = reference.load_error {
+                    (ValidationOutcome::DataError, Some(error))
+                } else if !symbol_state.seen {
+                    (
                         ValidationOutcome::MissingSource,
                         Some("no selected raw order/trade events were observed".to_owned()),
-                        Vec::new(),
-                    ),
-                    (Some(_), Some(state))
-                        if state
-                            .diagnostics
-                            .as_ref()
-                            .is_some_and(|d| d.comparison_error.is_some()) =>
-                    {
-                        (
-                            ValidationOutcome::DataError,
-                            state.diagnostics.and_then(|d| d.comparison_error),
-                            Vec::new(),
-                        )
-                    }
-                    (Some(_), Some(state)) if state.matched => {
-                        (ValidationOutcome::Matched, None, Vec::new())
-                    }
-                    (Some(_), Some(state)) => (
+                    )
+                } else if let Some(error) = comparison_error {
+                    (ValidationOutcome::DataError, Some(error))
+                } else if state.matched {
+                    (ValidationOutcome::Matched, None)
+                } else {
+                    (
                         ValidationOutcome::Mismatched,
                         Some(
                             "no reconstructed full-state candidate matched the reference"
                                 .to_owned(),
                         ),
-                        state
-                            .diagnostics
-                            .and_then(|d| d.best_differences)
-                            .unwrap_or_default(),
-                    ),
-                    (Some(_), None) => (
-                        ValidationOutcome::MissingSource,
-                        Some("replay did not reach the reference anchor".to_owned()),
-                        Vec::new(),
-                    ),
+                    )
                 };
-                if outcome != ValidationOutcome::Matched {
-                    matched_candidate_time_ms = None;
-                    matched_candidate_raw_sequence = None;
-                    matched_candidate_apply_sequence = None;
-                    match_tag = None;
-                }
                 totals.observe(&outcome);
-                let class = if is_etf_symbol(self.market, &symbol) {
-                    "etf"
-                } else {
-                    "stock"
-                };
-                let key = format!("{class}.{}", anchor_text(anchor));
-                breakdown.entry(key).or_default().observe(&outcome);
+                breakdown
+                    .entry(format!("{class}.{}", anchor_text(anchor)))
+                    .or_default()
+                    .observe(&outcome);
+                let matched = outcome == ValidationOutcome::Matched;
                 if outcome == ValidationOutcome::Mismatched {
+                    mismatched_symbols.insert(symbol.clone());
                     for difference in &differences {
                         *mismatch_fields.entry(difference.field.clone()).or_default() += 1;
                     }
-                    if let Some(reason) = reason.as_ref() {
+                    if let Some(reason) = &reason {
                         *mismatch_reasons.entry(reason.clone()).or_default() += 1;
                     }
-                } else if outcome != ValidationOutcome::Matched {
-                    if let Some(reason) = reason.as_ref() {
-                        *not_comparable_reasons.entry(reason.clone()).or_default() += 1;
-                    }
                 }
-                if outcome == ValidationOutcome::Matched {
-                    if let Some(tag) = match_tag.as_ref() {
-                        *match_tags.entry(tag.clone()).or_default() += 1;
+                if !matched {
+                    if let Some(reason) = &reason {
+                        *failure_reasons.entry(reason.clone()).or_default() += 1;
                     }
+                } else if let Some(tag) = state.match_tag {
+                    *match_tags.entry(tag.to_owned()).or_default() += 1;
                 }
-                let record = ValidationRecord {
-                    close_price_band,
-                    market: market.clone(),
-                    symbol: symbol.clone(),
-                    anchor,
-                    outcome: outcome.clone(),
-                    reference_time_ms: reference_time_ns.map(timestamp_ns_to_ms),
-                    matched_candidate_time_ms,
-                    matched_candidate_raw_sequence,
-                    matched_candidate_apply_sequence,
-                    channel_id: symbol_state.channel,
-                    best_candidate_time_ms,
-                    best_candidate_raw_sequence,
-                    match_tag,
-                    reason,
-                    differences,
-                };
-                if outcome == ValidationOutcome::Mismatched {
-                    mismatched_symbols.insert(symbol.clone());
+                if matched {
+                    if turnover_precision.is_some() {
+                        *match_tags
+                            .entry(TURNOVER_PRECISION_TAG.to_owned())
+                            .or_default() += 1;
+                    }
+                    if close_price_band
+                        .as_ref()
+                        .is_some_and(|a| a.upper_limit_normalization.is_some())
+                    {
+                        *match_tags
+                            .entry(UPPER_LIMIT_PRECISION_TAG.to_owned())
+                            .or_default() += 1;
+                    }
                 }
                 let keep_detail = self
                     .max_detail_records
                     .is_none_or(|limit| records.len() < limit);
-                if (outcome == ValidationOutcome::Matched && retain_matched_records)
-                    || (outcome != ValidationOutcome::Matched && keep_detail)
-                {
-                    records.push(record);
+                if (matched && retain_matched_records) || (!matched && keep_detail) {
+                    records.push(ValidationRecord {
+                        close_price_band,
+                        turnover_precision: if matched { turnover_precision } else { None },
+                        market: market.clone(),
+                        symbol: symbol.clone(),
+                        anchor,
+                        outcome,
+                        reference_time_ms: timestamp_ns_to_ms(reference.time_ns),
+                        reference_source_row_no: reference.source_row_no,
+                        matched_candidate_time_ms: if matched {
+                            state.matched_candidate_time_ns.map(timestamp_ns_to_ms)
+                        } else {
+                            None
+                        },
+                        matched_candidate_raw_sequence: if matched {
+                            state.matched_candidate_raw_sequence
+                        } else {
+                            None
+                        },
+                        matched_candidate_apply_sequence: if matched {
+                            state.matched_candidate_apply_sequence
+                        } else {
+                            None
+                        },
+                        channel_id: symbol_state.channel,
+                        best_candidate_time_ms,
+                        best_candidate_raw_sequence,
+                        match_tag: if matched {
+                            state.match_tag.map(str::to_owned)
+                        } else {
+                            None
+                        },
+                        reason,
+                        differences: if matched { Vec::new() } else { differences },
+                    });
+                } else if matched {
+                    omitted_matched_records += 1;
                 } else {
-                    match outcome {
-                        ValidationOutcome::Matched => omitted_matched_records += 1,
-                        ValidationOutcome::Mismatched => omitted_mismatched_records += 1,
-                        _ => omitted_not_comparable_records += 1,
-                    }
+                    omitted_failure_records += 1;
                 }
             }
         }
         let mut mismatch_symbol_prefixes = BTreeMap::new();
         for symbol in &mismatched_symbols {
-            let prefix = symbol.get(..3).unwrap_or(symbol).to_owned();
-            *mismatch_symbol_prefixes.entry(prefix).or_insert(0) += 1;
+            *mismatch_symbol_prefixes
+                .entry(symbol.get(..3).unwrap_or(symbol).to_owned())
+                .or_default() += 1;
         }
-        records.sort_by(|left, right| {
-            left.symbol
-                .cmp(&right.symbol)
-                .then_with(|| anchor_rank(left.anchor).cmp(&anchor_rank(right.anchor)))
-                .then_with(|| left.reference_time_ms.cmp(&right.reference_time_ms))
+        records.sort_by(|a, b| {
+            a.symbol
+                .cmp(&b.symbol)
+                .then_with(|| anchor_rank(a.anchor).cmp(&anchor_rank(b.anchor)))
+                .then_with(|| a.reference_time_ms.cmp(&b.reference_time_ms))
         });
+        let run_outcome = if totals.mismatched > 0
+            || totals.data_errors > 0
+            || totals.missing_source > 0
+            || replay.sz_after_close_events > 0
+        {
+            RunOutcome::Failed
+        } else if totals.total == 0 {
+            RunOutcome::NoEligibleReferences
+        } else {
+            RunOutcome::Passed
+        };
         ValidationReport {
+            report_schema_version: 2,
+            run_outcome,
+            coverage,
             replay,
             continuous_lookback_ms: self.continuous_lookback_ns / REFERENCE_MILLISECOND_NS,
             continuous_lookahead_ms: self.continuous_lookahead_ns / REFERENCE_MILLISECOND_NS,
             diagnostic_window_override: self.diagnostic_window_override,
             continuous_lookahead_ms_by_symbol,
-            phase_audit: self.phase_audit.into_values().collect(),
-            total_anchors: totals.total,
-            comparable_anchors: totals.comparable,
+            selection_audit: self.selection_audit.into_values().collect(),
+            selected_references: totals.total,
+            comparable_references: totals.comparable,
             matched: totals.matched,
             mismatched: totals.mismatched,
-            not_comparable: totals.not_comparable,
-            excluded_by_status: totals.excluded_by_status,
             data_errors: totals.data_errors,
             missing_source: totals.missing_source,
             match_rate: ratio(totals.matched, totals.comparable),
-            not_comparable_rate: ratio(totals.not_comparable, totals.total),
             mismatch_fields,
             mismatch_reasons,
-            not_comparable_reasons,
+            failure_reasons,
             mismatched_symbols: mismatched_symbols.len() as u64,
             mismatch_symbol_prefixes,
             match_tags,
             breakdown,
             omitted_matched_records,
-            omitted_mismatched_records,
-            omitted_not_comparable_records,
+            omitted_failure_records,
             records,
         }
     }
@@ -975,7 +758,7 @@ pub fn validate_market_day(config: &ValidationConfig) -> Result<ValidationReport
         .with_continuous_lookback(config.continuous_lookback)?
         .with_continuous_lookahead(config.continuous_lookahead)?
         .with_max_detail_records(config.max_detail_records);
-    observer.phase_audit = references.phase_audit;
+    observer.selection_audit = references.selection_audit;
     observer.set_close_limits(references.sz_close_limits);
     let mut request = config.request.clone();
     request.snapshots = None;
@@ -1010,7 +793,7 @@ pub fn validate_pre_open_market_day(
         .with_continuous_lookback(config.continuous_lookback)?
         .with_continuous_lookahead(config.continuous_lookahead)?
         .with_max_detail_records(config.max_detail_records);
-    observer.phase_audit = references.phase_audit;
+    observer.selection_audit = references.selection_audit;
     let mut request = config.request.clone();
     request.snapshots = None;
     let replay = run_market_day_before(&request, cutoff, &mut observer)?;
@@ -1028,7 +811,7 @@ const fn timestamp_ns_to_ms(timestamp_ns: i64) -> i64 {
 struct LoadedReferences {
     sz_close_limits: HashMap<String, DayLimits>,
     books: HashMap<String, SymbolReferences>,
-    phase_audit: BTreeMap<String, PhaseAudit>,
+    selection_audit: BTreeMap<String, SelectionAudit>,
 }
 
 struct ReferenceLoadState {
@@ -1088,11 +871,13 @@ fn load_references(
                 continue;
             }
             let time_ns = timestamp_parser.parse(times.value(row))?;
+            let missing_reception = columns.missing_reception(row);
             let state = states
                 .entry_ref(symbol)
                 .or_insert_with(|| ReferenceLoadState {
                     references: SymbolReferences::default(),
-                    tracker: PhaseTracker::new(request.market, request.trading_day, symbol),
+                    tracker: PhaseTracker::new(request.market, request.trading_day, symbol)
+                        .with_pre_open_only(pre_open_only),
                     limits: None,
                 });
             if !pre_open_only
@@ -1103,7 +888,7 @@ fn load_references(
                 state
                     .limits
                     .get_or_insert_with(DayLimits::default)
-                    .observe_lazy(values, || {
+                    .observe_reference(values, missing_reception, || {
                         format!("{}#source_row_no={}", path.display(), rows.value(row))
                     });
             }
@@ -1114,18 +899,17 @@ fn load_references(
                 statuses.value(row).trim(),
                 opening_start,
                 continuous_start,
-            ) else {
+            )?
+            else {
                 continue;
             };
-            if pre_open_only && anchor != ValidationAnchor::PreOpen {
-                continue;
-            }
             let (view, load_error) = load_raw_snapshot_view(&columns, &path, row)?;
             let candidate = ReferenceSnapshot {
                 time_ns,
                 view,
                 load_error,
-                not_comparable_reason: None,
+                source_row_no: rows.value(row),
+                missing_reception,
                 pre_close_price_units: if request.market == Market::Szse
                     && anchor == ValidationAnchor::MarketClose
                 {
@@ -1145,36 +929,19 @@ fn load_references(
                     } else {
                         &mut references.market_close
                     };
-                    if let Some(first) = target.as_mut() {
-                        // Compare normalized reference fields exactly; the book's
-                        // weighted-price tolerance does not apply to reference duplicates.
-                        if first.load_error.is_none()
-                            && (first.view != candidate.view || candidate.load_error.is_some())
-                        {
-                            first.load_error = Some(format!(
-                                "repeated {} {} frames differ for {symbol}: first={} candidate={} source_row={}",
-                                market_text(request.market),
-                                anchor_text(anchor),
-                                timestamp_ns_to_ms(first.time_ns),
-                                timestamp_ns_to_ms(time_ns),
-                                rows.value(row)
-                            ));
-                        }
-                    } else {
-                        *target = Some(candidate);
-                    }
+                    *target = Some(candidate);
                 }
             }
         }
     }
     let mut books = HashMap::with_capacity(states.len());
     let mut sz_close_limits = HashMap::new();
-    let mut phase_audit = BTreeMap::new();
+    let mut selection_audit = BTreeMap::new();
     for (symbol, state) in states {
         if let Some(limits) = state.limits {
             sz_close_limits.insert(symbol.clone(), limits);
         }
-        phase_audit.insert(symbol.clone(), state.tracker.audit);
+        selection_audit.insert(symbol.clone(), state.tracker.audit);
         books.insert(symbol, state.references);
     }
     // Duplicate periodic timestamps are source errors, not frames to silently deduplicate.
@@ -1204,7 +971,7 @@ fn load_references(
     Ok(LoadedReferences {
         sz_close_limits,
         books,
-        phase_audit,
+        selection_audit,
     })
 }
 
@@ -1763,6 +1530,7 @@ mod tests {
                     values: Some((120000, 80000)),
                     source: "first".to_owned(),
                     error: None,
+                    upper_limit_normalization: None,
                 },
             ),
             (
@@ -1771,6 +1539,7 @@ mod tests {
                     values: Some((240000, 160000)),
                     source: "second".to_owned(),
                     error: None,
+                    upper_limit_normalization: None,
                 },
             ),
         ]));
@@ -1881,7 +1650,8 @@ mod tests {
                                 .unwrap_or_else(|_| std::process::abort()),
                         ),
                         load_error: None,
-                        not_comparable_reason: None,
+                        source_row_no: 1,
+                        missing_reception: false,
                         pre_close_price_units: None,
                         state: AnchorState::default(),
                     }),
@@ -1989,7 +1759,8 @@ mod tests {
                     time_ns: timestamp("15:00:00.000"),
                     view: Some(view.try_into().unwrap_or_else(|_| std::process::abort())),
                     load_error: None,
-                    not_comparable_reason: None,
+                    source_row_no: 1,
+                    missing_reception: false,
                     pre_close_price_units: Some(pre_close_price_units),
                     state: AnchorState::default(),
                 }),
@@ -2069,7 +1840,8 @@ mod tests {
                             time_ns: 10,
                             view: Some(expected.clone().try_into().expect("compact")),
                             load_error: None,
-                            not_comparable_reason: None,
+                            source_row_no: 1,
+                            missing_reception: false,
                             pre_close_price_units: None,
                             state: AnchorState::default(),
                         }],
@@ -2150,7 +1922,8 @@ mod tests {
                             .unwrap_or_else(|_| std::process::abort()),
                     ),
                     load_error: None,
-                    not_comparable_reason: None,
+                    source_row_no: 1,
+                    missing_reception: false,
                     pre_close_price_units: None,
                     state: AnchorState::default(),
                 }),
@@ -2194,8 +1967,8 @@ mod tests {
         ));
         assert_eq!(report.matched, 1);
         assert_eq!(report.mismatched, 0);
-        assert_eq!(report.missing_source, 2);
-        assert_eq!(report.not_comparable, 2);
+        assert_eq!(report.missing_source, 0);
+        assert_eq!(report.selected_references, 1);
         assert_eq!(report.match_rate, Some(1.0));
 
         let mut compact = ValidationObserver::new(Market::Sse, compact_references);
@@ -2211,7 +1984,7 @@ mod tests {
         );
         let compact_report = compact.into_report(ReplayReport::default(), false);
         assert_eq!(compact_report.omitted_matched_records, 1);
-        assert_eq!(compact_report.records.len(), 2);
+        assert_eq!(compact_report.records.len(), 0);
         assert!(
             compact_report
                 .records
@@ -2248,7 +2021,8 @@ mod tests {
                             .unwrap_or_else(|_| std::process::abort()),
                     ),
                     load_error: None,
-                    not_comparable_reason: None,
+                    source_row_no: 1,
+                    missing_reception: false,
                     pre_close_price_units: None,
                     state: AnchorState::default(),
                 }],
@@ -2295,8 +2069,9 @@ mod tests {
     fn old_and_assumed_market_order_reports_are_not_standard_acceptance() {
         let observer = ValidationObserver::new(Market::Szse, HashMap::new());
         let mut report = observer.into_report(ReplayReport::default(), true);
-        report.total_anchors = 1;
-        report.comparable_anchors = 1;
+        report.run_outcome = super::RunOutcome::Passed;
+        report.selected_references = 1;
+        report.comparable_references = 1;
         report.matched = 1;
         report.omitted_matched_records = 1;
         assert!(report.is_success());
@@ -2343,7 +2118,8 @@ mod tests {
                             .unwrap_or_else(|_| std::process::abort()),
                     ),
                     load_error: None,
-                    not_comparable_reason: None,
+                    source_row_no: 1,
+                    missing_reception: false,
                     pre_close_price_units: None,
                     state: AnchorState::default(),
                 }],
@@ -2406,7 +2182,8 @@ mod tests {
                             .unwrap_or_else(|_| std::process::abort()),
                     ),
                     load_error: None,
-                    not_comparable_reason: None,
+                    source_row_no: 1,
+                    missing_reception: false,
                     pre_close_price_units: None,
                     state: AnchorState::default(),
                 }],
@@ -2469,7 +2246,8 @@ mod tests {
                             .unwrap_or_else(|_| std::process::abort()),
                     ),
                     load_error: None,
-                    not_comparable_reason: None,
+                    source_row_no: 1,
+                    missing_reception: false,
                     pre_close_price_units: None,
                     state: AnchorState::default(),
                 }],
@@ -2539,7 +2317,8 @@ mod tests {
                             .unwrap_or_else(|_| std::process::abort()),
                     ),
                     load_error: None,
-                    not_comparable_reason: None,
+                    source_row_no: 1,
+                    missing_reception: false,
                     pre_close_price_units: None,
                     state: AnchorState::default(),
                 }],
@@ -2601,7 +2380,8 @@ mod tests {
                                     .unwrap_or_else(|_| std::process::abort()),
                             ),
                             load_error: None,
-                            not_comparable_reason: None,
+                            source_row_no: 1,
+                            missing_reception: false,
                             pre_close_price_units: None,
                             state: AnchorState::default(),
                         }],
@@ -2683,7 +2463,8 @@ mod tests {
                         .unwrap_or_else(|_| std::process::abort()),
                 ),
                 load_error: None,
-                not_comparable_reason: None,
+                source_row_no: 1,
+                missing_reception: false,
                 pre_close_price_units: None,
                 state: AnchorState::default(),
             };
@@ -2789,7 +2570,8 @@ mod tests {
                             .unwrap_or_else(|_| std::process::abort()),
                     ),
                     load_error: None,
-                    not_comparable_reason: None,
+                    source_row_no: 1,
+                    missing_reception: false,
                     pre_close_price_units: None,
                     state: AnchorState::default(),
                 })
@@ -2810,7 +2592,7 @@ mod tests {
         let later = report
             .records
             .iter()
-            .find(|r| r.reference_time_ms == Some(11_000));
+            .find(|r| r.reference_time_ms == 11_000);
         assert!(
             matches!(later, Some(record) if record.outcome == ValidationOutcome::Matched
             && record.matched_candidate_time_ms == Some(10_500))
@@ -2851,7 +2633,8 @@ mod tests {
                             .unwrap_or_else(|_| std::process::abort()),
                     ),
                     load_error: None,
-                    not_comparable_reason: None,
+                    source_row_no: 1,
+                    missing_reception: false,
                     pre_close_price_units: None,
                     state: AnchorState::default(),
                 }),
@@ -2865,7 +2648,8 @@ mod tests {
                                 .unwrap_or_else(|_| std::process::abort()),
                         ),
                         load_error: None,
-                        not_comparable_reason: None,
+                        source_row_no: 1,
+                        missing_reception: false,
                         pre_close_price_units: None,
                         state: AnchorState::default(),
                     },
@@ -2877,7 +2661,8 @@ mod tests {
                                 .unwrap_or_else(|_| std::process::abort()),
                         ),
                         load_error: None,
-                        not_comparable_reason: None,
+                        source_row_no: 1,
+                        missing_reception: false,
                         pre_close_price_units: None,
                         state: AnchorState::default(),
                     },
@@ -2886,7 +2671,8 @@ mod tests {
                     time_ns: 14_000_000_000,
                     view: Some(empty.try_into().unwrap_or_else(|_| std::process::abort())),
                     load_error: None,
-                    not_comparable_reason: None,
+                    source_row_no: 1,
+                    missing_reception: false,
                     pre_close_price_units: None,
                     state: AnchorState::default(),
                 }),
@@ -2918,7 +2704,7 @@ mod tests {
         let report = observer.into_report(ReplayReport::default(), false);
         assert_eq!(report.mismatched, 2);
         assert_eq!(report.records.len(), 1);
-        assert_eq!(report.omitted_mismatched_records, 1);
+        assert_eq!(report.omitted_failure_records, 1);
         assert_eq!(report.mismatched_symbols, 1);
         assert_eq!(report.mismatch_symbol_prefixes.get("600"), Some(&1));
     }
@@ -2947,7 +2733,8 @@ mod tests {
                                 .unwrap_or_else(|_| std::process::abort()),
                         ),
                         load_error: None,
-                        not_comparable_reason: None,
+                        source_row_no: 1,
+                        missing_reception: false,
                         pre_close_price_units: None,
                         state: AnchorState::default(),
                     },
@@ -2959,7 +2746,8 @@ mod tests {
                                 .unwrap_or_else(|_| std::process::abort()),
                         ),
                         load_error: None,
-                        not_comparable_reason: None,
+                        source_row_no: 1,
+                        missing_reception: false,
                         pre_close_price_units: None,
                         state: AnchorState::default(),
                     },
@@ -3001,8 +2789,8 @@ mod tests {
                 .iter()
                 .all(|record| record.outcome == ValidationOutcome::Matched)
         );
-        assert_eq!(continuous[0].reference_time_ms, Some(10_000));
-        assert_eq!(continuous[1].reference_time_ms, Some(12_000));
+        assert_eq!(continuous[0].reference_time_ms, 10_000);
+        assert_eq!(continuous[1].reference_time_ms, 12_000);
     }
 
     #[test]
@@ -3026,7 +2814,8 @@ mod tests {
                             .unwrap_or_else(|_| std::process::abort()),
                     ),
                     load_error: None,
-                    not_comparable_reason: None,
+                    source_row_no: 1,
+                    missing_reception: false,
                     pre_close_price_units: None,
                     state: AnchorState::default(),
                 }],
@@ -3221,6 +3010,7 @@ mod tests {
             values: Some((200_000, 100)),
             source: "synthetic limited stock".to_owned(),
             error: None,
+            upper_limit_normalization: None,
         });
         assert!(
             observer
@@ -3291,6 +3081,7 @@ mod tests {
             values: Some((200_000, 100)),
             source: "synthetic limited stock".to_owned(),
             error: None,
+            upper_limit_normalization: None,
         });
         assert!(
             observer
@@ -3350,45 +3141,33 @@ mod tests {
     }
 
     #[test]
-    fn suspension_reason_precedes_missing_tick_reason() {
-        let references = HashMap::from([(
-            "000635".to_owned(),
-            SymbolReferences {
-                pre_open: Some(ReferenceSnapshot {
-                    time_ns: 100,
-                    view: None,
-                    load_error: None,
-                    not_comparable_reason: Some("suspended PreOpen phase status B1".to_owned()),
-                    pre_close_price_units: None,
-                    state: AnchorState::default(),
-                }),
-                continuous_trading: vec![ReferenceSnapshot {
-                    time_ns: 200,
-                    view: None,
-                    load_error: None,
-                    not_comparable_reason: Some("suspended continuous phase status T1".to_owned()),
-                    pre_close_price_units: None,
-                    state: AnchorState::default(),
-                }],
-                market_close: Some(ReferenceSnapshot {
-                    time_ns: 300,
-                    view: None,
-                    load_error: None,
-                    not_comparable_reason: Some("suspended close phase status E1".to_owned()),
-                    pre_close_price_units: None,
-                    state: AnchorState::default(),
-                }),
-            },
-        )]);
-        let observer = ValidationObserver::new(Market::Szse, references);
-        let report = observer.into_report(ReplayReport::default(), true);
-        assert_eq!(report.not_comparable, 3);
-        assert!(report.records.iter().all(|record| {
-            record.outcome == ValidationOutcome::ExcludedByStatus
-                && record
-                    .reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("suspended"))
-        }));
+    #[allow(clippy::expect_used)]
+    fn no_selected_references_has_no_virtual_results_and_version_is_strict() {
+        let refs = HashMap::from([("000635".to_owned(), SymbolReferences::default())]);
+        let report =
+            ValidationObserver::new(Market::Szse, refs).into_report(ReplayReport::default(), true);
+        assert_eq!(report.selected_references, 0);
+        assert_eq!(report.match_rate, None);
+        assert!(report.records.is_empty());
+        assert!(report.is_success());
+        assert!(!report.is_standard_acceptance());
+        assert_eq!(report.run_outcome, super::RunOutcome::NoEligibleReferences);
+        assert_eq!(report.coverage.symbols_without_reference_records, 1);
+        let mut json = serde_json::to_value(&report).expect("serialize");
+        assert!(serde_json::from_value::<super::ValidationReport>(json.clone()).is_ok());
+        json["report_schema_version"] = serde_json::json!(1);
+        assert!(serde_json::from_value::<super::ValidationReport>(json.clone()).is_err());
+        json.as_object_mut()
+            .expect("object")
+            .remove("report_schema_version");
+        assert!(serde_json::from_value::<super::ValidationReport>(json).is_err());
+        let replay = ReplayReport {
+            sz_after_close_events: 1,
+            ..ReplayReport::default()
+        };
+        let report =
+            ValidationObserver::new(Market::Szse, HashMap::new()).into_report(replay, true);
+        assert_eq!(report.run_outcome, super::RunOutcome::Failed);
+        assert!(!report.is_success());
     }
 }
