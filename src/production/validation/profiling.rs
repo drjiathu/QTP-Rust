@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use super::{ValidationConfig, ValidationObserver, ValidationReport, load_references};
+use super::{ValidationConfig, ValidationReport, full_day_observer, load_references};
 use crate::production::replay::{ObservationPoint, StateObserver, profile_run_market_day};
 use crate::{OrderBook, ProductionError};
 
@@ -103,12 +103,7 @@ pub fn profile_validate_market_day(
     let total_start = Instant::now();
     let start = Instant::now();
     let references = load_references(&config.request, false)?;
-    let mut observer = ValidationObserver::new(config.request.market, references.books)
-        .with_continuous_lookback(config.continuous_lookback)?
-        .with_continuous_lookahead(config.continuous_lookahead)?
-        .with_max_detail_records(config.max_detail_records);
-    observer.selection_audit = references.selection_audit;
-    observer.set_close_limits(references.sz_close_limits);
+    let mut observer = full_day_observer(config, references)?;
     let mut request = config.request.clone();
     request.snapshots = None;
     let reference_load = start.elapsed();

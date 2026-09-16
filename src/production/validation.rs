@@ -142,6 +142,7 @@ impl AnchorState {
 
 #[derive(Clone, Debug, Default)]
 struct SymbolValidationState {
+    rules: Option<SymbolValidationRules>,
     limits: Option<DayLimits>,
     cache: CandidateCache,
     references: SymbolReferences,
@@ -149,6 +150,36 @@ struct SymbolValidationState {
     seen: bool,
     close_price: Option<SzClosePriceTracker>,
     channel: Option<u32>,
+}
+
+/// Configuration-only values, initialized on first observation after overrides.
+/// This cache never depends on the evolving order book or reference frames.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SymbolValidationRules {
+    is_etf: bool,
+    price_quantum: i64,
+    lookahead_ns: i64,
+}
+
+impl SymbolValidationRules {
+    fn new(market: Market, symbol: &str, lookahead_ns: i64, lookahead_override: bool) -> Self {
+        let is_etf = is_etf_symbol(market, symbol);
+        Self {
+            is_etf,
+            price_quantum: validation_price_quantum(market, symbol),
+            lookahead_ns: if !lookahead_override && market == Market::Szse {
+                if is_etf {
+                    1_100 * REFERENCE_MILLISECOND_NS
+                } else if is_chinext_symbol(symbol) {
+                    3 * REFERENCE_SECOND_NS
+                } else {
+                    lookahead_ns
+                }
+            } else {
+                lookahead_ns
+            },
+        }
+    }
 }
 
 impl From<SymbolReferences> for SymbolValidationState {
@@ -397,6 +428,9 @@ impl ValidationObserver {
                 "continuous lookahead must be within [1ms, 3s]".to_owned(),
             ));
         }
+        for state in self.symbols.values_mut() {
+            state.rules = None;
+        }
         Ok(self)
     }
 
@@ -406,15 +440,16 @@ impl ValidationObserver {
     }
 
     fn lookahead_ns(&self, symbol: &str) -> i64 {
-        if !self.lookahead_override && self.market == Market::Szse {
-            if is_etf_symbol(self.market, symbol) {
-                return 1_100 * REFERENCE_MILLISECOND_NS;
-            }
-            if is_chinext_symbol(symbol) {
-                return 3 * REFERENCE_SECOND_NS;
-            }
-        }
-        self.continuous_lookahead_ns
+        self.rules_for(symbol).lookahead_ns
+    }
+
+    fn rules_for(&self, symbol: &str) -> SymbolValidationRules {
+        SymbolValidationRules::new(
+            self.market,
+            symbol,
+            self.continuous_lookahead_ns,
+            self.lookahead_override,
+        )
     }
 
     fn pre_open_only(market: Market, references: HashMap<String, SymbolReferences>) -> Self {
@@ -433,6 +468,7 @@ impl ValidationObserver {
         reference_time_ns: i64,
         candidate_time_ns: Option<i64>,
     ) -> Result<(), ProductionError> {
+        let rules = self.rules_for(symbol);
         let Some(state) = self.symbols.get_mut(symbol) else {
             return Ok(());
         };
@@ -441,6 +477,7 @@ impl ValidationObserver {
         };
         let ctx = CandidateContext {
             market: self.market,
+            rules,
             symbol,
             book,
             limits: state.limits.as_ref(),
@@ -729,17 +766,26 @@ impl StateObserver for ValidationObserver {
         book: &OrderBook,
         point: ObservationPoint,
     ) -> Result<(), ProductionError> {
+        let state = self.symbols.entry_ref(symbol).or_default();
+        let rules = *state.rules.get_or_insert_with(|| {
+            SymbolValidationRules::new(
+                self.market,
+                symbol,
+                self.continuous_lookahead_ns,
+                self.lookahead_override,
+            )
+        });
         let windows = WindowConfig {
             pre_open_only: self.pre_open_only,
             lookback_ns: self.continuous_lookback_ns,
-            lookahead_ns: self.lookahead_ns(symbol),
+            lookahead_ns: rules.lookahead_ns,
         };
-        let state = self.symbols.entry_ref(symbol).or_default();
         state.seen = true;
         state.channel = Some(channel);
         state.observe_candidates(
             CandidateContext {
                 market: self.market,
+                rules,
                 symbol,
                 book,
                 limits: None, // Borrowed from the same symbol state inside observe_candidates.
@@ -754,16 +800,24 @@ impl StateObserver for ValidationObserver {
 
 pub fn validate_market_day(config: &ValidationConfig) -> Result<ValidationReport, ProductionError> {
     let references = load_references(&config.request, false)?;
+    let mut observer = full_day_observer(config, references)?;
+    let mut request = config.request.clone();
+    request.snapshots = None;
+    let replay = run_market_day(&request, &mut observer)?;
+    Ok(observer.into_report(replay, config.retain_matched_records))
+}
+
+fn full_day_observer(
+    config: &ValidationConfig,
+    references: LoadedReferences,
+) -> Result<ValidationObserver, ProductionError> {
     let mut observer = ValidationObserver::new(config.request.market, references.books)
         .with_continuous_lookback(config.continuous_lookback)?
         .with_continuous_lookahead(config.continuous_lookahead)?
         .with_max_detail_records(config.max_detail_records);
     observer.selection_audit = references.selection_audit;
     observer.set_close_limits(references.sz_close_limits);
-    let mut request = config.request.clone();
-    request.snapshots = None;
-    let replay = run_market_day(&request, &mut observer)?;
-    Ok(observer.into_report(replay, config.retain_matched_records))
+    Ok(observer)
 }
 
 /// Validates only the post-opening-auction (`PreOpen`) state and stops replay
@@ -1042,8 +1096,7 @@ impl DifferenceMask {
 }
 
 fn compare_reference_scalars(
-    market: Market,
-    symbol: &str,
+    price_quantum: i64,
     expected: &ReferenceBookView,
     actual: &SnapshotBookView,
 ) -> DifferenceMask {
@@ -1056,7 +1109,7 @@ fn compare_reference_scalars(
         DIFF_WEIGHTED_BID_PRICE,
         !weighted_prices_match(
             expected.weighted_bid_price_units,
-            validation_price(market, symbol, actual.weighted_bid_price_units),
+            quantize_validation_price(price_quantum, actual.weighted_bid_price_units),
         ),
     );
     mask.record(
@@ -1067,7 +1120,7 @@ fn compare_reference_scalars(
         DIFF_WEIGHTED_ASK_PRICE,
         !weighted_prices_match(
             expected.weighted_ask_price_units,
-            validation_price(market, symbol, actual.weighted_ask_price_units),
+            quantize_validation_price(price_quantum, actual.weighted_ask_price_units),
         ),
     );
     mask.record(
@@ -1294,7 +1347,10 @@ fn weighted_prices_match(expected: Option<i64>, actual: Option<i64>) -> bool {
 }
 
 fn validation_price(market: Market, symbol: &str, value: Option<i64>) -> Option<i64> {
-    let quantum = validation_price_quantum(market, symbol);
+    quantize_validation_price(validation_price_quantum(market, symbol), value)
+}
+
+fn quantize_validation_price(quantum: i64, value: Option<i64>) -> Option<i64> {
     value.map(|units| (units + quantum / 2) / quantum * quantum)
 }
 
@@ -1306,18 +1362,27 @@ fn validation_price_quantum(market: Market, symbol: &str) -> i64 {
     }
 }
 
+#[cfg(test)]
 fn published_weighted_price(
     book: &OrderBook,
     side: Side,
     market: Market,
     symbol: &str,
 ) -> Result<Option<i64>, ProductionError> {
+    published_weighted_price_with_quantum(book, side, validation_price_quantum(market, symbol))
+}
+
+fn published_weighted_price_with_quantum(
+    book: &OrderBook,
+    side: Side,
+    price_quantum: i64,
+) -> Result<Option<i64>, ProductionError> {
     let (total, weighted) = book.visible_aggregate(side);
     if total == 0 {
         return Ok(None);
     }
     let total = u128::from(total);
-    let quantum = u128::try_from(validation_price_quantum(market, symbol))
+    let quantum = u128::try_from(price_quantum)
         .map_err(|_| ProductionError::Arithmetic("published weighted quantum"))?;
     let rounded_units = round_weighted_to_quantum(weighted, total, quantum)?;
     i64::try_from(rounded_units)
@@ -2517,6 +2582,48 @@ mod tests {
                     },
                     "{anchor:?}, offset={offset_ms}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn cached_rules_follow_overrides_and_initialize_replay_only_symbols() {
+        for (market, symbols) in [
+            (Market::Sse, vec!["600000", "510300"]),
+            (Market::Szse, vec!["000001", "159915", "300001"]),
+        ] {
+            let mut observer = ValidationObserver::new(market, HashMap::new());
+            for symbol in &symbols {
+                observer.symbol_state_mut(symbol); // Also covers limits/trades before observation.
+                assert!(observer.symbols[*symbol].rules.is_none());
+            }
+            for configured_ms in [None, Some(2500), Some(1000)] {
+                if let Some(ms) = configured_ms {
+                    observer = observer
+                        .with_continuous_lookahead(Some(Duration::from_millis(ms)))
+                        .unwrap_or_else(|_| std::process::abort());
+                    assert!(observer.symbols.values().all(|state| state.rules.is_none()));
+                }
+                for symbol in &symbols {
+                    let expected_lookahead = observer.lookahead_ns(symbol);
+                    let book = empty_book();
+                    observer
+                        .observe(1, symbol, &book, ObservationPoint::BeforeEvent(10))
+                        .unwrap_or_else(|_| std::process::abort());
+                    let rules = observer.symbols[*symbol]
+                        .rules
+                        .unwrap_or_else(|| std::process::abort());
+                    assert_eq!(rules.lookahead_ns, expected_lookahead);
+                    assert_eq!(
+                        rules.price_quantum,
+                        super::validation_price_quantum(market, symbol)
+                    );
+                    assert_eq!(rules.is_etf, super::is_etf_symbol(market, symbol));
+                    observer
+                        .observe(1, symbol, &book, ObservationPoint::AfterEvent(10))
+                        .unwrap_or_else(|_| std::process::abort());
+                    assert_eq!(observer.symbols[*symbol].rules, Some(rules));
+                }
             }
         }
     }

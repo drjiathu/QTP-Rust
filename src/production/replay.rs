@@ -308,6 +308,16 @@ impl BookRuntime {
         self.resolve_history(side, order_no)
             .filter(|key| self.book.order(key).is_some())
     }
+
+    fn active_reference_with_remaining(
+        &self,
+        side: Side,
+        order_no: u64,
+    ) -> Option<(OrderKey, u64)> {
+        let key = self.resolve_history(side, order_no)?;
+        let order = self.book.order(&key)?;
+        Some((key, order.remaining_quantity))
+    }
 }
 
 fn same_second_regression_is_allowed(
@@ -369,7 +379,7 @@ fn process_sse_channel(
                     observer,
                     report,
                 )?;
-                apply_sse_row(runtime, request, &row)?;
+                apply_sse_row(runtime, &row)?;
                 report.applied_events += 1;
                 observer.observe(
                     channel,
@@ -447,15 +457,16 @@ fn process_sz_channel(
                 .map(|reader| reader.next_row())
                 .transpose()?
                 .flatten();
-            let book = &runtime(request, &mut runtimes, &row.symbol)?.book;
+            let runtime = runtime(request, &mut runtimes, &row.symbol)?;
             let side = sz_side(row.side);
-            let same_best = book.best_level(side);
+            let same_side_price_available =
+                row.kind == SzOrderKind::SameSideBest && runtime.book.best_level(side).is_some();
             if (row.kind == SzOrderKind::Market
                 && request.sz_market_order_policy
                     != super::SzMarketOrderPolicy::RestAtLastTradePrice)
-                || (row.kind == SzOrderKind::SameSideBest && same_best.is_none())
+                || (row.kind == SzOrderKind::SameSideBest && !same_side_price_available)
             {
-                let opposite_best = book.best_level(match side {
+                let opposite_best = runtime.book.best_level(match side {
                     Side::Buy => Side::Sell,
                     Side::Sell => Side::Buy,
                 });
@@ -503,7 +514,7 @@ fn process_sz_channel(
                     channel,
                     &row.symbol,
                     row.quote_time_ns,
-                    runtime(request, &mut runtimes, &row.symbol)?,
+                    runtime,
                     writer.as_mut(),
                     observer,
                     report,
@@ -512,9 +523,10 @@ fn process_sz_channel(
                     request,
                     channel,
                     &row,
-                    &mut runtimes,
+                    runtime,
+                    same_side_price_available,
                     None,
-                    &mut SilentObserver,
+                    &mut NullObserver,
                     report,
                 )?;
                 for response in &responses {
@@ -522,15 +534,15 @@ fn process_sz_channel(
                         request,
                         channel,
                         response,
-                        &mut runtimes,
+                        runtime,
                         None,
-                        &mut SilentObserver,
+                        &mut NullObserver,
                         report,
                     )?;
                 }
                 if let super::sz_pending::Disposition::Rest(units) = disposition {
                     let key = order_key(channel, side, row.sequence, &row.symbol, row.sequence)?;
-                    runtime(request, &mut runtimes, &row.symbol)?
+                    runtime
                         .book
                         .rest_pending_order(key, price(units, &row.symbol, row.sequence)?)
                         .map_err(|source| ProductionError::Apply {
@@ -560,7 +572,7 @@ fn process_sz_channel(
                 observer.observe(
                     channel,
                     &row.symbol,
-                    &runtime(request, &mut runtimes, &row.symbol)?.book,
+                    &runtime.book,
                     ObservationPoint::AfterEvent(row.quote_time_ns),
                 )?;
             } else {
@@ -568,7 +580,8 @@ fn process_sz_channel(
                     request,
                     channel,
                     &row,
-                    &mut runtimes,
+                    runtime,
+                    same_side_price_available,
                     writer.as_mut(),
                     observer,
                     report,
@@ -582,7 +595,7 @@ fn process_sz_channel(
                 request,
                 channel,
                 &row,
-                &mut runtimes,
+                runtime(request, &mut runtimes, &row.symbol)?,
                 writer.as_mut(),
                 observer,
                 report,
@@ -616,30 +629,17 @@ fn process_sz_channel(
     Ok(())
 }
 
-struct SilentObserver;
-
-impl StateObserver for SilentObserver {
-    fn observe(
-        &mut self,
-        _channel: u32,
-        _symbol: &str,
-        _book: &OrderBook,
-        _point: ObservationPoint,
-    ) -> Result<(), ProductionError> {
-        Ok(())
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 fn process_sz_order(
     request: &MarketDayRequest,
     channel: u32,
     row: &SzOrderRow,
-    runtimes: &mut SymbolMap<BookRuntime>,
+    runtime: &mut BookRuntime,
+    same_side_price_available: bool,
     writer: Option<&mut SnapshotWriter>,
     observer: &mut dyn StateObserver,
     report: &mut ReplayReport,
 ) -> Result<(), ProductionError> {
-    let runtime = runtime(request, runtimes, &row.symbol)?;
     before_business_event(
         request,
         channel,
@@ -652,7 +652,6 @@ fn process_sz_order(
     )?;
     let side = sz_side(row.side);
     let key = order_key(channel, side, row.sequence, &row.symbol, row.sequence)?;
-    let same_side_price_available = runtime.book.best_level(side).is_some();
     let pricing = match row.kind {
         SzOrderKind::Market => PricingInstruction::Unpriced,
         SzOrderKind::Limit => {
@@ -678,13 +677,7 @@ fn process_sz_order(
         SzOrderKind::Limit => CrossingBehavior::Rest,
     };
     let event = BookEvent::AddOrder(AddOrder {
-        meta: meta(
-            runtime,
-            request,
-            row.sequence,
-            row.local_time_ns,
-            row.quote_time_ns,
-        )?,
+        meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
         order_key: key,
         pricing,
         crossing,
@@ -709,12 +702,11 @@ fn process_sz_execution(
     request: &MarketDayRequest,
     channel: u32,
     row: &SzExecutionRow,
-    runtimes: &mut SymbolMap<BookRuntime>,
+    runtime: &mut BookRuntime,
     writer: Option<&mut SnapshotWriter>,
     observer: &mut dyn StateObserver,
     report: &mut ReplayReport,
 ) -> Result<(), ProductionError> {
-    let runtime = runtime(request, runtimes, &row.symbol)?;
     before_business_event(
         request,
         channel,
@@ -727,13 +719,7 @@ fn process_sz_execution(
     )?;
     let event = match row.kind {
         SzExecutionKind::Trade => BookEvent::Trade(Trade {
-            meta: meta(
-                runtime,
-                request,
-                row.sequence,
-                row.local_time_ns,
-                row.quote_time_ns,
-            )?,
+            meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
             bid_order: sz_reference(runtime, Side::Buy, row.bid_order_no),
             ask_order: sz_reference(runtime, Side::Sell, row.ask_order_no),
             price: price(row.price_units, &row.symbol, row.sequence)?,
@@ -746,15 +732,10 @@ fn process_sz_execution(
                 &row.symbol,
                 row.sequence,
             )?;
-            let key = runtime.active_reference(side, order_no).ok_or_else(|| {
-                normalize_error(&row.symbol, row.sequence, "unknown cancellation target")
-            })?;
-            let remaining = runtime
-                .book
-                .order(&key)
-                .map(|order| order.remaining_quantity)
+            let (key, remaining) = runtime
+                .active_reference_with_remaining(side, order_no)
                 .ok_or_else(|| {
-                    normalize_error(&row.symbol, row.sequence, "inactive cancellation target")
+                    normalize_error(&row.symbol, row.sequence, "unknown cancellation target")
                 })?;
             if remaining != row.quantity {
                 return Err(normalize_error(
@@ -767,13 +748,7 @@ fn process_sz_execution(
                 ));
             }
             BookEvent::OrderCancel(OrderCancel {
-                meta: meta(
-                    runtime,
-                    request,
-                    row.sequence,
-                    row.local_time_ns,
-                    row.quote_time_ns,
-                )?,
+                meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
                 order_key: key,
             })
         }
@@ -948,11 +923,7 @@ fn emit_market_close(
     Ok(())
 }
 
-fn apply_sse_row(
-    runtime: &mut BookRuntime,
-    request: &MarketDayRequest,
-    row: &SseRow,
-) -> Result<(), ProductionError> {
+fn apply_sse_row(runtime: &mut BookRuntime, row: &SseRow) -> Result<(), ProductionError> {
     let event = match row.kind {
         SseKind::Add => {
             let (side, order_no) = one_sided_reference(
@@ -973,13 +944,7 @@ fn apply_sse_row(
             }
             let key = order_key(row.channel, side, order_no, &row.symbol, row.sequence)?;
             let event = BookEvent::AddOrder(AddOrder {
-                meta: meta(
-                    runtime,
-                    request,
-                    row.sequence,
-                    row.local_time_ns,
-                    row.quote_time_ns,
-                )?,
+                meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
                 order_key: key,
                 pricing: PricingInstruction::Provided(price(
                     row.price_units,
@@ -1004,24 +969,12 @@ fn apply_sse_row(
                 normalize_error(&row.symbol, row.sequence, "unknown deletion target")
             })?;
             BookEvent::OrderCancel(OrderCancel {
-                meta: meta(
-                    runtime,
-                    request,
-                    row.sequence,
-                    row.local_time_ns,
-                    row.quote_time_ns,
-                )?,
+                meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
                 order_key: key,
             })
         }
         SseKind::Trade => BookEvent::Trade(Trade {
-            meta: meta(
-                runtime,
-                request,
-                row.sequence,
-                row.local_time_ns,
-                row.quote_time_ns,
-            )?,
+            meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
             bid_order: sse_trade_reference(runtime, Side::Buy, row, row.buy_order_no)?,
             ask_order: sse_trade_reference(runtime, Side::Sell, row, row.sell_order_no)?,
             price: price(row.price_units, &row.symbol, row.sequence)?,
@@ -1128,7 +1081,6 @@ fn snapshot_writer(
 
 fn meta(
     runtime: &BookRuntime,
-    _request: &MarketDayRequest,
     raw_sequence: u64,
     local_time_ns: i64,
     quote_time_ns: i64,
@@ -1303,6 +1255,102 @@ mod tests {
                 .is_some()
         );
         assert_eq!(runtimes.len(), 2);
+    }
+
+    #[test]
+    fn sz_cancel_lookup_retains_unknown_target_errors_and_current_remaining() {
+        let request = runtime_request();
+        let mut runtimes = SymbolMap::default();
+        let runtime = runtime(&request, &mut runtimes, "000001").expect("runtime");
+        let mut report = super::ReplayReport::default();
+        let row = super::SzOrderRow {
+            source_row: 1,
+            sequence: 1,
+            channel: 1,
+            symbol: "000001".try_into().expect("symbol"),
+            quote_time_ns: 100,
+            local_time_ns: 200,
+            price_units: 100_000,
+            quantity: 10,
+            side: super::SzSide::Buy,
+            kind: super::SzOrderKind::Limit,
+        };
+        super::process_sz_order(
+            &request,
+            1,
+            &row,
+            runtime,
+            false,
+            None,
+            &mut super::NullObserver,
+            &mut report,
+        )
+        .expect("add");
+        let (key, remaining) = runtime
+            .active_reference_with_remaining(Side::Buy, 1)
+            .expect("active");
+        assert_eq!(remaining, 10);
+        assert_eq!(runtime.active_reference(Side::Buy, 1), Some(key));
+        let mut cancel = super::SzExecutionRow {
+            source_row: 2,
+            sequence: 2,
+            channel: 1,
+            symbol: row.symbol,
+            quote_time_ns: 100,
+            local_time_ns: 201,
+            bid_order_no: 1,
+            ask_order_no: 0,
+            price_units: 0,
+            quantity: 9,
+            kind: super::SzExecutionKind::Cancel,
+        };
+        let err = super::process_sz_execution(
+            &request,
+            1,
+            &cancel,
+            runtime,
+            None,
+            &mut super::NullObserver,
+            &mut report,
+        )
+        .expect_err("wrong quantity");
+        assert!(
+            err.to_string()
+                .contains("cancellation quantity 9 does not equal remaining 10")
+        );
+        assert_eq!(
+            runtime.active_reference_with_remaining(Side::Buy, 1),
+            Some((key, 10))
+        );
+        cancel.quantity = 10;
+        super::process_sz_execution(
+            &request,
+            1,
+            &cancel,
+            runtime,
+            None,
+            &mut super::NullObserver,
+            &mut report,
+        )
+        .expect("cancel");
+        assert_eq!(runtime.resolve_history(Side::Buy, 1), Some(key));
+        assert_eq!(runtime.active_reference_with_remaining(Side::Buy, 1), None);
+        for order_no in [1, 999] {
+            cancel.bid_order_no = order_no;
+            cancel.sequence = 3;
+            let err = super::process_sz_execution(
+                &request,
+                1,
+                &cancel,
+                runtime,
+                None,
+                &mut super::NullObserver,
+                &mut report,
+            )
+            .expect_err("inactive or missing");
+            assert!(err.to_string().contains("unknown cancellation target"));
+        }
+        assert_eq!(report.applied_events, 2);
     }
 
     #[test]

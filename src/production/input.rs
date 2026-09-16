@@ -445,12 +445,6 @@ fn read_batches(
 
 fn raw_columns(feed: &str) -> &'static [&'static str] {
     match feed {
-        "mdl_6_28_0" => &[
-            "SecurityID",
-            "UpdateTime",
-            "TradingPhaseCode",
-            "source_row_no",
-        ],
         "mdl_4_24_0" => &[
             "BizIndex",
             "Channel",

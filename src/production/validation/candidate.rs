@@ -69,6 +69,12 @@ mod tests {
     fn context<'a>(book: &'a OrderBook, symbol: &'a str) -> CandidateContext<'a> {
         CandidateContext {
             market: book.config().book_key.market,
+            rules: SymbolValidationRules::new(
+                book.config().book_key.market,
+                symbol,
+                REFERENCE_SECOND_NS,
+                false,
+            ),
             symbol,
             book,
             limits: None,
@@ -306,7 +312,11 @@ mod tests {
                     12 => actual.trade_quantity += 1,
                     _ => actual.turnover_units += 1,
                 }
-                let mut mask = compare_reference_scalars(market, symbol, &compact, &actual);
+                let mut mask = compare_reference_scalars(
+                    validation_price_quantum(market, symbol),
+                    &compact,
+                    &actual,
+                );
                 mask.0 |= compact.depth_differences(&actual).0;
                 assert_eq!(mask, compare_view_mask(market, symbol, &expected, &actual));
                 assert_eq!(
@@ -331,6 +341,7 @@ pub(super) struct CandidateCounters {
 #[derive(Clone, Copy)]
 pub(super) struct CandidateContext<'a> {
     pub market: Market,
+    pub rules: SymbolValidationRules,
     pub symbol: &'a str,
     pub book: &'a OrderBook,
     pub limits: Option<&'a DayLimits>,
@@ -344,17 +355,15 @@ fn scalars(ctx: CandidateContext<'_>) -> Result<SnapshotBookView, ProductionErro
         asks: SnapshotLevels::new(),
         total_bid_quantity: ctx.book.visible_aggregate(Side::Buy).0,
         total_ask_quantity: ctx.book.visible_aggregate(Side::Sell).0,
-        weighted_bid_price_units: published_weighted_price(
+        weighted_bid_price_units: published_weighted_price_with_quantum(
             ctx.book,
             Side::Buy,
-            ctx.market,
-            ctx.symbol,
+            ctx.rules.price_quantum,
         )?,
-        weighted_ask_price_units: published_weighted_price(
+        weighted_ask_price_units: published_weighted_price_with_quantum(
             ctx.book,
             Side::Sell,
-            ctx.market,
-            ctx.symbol,
+            ctx.rules.price_quantum,
         )?,
         last_price_units: stats.last_price.map(crate::Price::units),
         high_price_units: stats.high_price.map(crate::Price::units),
@@ -404,26 +413,25 @@ pub(super) fn compare_candidate(
     // Close projections and closing-price reconciliation have independent
     // audit state. They neither use nor modify the ordinary candidate cache.
     let is_close = anchor == ValidationAnchor::MarketClose;
-    let projection =
-        if is_close && ctx.market == Market::Szse && !is_etf_symbol(ctx.market, ctx.symbol) {
-            let missing = DayLimits::default();
-            let limits = ctx.limits.unwrap_or(&missing);
-            match limits.unlimited() {
-                Ok(false) => Ok(None),
-                Ok(true) => ctx
-                    .close_price
-                    .and_then(|tracker| tracker.range_base.as_ref())
-                    .ok_or_else(|| "missing pre-14:57 successful trade for SZ E0 range".to_owned())
-                    .and_then(|base| {
-                        close_range::project(ctx.book, base, limits)
-                            .map(Some)
-                            .map_err(|e| e.to_string())
-                    }),
-                Err(error) => Err(error),
-            }
-        } else {
-            Ok(None)
-        };
+    let projection = if is_close && ctx.market == Market::Szse && !ctx.rules.is_etf {
+        let missing = DayLimits::default();
+        let limits = ctx.limits.unwrap_or(&missing);
+        match limits.unlimited() {
+            Ok(false) => Ok(None),
+            Ok(true) => ctx
+                .close_price
+                .and_then(|tracker| tracker.range_base.as_ref())
+                .ok_or_else(|| "missing pre-14:57 successful trade for SZ E0 range".to_owned())
+                .and_then(|base| {
+                    close_range::project(ctx.book, base, limits)
+                        .map(Some)
+                        .map_err(|e| e.to_string())
+                }),
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(None)
+    };
     let (mut close_view, close_price_band, projected) = match projection {
         Ok(Some((view, audit))) => (Some(view), Some(audit), true),
         Ok(None) if is_close => (Some(scalars(ctx)?), None, false),
@@ -445,7 +453,7 @@ pub(super) fn compare_candidate(
             .as_mut()
             .ok_or(ProductionError::Arithmetic("missing candidate cache"))?
     };
-    let mut mask = compare_reference_scalars(ctx.market, ctx.symbol, expected, actual);
+    let mut mask = compare_reference_scalars(ctx.rules.price_quantum, expected, actual);
     let turnover_precision = turnover_precision(
         reference.missing_reception,
         expected.turnover_units,
@@ -493,7 +501,7 @@ pub(super) fn compare_candidate(
         None
     };
     if match_tag.is_some() {
-        mask = compare_reference_scalars(ctx.market, ctx.symbol, expected, actual);
+        mask = compare_reference_scalars(ctx.rules.price_quantum, expected, actual);
         if turnover_precision.is_some() {
             mask.0 &= !DIFF_TURNOVER;
         }

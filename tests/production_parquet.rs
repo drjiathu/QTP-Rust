@@ -2530,3 +2530,105 @@ fn rejects_shenzhen_cancellation_quantity_mismatch() {
     let error = replay_market_day(&sz_request(&root)).expect_err("bad cancellation must fail");
     assert!(error.to_string().contains("does not equal remaining 60"));
 }
+
+#[cfg(feature = "profiling")]
+#[test]
+fn validation_initialization_preserves_symbol_defaults_overrides_and_missing_references() {
+    for (symbol, default_horizon) in [("000001", 1000), ("159915", 1100), ("300001", 3000)] {
+        for reference_present in [false, true] {
+            let root = TempDir::new().expect("fixture directory");
+            write_sz_fixture(&root, [3, 4], 60);
+            write_sz_e0_fixture(&root);
+            for feed in ["mdl_6_33_0", "mdl_6_36_0"] {
+                rewrite_sz_columns(
+                    &root,
+                    feed,
+                    vec![(
+                        "SecurityID",
+                        Arc::new(LargeStringArray::from_iter_values([symbol; 2])),
+                    )],
+                );
+            }
+            if reference_present {
+                rewrite_sz_columns(
+                    &root,
+                    "mdl_6_28_0",
+                    vec![(
+                        "SecurityID",
+                        Arc::new(LargeStringArray::from_iter_values([symbol; 3])),
+                    )],
+                );
+            } else {
+                // A supported reference symbol outside the requested universe
+                // leaves the runtime to initialize this symbol lazily.
+                rewrite_sz_columns(
+                    &root,
+                    "mdl_6_28_0",
+                    vec![(
+                        "SecurityID",
+                        Arc::new(LargeStringArray::from_iter_values(["002001"; 3])),
+                    )],
+                );
+            }
+            for override_horizon in [None, Some(Duration::from_millis(1500))] {
+                let mut request = sz_request(&root);
+                request.targets = TargetUniverse::Symbols(vec![Symbol::from(symbol)]);
+                request.batch_size = 1;
+                let config = ValidationConfig {
+                    request,
+                    continuous_lookback: Some(Duration::from_millis(500)),
+                    continuous_lookahead: override_horizon,
+                    retain_matched_records: true,
+                    max_detail_records: Some(1),
+                };
+                let plain = validate_market_day(&config).expect("plain validation");
+                let (profiled, _) =
+                    qtp_core::profile_validate_market_day(&config).expect("profiled validation");
+                assert_eq!(
+                    serde_json::to_value(&plain).expect("serialize"),
+                    serde_json::to_value(&profiled).expect("serialize"),
+                    "profiling must not change initialization: {symbol}, reference={reference_present}"
+                );
+                assert_eq!(plain.continuous_lookback_ms, 500);
+                assert_eq!(
+                    plain.continuous_lookahead_ms_by_symbol[symbol],
+                    if override_horizon.is_some() {
+                        1500
+                    } else {
+                        default_horizon
+                    }
+                );
+                assert_eq!(plain.selected_references, u64::from(reference_present));
+                assert_eq!(plain.replay.applied_events, 4);
+                if reference_present {
+                    assert_eq!(plain.matched, 1);
+                    assert_eq!(plain.records[0].matched_candidate_raw_sequence, Some(4));
+                } else {
+                    assert_eq!(plain.coverage.symbols_without_reference_records, 1);
+                    assert!(plain.records.is_empty());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cancellation_lookup_keeps_unknown_target_failure_distinct_from_quantity_failure() {
+    for (order_no, expected) in [
+        (1, "cancellation quantity 59 does not equal remaining 60"),
+        (999, "unknown cancellation target"),
+    ] {
+        let root = TempDir::new().expect("fixture directory");
+        write_sz_fixture(&root, [3, 4], 59);
+        rewrite_sz_columns(
+            &root,
+            "mdl_6_36_0",
+            vec![(
+                "BidApplSeqNum",
+                Arc::new(Int64Array::from_iter_values([1, order_no])),
+            )],
+        );
+        let error = replay_market_day(&sz_request(&root)).expect_err("invalid cancellation");
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}
