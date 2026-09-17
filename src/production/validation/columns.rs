@@ -1,6 +1,14 @@
 //! Bind Arrow columns once per batch. Row decoding performs only indexed reads.
-use super::*;
+use crate::{Market, ProductionError, SnapshotBookView, SnapshotLevel, SnapshotLevels};
+use arrow::array::{
+    Array, Decimal128Array, Int64Array, LargeStringArray, UInt32Array, UInt64Array,
+};
+use arrow::datatypes::DataType;
+use arrow::record_batch::RecordBatch;
 use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::fs::File;
+use std::path::Path;
 
 struct DecimalField<'a> {
     name: String,
@@ -377,6 +385,130 @@ pub(super) fn projection(
     Ok(ProjectionMask::roots(builder.parquet_schema(), indices))
 }
 
+fn column_index(path: &Path, batch: &RecordBatch, name: &str) -> Result<usize, ProductionError> {
+    batch
+        .schema()
+        .index_of(name)
+        .map_err(|_| ProductionError::Schema {
+            path: path.to_path_buf(),
+            detail: format!("missing reference field {name}"),
+        })
+}
+
+pub(super) fn large_string<'a>(
+    path: &Path,
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a LargeStringArray, ProductionError> {
+    let index = column_index(path, batch, name)?;
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref()
+        .ok_or_else(|| ProductionError::Schema {
+            path: path.to_path_buf(),
+            detail: format!("reference field {name} is not LargeUtf8"),
+        })
+}
+
+fn int64<'a>(
+    path: &Path,
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a Int64Array, ProductionError> {
+    let index = column_index(path, batch, name)?;
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref()
+        .ok_or_else(|| ProductionError::Schema {
+            path: path.to_path_buf(),
+            detail: format!("reference field {name} is not Int64"),
+        })
+}
+
+fn uint32<'a>(
+    path: &Path,
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a UInt32Array, ProductionError> {
+    let index = column_index(path, batch, name)?;
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref()
+        .ok_or_else(|| ProductionError::Schema {
+            path: path.to_path_buf(),
+            detail: format!("reference field {name} is not UInt32"),
+        })
+}
+
+pub(super) fn uint64<'a>(
+    path: &Path,
+    batch: &'a RecordBatch,
+    name: &str,
+) -> Result<&'a UInt64Array, ProductionError> {
+    let index = column_index(path, batch, name)?;
+    batch
+        .column(index)
+        .as_any()
+        .downcast_ref()
+        .ok_or_else(|| ProductionError::Schema {
+            path: path.to_path_buf(),
+            detail: format!("reference field {name} is not UInt64"),
+        })
+}
+
+fn decimal128<'a>(
+    path: &Path,
+    batch: &'a RecordBatch,
+    name: &str,
+    expected_scale: i8,
+) -> Result<&'a Decimal128Array, ProductionError> {
+    let index = column_index(path, batch, name)?;
+    let array = batch
+        .column(index)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| ProductionError::Schema {
+            path: path.to_path_buf(),
+            detail: format!("reference field {name} is not Decimal128"),
+        })?;
+    match array.data_type() {
+        DataType::Decimal128(_, scale) if *scale == expected_scale => Ok(array),
+        DataType::Decimal128(_, scale) => Err(ProductionError::Schema {
+            path: path.to_path_buf(),
+            detail: format!(
+                "reference field {name} has decimal scale {scale}, expected {expected_scale}"
+            ),
+        }),
+        _ => Err(ProductionError::Schema {
+            path: path.to_path_buf(),
+            detail: format!("reference field {name} is not Decimal128"),
+        }),
+    }
+}
+
+fn rescale_nonnegative_decimal(value: i128, source_scale: i8, target_scale: i8) -> Option<i128> {
+    if value < 0 {
+        return None;
+    }
+    match source_scale.cmp(&target_scale) {
+        std::cmp::Ordering::Less => {
+            let exponent = u32::try_from(target_scale - source_scale).ok()?;
+            value.checked_mul(10_i128.checked_pow(exponent)?)
+        }
+        std::cmp::Ordering::Equal => Some(value),
+        std::cmp::Ordering::Greater => {
+            let exponent = u32::try_from(source_scale - target_scale).ok()?;
+            let divisor = 10_i128.checked_pow(exponent)?;
+            value
+                .checked_add(divisor / 2)
+                .map(|scaled| scaled / divisor)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::expect_used)]
@@ -423,5 +555,22 @@ mod tests {
         assert_eq!(field.required(1).expect("integer"), 1);
         assert!(field.required(2).is_err());
         assert!(field.required(3).is_err());
+    }
+
+    #[test]
+    fn rescales_raw_decimal_references_without_float64() {
+        assert_eq!(
+            super::rescale_nonnegative_decimal(7_994, 3, 4),
+            Some(79_940)
+        );
+        assert_eq!(
+            super::rescale_nonnegative_decimal(12_345_649, 6, 4),
+            Some(123_456)
+        );
+        assert_eq!(
+            super::rescale_nonnegative_decimal(12_345_650, 6, 4),
+            Some(123_457)
+        );
+        assert_eq!(super::rescale_nonnegative_decimal(-1, 6, 4), None);
     }
 }

@@ -1,6 +1,7 @@
 //! Compact storage for millions of reference frames; public snapshot types stay unchanged.
-use super::{SnapshotBookView, SnapshotLevel, SnapshotLevels};
+use super::candidate::{DIFF_ASKS, DIFF_BIDS, DifferenceMask};
 use crate::ProductionError;
+use crate::{SnapshotBookView, SnapshotLevel, SnapshotLevels};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct ReferenceLevels {
@@ -84,10 +85,10 @@ impl TryFrom<SnapshotBookView> for ReferenceBookView {
     }
 }
 impl ReferenceBookView {
-    pub fn depth_differences(&self, actual: &SnapshotBookView) -> super::DifferenceMask {
-        let mut mask = super::DifferenceMask::default();
-        mask.record(super::DIFF_BIDS, !self.bids.matches(&actual.bids));
-        mask.record(super::DIFF_ASKS, !self.asks.matches(&actual.asks));
+    pub fn depth_differences(&self, actual: &SnapshotBookView) -> DifferenceMask {
+        let mut mask = DifferenceMask::default();
+        mask.record(DIFF_BIDS, !self.bids.matches(&actual.bids));
+        mask.record(DIFF_ASKS, !self.asks.matches(&actual.asks));
         mask
     }
     pub fn expand(&self) -> SnapshotBookView {

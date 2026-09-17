@@ -8,6 +8,28 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-09-17
+
+### Changed
+
+- Reduced repeated replay lookups and reused symbol runtime, best-price and
+  cancellation queries; cached validation rules and avoided unnecessary candidate
+  work without changing reconstruction or matching semantics.
+- Separated large private test modules from production code, and organized
+  validation into reference loading, Arrow decoding, Shenzhen closing-price
+  handling, candidate comparison and report assembly responsibilities.
+- Split Shenzhen pending processing into collection and application steps while
+  preserving read-ahead boundaries, error ordering, observer notifications and
+  existing partial-failure effects.
+- Updated the implementation guide's module navigation. Public Rust APIs, CLI
+  options, report schema v2 and Parquet formats remain unchanged from v0.2.0.
+
+### Added
+
+- Regression coverage for equivalent validation entry points, report accounting
+  and pending-order processing boundaries. Full-market validation and paired
+  performance evidence remain local under ignored `reports/`.
+
 ## [0.2.0] - 2026-09-14
 
 ### Added

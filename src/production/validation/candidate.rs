@@ -1,5 +1,18 @@
 //! Candidate extraction is cached, never candidate eligibility or match timing.
-use super::*;
+use super::close_range::{self, DayLimits};
+use super::precision::turnover_precision;
+use super::reference::ReferenceBookView;
+use super::report::FieldDifference;
+use super::sz_close_price::{SzClosePriceTracker, reconcile_sz_market_close_price};
+use super::{
+    REFERENCE_MILLISECOND_NS, REFERENCE_SECOND_NS, ReferenceSnapshot, SymbolValidationRules,
+    SymbolValidationState, published_weighted_price_with_quantum, quantize_validation_price,
+    validation_price,
+};
+use crate::production::replay::ObservationPoint;
+use crate::{
+    Market, OrderBook, ProductionError, Side, SnapshotBookView, SnapshotLevels, ValidationAnchor,
+};
 
 #[derive(Clone, Debug, Default)]
 pub(super) struct CandidateCache {
@@ -11,312 +24,7 @@ pub(super) struct CandidateCache {
 }
 
 #[cfg(test)]
-mod tests {
-    #![allow(clippy::expect_used)]
-    use super::*;
-    use crate::{
-        AddOrder, ApplySequence, BookConfig, BookEvent, BookKey, ChannelId, CrossingBehavior,
-        EventMeta, LocalTimestampNs, OrderId, OrderKey, Price, PriceScale, PricingInstruction,
-        Quantity, RawSequence, Symbol, TradingDay,
-    };
-
-    fn book(market: Market, symbol: &str) -> OrderBook {
-        OrderBook::new(BookConfig::new(
-            BookKey {
-                market,
-                symbol: Symbol::from(symbol),
-                trading_day: TradingDay::from_yyyymmdd(20260828).expect("date"),
-            },
-            PriceScale::from_decimal_places(4).expect("scale"),
-        ))
-    }
-
-    fn add(book: &mut OrderBook, n: u64, crossing: CrossingBehavior) -> OrderKey {
-        let key = OrderKey {
-            channel_id: ChannelId::new(1).expect("channel"),
-            side: Side::Buy,
-            order_id: OrderId::new(n).expect("order"),
-        };
-        book.apply(BookEvent::AddOrder(AddOrder {
-            meta: EventMeta {
-                book_key: book.config().book_key.clone(),
-                raw_sequence: RawSequence::new(n).expect("raw"),
-                apply_sequence: ApplySequence::new(n).expect("apply"),
-                local_time: LocalTimestampNs::from_nanos(10),
-                quote_time: QuoteTimestampNs::from_nanos(10),
-            },
-            order_key: key,
-            pricing: PricingInstruction::Provided(Price::from_units(100_000).expect("price")),
-            crossing,
-            quantity: Quantity::new(10).expect("quantity"),
-        }))
-        .expect("add");
-        key
-    }
-
-    fn reference(view: SnapshotBookView) -> ReferenceSnapshot {
-        ReferenceSnapshot {
-            time_ns: 10,
-            view: Some(view.try_into().expect("compact")),
-            load_error: None,
-            source_row_no: 1,
-            missing_reception: false,
-            pre_close_price_units: None,
-            state: AnchorState::default(),
-        }
-    }
-
-    fn context<'a>(book: &'a OrderBook, symbol: &'a str) -> CandidateContext<'a> {
-        CandidateContext {
-            market: book.config().book_key.market,
-            symbol,
-            book,
-            limits: None,
-            close_price: None,
-        }
-    }
-
-    #[test]
-    fn turnover_compatibility_is_per_reference_and_preserves_other_differences() {
-        for market in [Market::Sse, Market::Szse] {
-            let symbol = if market == Market::Sse {
-                "510300"
-            } else {
-                "159915"
-            };
-            let mut book = book(market, symbol);
-            book.apply(BookEvent::Trade(crate::Trade {
-                meta: EventMeta {
-                    book_key: book.config().book_key.clone(),
-                    raw_sequence: RawSequence::new(1).expect("seq"),
-                    apply_sequence: ApplySequence::new(1).expect("seq"),
-                    local_time: LocalTimestampNs::from_nanos(10),
-                    quote_time: QuoteTimestampNs::from_nanos(10),
-                },
-                bid_order: crate::OrderReference::Absent,
-                ask_order: crate::OrderReference::Absent,
-                price: Price::from_units(100_100).expect("price"),
-                quantity: Quantity::new(1_000_000_001).expect("quantity"),
-            }))
-            .expect("trade");
-            let original = SnapshotBookView::from_book(&book, 10).expect("view");
-            let mut cache = CandidateCache::default();
-            let mut counters = CandidateCounters::default();
-            for anchor in [
-                ValidationAnchor::PreOpen,
-                ValidationAnchor::ContinuousTrading,
-                ValidationAnchor::MarketClose,
-            ] {
-                for (missing, extra_difference) in [(true, false), (false, false), (true, true)] {
-                    let mut expected = original.clone();
-                    expected.turnover_units = 100_100_000_100_000;
-                    if extra_difference {
-                        expected.total_bid_quantity += 1;
-                    }
-                    let mut frame = reference(expected);
-                    frame.missing_reception = missing;
-                    compare_candidate(
-                        context(&book, symbol),
-                        &mut frame,
-                        &mut cache,
-                        &mut counters,
-                        anchor,
-                        Some(10),
-                    )
-                    .expect("compare");
-                    assert_eq!(frame.state.matched, missing && !extra_difference);
-                    if frame.state.matched {
-                        let audit = frame
-                            .state
-                            .diagnostics
-                            .as_ref()
-                            .expect("diagnostics")
-                            .turnover_precision
-                            .as_ref()
-                            .expect("precision audit");
-                        assert_eq!(audit.actual_units, original.turnover_units);
-                        assert_eq!(audit.quantum_units, 1000);
-                    } else {
-                        let differences = frame.state.best_differences().expect("differences");
-                        assert_eq!(
-                            differences.iter().any(|d| d.field == "turnover_units"),
-                            !missing
-                        );
-                    }
-                }
-            }
-            assert_eq!(
-                SnapshotBookView::from_book(&book, 10).expect("unchanged"),
-                original
-            );
-            assert_eq!(
-                cache.view.as_ref().expect("cache").turnover_units,
-                original.turnover_units
-            );
-        }
-    }
-
-    #[test]
-    fn pending_reentry_invalidates_cache_without_advancing_event_metadata() {
-        let mut book = book(Market::Szse, "000001");
-        let key = add(&mut book, 1, CrossingBehavior::AlwaysHide);
-        let mut target = book.clone();
-        let price = Price::from_units(100_000).expect("price");
-        target.rest_pending_order(key, price).expect("target");
-        let mut reference = reference(SnapshotBookView::from_book(&target, 10).expect("view"));
-        let mut cache = CandidateCache::default();
-        let mut counters = CandidateCounters::default();
-        compare_candidate(
-            context(&book, "000001"),
-            &mut reference,
-            &mut cache,
-            &mut counters,
-            ValidationAnchor::ContinuousTrading,
-            Some(10),
-        )
-        .expect("before");
-        assert!(!reference.state.matched);
-        let metadata = book.last_applied_meta().cloned();
-        let revision = book.cache_revision();
-        book.rest_pending_order(key, price).expect("reentry");
-        assert_eq!(book.last_applied_meta(), metadata.as_ref());
-        assert_ne!(book.cache_revision(), revision);
-        compare_candidate(
-            context(&book, "000001"),
-            &mut reference,
-            &mut cache,
-            &mut counters,
-            ValidationAnchor::ContinuousTrading,
-            Some(11),
-        )
-        .expect("after");
-        assert!(reference.state.matched);
-        assert_eq!(reference.state.matched_candidate_time_ns, Some(11));
-        assert_eq!(reference.state.matched_candidate_apply_sequence, Some(1));
-        let ready = cache.revision;
-        assert!(book.rest_pending_order(key, price).is_err());
-        cache
-            .prepare(context(&book, "000001"), &mut counters)
-            .expect("failed mutation");
-        assert_eq!(cache.revision, ready);
-        assert!(cache.depth_ready);
-    }
-
-    #[test]
-    fn cached_views_preserve_per_reference_first_match_and_close_isolation() {
-        for (market, symbol) in [
-            (Market::Sse, "600000"),
-            (Market::Sse, "510300"),
-            (Market::Szse, "000001"),
-            (Market::Szse, "159915"),
-        ] {
-            let mut book = book(market, symbol);
-            add(&mut book, 1, CrossingBehavior::Rest);
-            let expected = SnapshotBookView::from_book(&book, 10).expect("view");
-            let mut cache = CandidateCache::default();
-            let mut counters = CandidateCounters::default();
-            for time in [10, 11, 19] {
-                let mut frame = reference(expected.clone());
-                compare_candidate(
-                    context(&book, symbol),
-                    &mut frame,
-                    &mut cache,
-                    &mut counters,
-                    ValidationAnchor::ContinuousTrading,
-                    Some(time),
-                )
-                .expect("match");
-                assert_eq!(frame.state.matched_candidate_time_ns, Some(time));
-                assert_eq!(frame.state.matched_candidate_raw_sequence, Some(1));
-            }
-            #[cfg(feature = "profiling")]
-            {
-                assert_eq!(counters.depth_materializations, 1);
-                assert_eq!(counters.candidate_cache_hits, 2);
-            }
-            let cached = cache.view.clone();
-            // Close always gets an independent view, including SZ LastPrice
-            // normalization, even if the underlying book revision is unchanged.
-            let mut frame = reference(expected);
-            let limits = DayLimits {
-                values: Some((120_000, 80_000)),
-                ..DayLimits::default()
-            };
-            let close_ctx = CandidateContext {
-                limits: Some(&limits),
-                ..context(&book, symbol)
-            };
-            compare_candidate(
-                close_ctx,
-                &mut frame,
-                &mut cache,
-                &mut counters,
-                ValidationAnchor::MarketClose,
-                Some(20),
-            )
-            .expect("close");
-            assert!(frame.state.matched);
-            assert_eq!(cache.view, cached);
-            add(&mut book, 2, CrossingBehavior::Rest); // Same quote_time, different state.
-            let mut frame = reference(SnapshotBookView::from_book(&book, 10).expect("new view"));
-            compare_candidate(
-                context(&book, symbol),
-                &mut frame,
-                &mut cache,
-                &mut counters,
-                ValidationAnchor::ContinuousTrading,
-                Some(21),
-            )
-            .expect("new revision");
-            assert!(frame.state.matched);
-        }
-    }
-
-    #[test]
-    fn direct_compact_mask_equals_materialized_comparison_for_every_field() {
-        for (market, symbol) in [
-            (Market::Sse, "600000"),
-            (Market::Sse, "510300"),
-            (Market::Szse, "000001"),
-            (Market::Szse, "159915"),
-        ] {
-            let mut book = book(market, symbol);
-            add(&mut book, 1, CrossingBehavior::Rest);
-            let expected = SnapshotBookView::from_book(&book, 10).expect("view");
-            let compact: ReferenceBookView = expected.clone().try_into().expect("compact");
-            for field in 0..14 {
-                let mut actual = expected.clone();
-                match field {
-                    0 => actual.bids[0].price_units += 1,
-                    1 => actual.bids[0].quantity += 1,
-                    2 => actual.bids[0].order_count = u64::from(u32::MAX) + 1,
-                    3 => actual.asks.push(SnapshotLevel {
-                        price_units: 110_000,
-                        quantity: 1,
-                        order_count: 1,
-                    }),
-                    4 => actual.total_bid_quantity += 1,
-                    5 => actual.total_ask_quantity += 1,
-                    6 => actual.weighted_bid_price_units = Some(999_999),
-                    7 => actual.weighted_ask_price_units = Some(999_999),
-                    8 => actual.last_price_units = Some(1),
-                    9 => actual.high_price_units = Some(2),
-                    10 => actual.low_price_units = Some(3),
-                    11 => actual.trade_count += 1,
-                    12 => actual.trade_quantity += 1,
-                    _ => actual.turnover_units += 1,
-                }
-                let mut mask = compare_reference_scalars(market, symbol, &compact, &actual);
-                mask.0 |= compact.depth_differences(&actual).0;
-                assert_eq!(mask, compare_view_mask(market, symbol, &expected, &actual));
-                assert_eq!(
-                    mask.count(),
-                    compare_views(market, symbol, &expected, &actual).len()
-                );
-            }
-        }
-    }
-}
+pub(super) mod tests;
 
 #[derive(Default)]
 pub(super) struct CandidateCounters {
@@ -331,6 +39,7 @@ pub(super) struct CandidateCounters {
 #[derive(Clone, Copy)]
 pub(super) struct CandidateContext<'a> {
     pub market: Market,
+    pub rules: SymbolValidationRules,
     pub symbol: &'a str,
     pub book: &'a OrderBook,
     pub limits: Option<&'a DayLimits>,
@@ -344,17 +53,15 @@ fn scalars(ctx: CandidateContext<'_>) -> Result<SnapshotBookView, ProductionErro
         asks: SnapshotLevels::new(),
         total_bid_quantity: ctx.book.visible_aggregate(Side::Buy).0,
         total_ask_quantity: ctx.book.visible_aggregate(Side::Sell).0,
-        weighted_bid_price_units: published_weighted_price(
+        weighted_bid_price_units: published_weighted_price_with_quantum(
             ctx.book,
             Side::Buy,
-            ctx.market,
-            ctx.symbol,
+            ctx.rules.price_quantum,
         )?,
-        weighted_ask_price_units: published_weighted_price(
+        weighted_ask_price_units: published_weighted_price_with_quantum(
             ctx.book,
             Side::Sell,
-            ctx.market,
-            ctx.symbol,
+            ctx.rules.price_quantum,
         )?,
         last_price_units: stats.last_price.map(crate::Price::units),
         high_price_units: stats.high_price.map(crate::Price::units),
@@ -387,6 +94,269 @@ impl CandidateCache {
     }
 }
 
+pub(super) const DIFF_BIDS: u16 = 1 << 0;
+pub(super) const DIFF_ASKS: u16 = 1 << 1;
+const DIFF_TOTAL_BID_QUANTITY: u16 = 1 << 2;
+const DIFF_WEIGHTED_BID_PRICE: u16 = 1 << 3;
+const DIFF_TOTAL_ASK_QUANTITY: u16 = 1 << 4;
+const DIFF_WEIGHTED_ASK_PRICE: u16 = 1 << 5;
+pub(super) const DIFF_LAST_PRICE: u16 = 1 << 6;
+const DIFF_HIGH_PRICE: u16 = 1 << 7;
+const DIFF_LOW_PRICE: u16 = 1 << 8;
+const DIFF_TRADE_COUNT: u16 = 1 << 9;
+const DIFF_TRADE_QUANTITY: u16 = 1 << 10;
+const DIFF_TURNOVER: u16 = 1 << 11;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) struct DifferenceMask(u16);
+
+impl DifferenceMask {
+    pub(super) fn record(&mut self, bit: u16, differs: bool) {
+        if differs {
+            self.0 |= bit;
+        }
+    }
+
+    const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub(super) fn count(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    pub(super) const fn is_only(self, bit: u16) -> bool {
+        self.0 == bit
+    }
+}
+
+fn compare_reference_scalars(
+    price_quantum: i64,
+    expected: &ReferenceBookView,
+    actual: &SnapshotBookView,
+) -> DifferenceMask {
+    let mut mask = DifferenceMask::default();
+    mask.record(
+        DIFF_TOTAL_BID_QUANTITY,
+        expected.total_bid_quantity != actual.total_bid_quantity,
+    );
+    mask.record(
+        DIFF_WEIGHTED_BID_PRICE,
+        !weighted_prices_match(
+            expected.weighted_bid_price_units,
+            quantize_validation_price(price_quantum, actual.weighted_bid_price_units),
+        ),
+    );
+    mask.record(
+        DIFF_TOTAL_ASK_QUANTITY,
+        expected.total_ask_quantity != actual.total_ask_quantity,
+    );
+    mask.record(
+        DIFF_WEIGHTED_ASK_PRICE,
+        !weighted_prices_match(
+            expected.weighted_ask_price_units,
+            quantize_validation_price(price_quantum, actual.weighted_ask_price_units),
+        ),
+    );
+    mask.record(
+        DIFF_LAST_PRICE,
+        expected.last_price_units != actual.last_price_units,
+    );
+    mask.record(
+        DIFF_HIGH_PRICE,
+        expected.high_price_units != actual.high_price_units,
+    );
+    mask.record(
+        DIFF_LOW_PRICE,
+        expected.low_price_units != actual.low_price_units,
+    );
+    mask.record(DIFF_TRADE_COUNT, expected.trade_count != actual.trade_count);
+    mask.record(
+        DIFF_TRADE_QUANTITY,
+        expected.trade_quantity != actual.trade_quantity,
+    );
+    mask.record(
+        DIFF_TURNOVER,
+        expected.turnover_units != actual.turnover_units,
+    );
+    mask
+}
+
+#[cfg(test)]
+fn compare_view_mask(
+    market: Market,
+    symbol: &str,
+    expected: &SnapshotBookView,
+    actual: &SnapshotBookView,
+) -> DifferenceMask {
+    let mut mask = DifferenceMask::default();
+    mask.record(DIFF_BIDS, expected.bids != actual.bids);
+    mask.record(DIFF_ASKS, expected.asks != actual.asks);
+    mask.record(
+        DIFF_TOTAL_BID_QUANTITY,
+        expected.total_bid_quantity != actual.total_bid_quantity,
+    );
+    mask.record(
+        DIFF_WEIGHTED_BID_PRICE,
+        !weighted_prices_match(
+            expected.weighted_bid_price_units,
+            validation_price(market, symbol, actual.weighted_bid_price_units),
+        ),
+    );
+    mask.record(
+        DIFF_TOTAL_ASK_QUANTITY,
+        expected.total_ask_quantity != actual.total_ask_quantity,
+    );
+    mask.record(
+        DIFF_WEIGHTED_ASK_PRICE,
+        !weighted_prices_match(
+            expected.weighted_ask_price_units,
+            validation_price(market, symbol, actual.weighted_ask_price_units),
+        ),
+    );
+    mask.record(
+        DIFF_LAST_PRICE,
+        expected.last_price_units != actual.last_price_units,
+    );
+    mask.record(
+        DIFF_HIGH_PRICE,
+        expected.high_price_units != actual.high_price_units,
+    );
+    mask.record(
+        DIFF_LOW_PRICE,
+        expected.low_price_units != actual.low_price_units,
+    );
+    mask.record(DIFF_TRADE_COUNT, expected.trade_count != actual.trade_count);
+    mask.record(
+        DIFF_TRADE_QUANTITY,
+        expected.trade_quantity != actual.trade_quantity,
+    );
+    mask.record(
+        DIFF_TURNOVER,
+        expected.turnover_units != actual.turnover_units,
+    );
+    mask
+}
+
+fn compare_views(
+    market: Market,
+    symbol: &str,
+    expected: &SnapshotBookView,
+    actual: &SnapshotBookView,
+) -> Vec<FieldDifference> {
+    let mut differences = Vec::new();
+    compare(&mut differences, "bids", &expected.bids, &actual.bids);
+    compare(&mut differences, "asks", &expected.asks, &actual.asks);
+    compare(
+        &mut differences,
+        "total_bid_quantity",
+        &expected.total_bid_quantity,
+        &actual.total_bid_quantity,
+    );
+    compare_weighted_price(
+        &mut differences,
+        "weighted_bid_price_units",
+        expected.weighted_bid_price_units,
+        validation_price(market, symbol, actual.weighted_bid_price_units),
+    );
+    compare(
+        &mut differences,
+        "total_ask_quantity",
+        &expected.total_ask_quantity,
+        &actual.total_ask_quantity,
+    );
+    compare_weighted_price(
+        &mut differences,
+        "weighted_ask_price_units",
+        expected.weighted_ask_price_units,
+        validation_price(market, symbol, actual.weighted_ask_price_units),
+    );
+    for (field, expected_value, actual_value) in [
+        (
+            "last_price_units",
+            expected.last_price_units,
+            actual.last_price_units,
+        ),
+        (
+            "high_price_units",
+            expected.high_price_units,
+            actual.high_price_units,
+        ),
+        (
+            "low_price_units",
+            expected.low_price_units,
+            actual.low_price_units,
+        ),
+    ] {
+        compare(&mut differences, field, &expected_value, &actual_value);
+    }
+    compare(
+        &mut differences,
+        "trade_count",
+        &expected.trade_count,
+        &actual.trade_count,
+    );
+    compare(
+        &mut differences,
+        "trade_quantity",
+        &expected.trade_quantity,
+        &actual.trade_quantity,
+    );
+    compare(
+        &mut differences,
+        "turnover_units",
+        &expected.turnover_units,
+        &actual.turnover_units,
+    );
+    differences
+}
+
+/// One internal price unit is CNY 0.0001, so ten units are CNY 0.001.
+const WEIGHTED_PRICE_TOLERANCE_UNITS: u64 = 10;
+
+fn compare_weighted_price(
+    differences: &mut Vec<FieldDifference>,
+    field: &str,
+    expected: Option<i64>,
+    actual: Option<i64>,
+) {
+    if !weighted_prices_match(expected, actual) {
+        differences.push(FieldDifference {
+            field: field.to_owned(),
+            expected: format!(
+                "{expected:?} (absolute tolerance: {} units / CNY 0.001)",
+                WEIGHTED_PRICE_TOLERANCE_UNITS
+            ),
+            actual: format!("{actual:?}"),
+        });
+    }
+}
+
+fn weighted_prices_match(expected: Option<i64>, actual: Option<i64>) -> bool {
+    match (expected, actual) {
+        (None, None) => true,
+        (Some(expected), Some(actual)) => {
+            expected.abs_diff(actual) <= WEIGHTED_PRICE_TOLERANCE_UNITS
+        }
+        _ => false,
+    }
+}
+
+fn compare<T: std::fmt::Debug + PartialEq>(
+    differences: &mut Vec<FieldDifference>,
+    field: &str,
+    expected: &T,
+    actual: &T,
+) {
+    if expected != actual {
+        differences.push(FieldDifference {
+            field: field.to_owned(),
+            expected: format!("{expected:?}"),
+            actual: format!("{actual:?}"),
+        });
+    }
+}
+
 pub(super) fn compare_candidate(
     ctx: CandidateContext<'_>,
     reference: &mut ReferenceSnapshot,
@@ -404,26 +374,25 @@ pub(super) fn compare_candidate(
     // Close projections and closing-price reconciliation have independent
     // audit state. They neither use nor modify the ordinary candidate cache.
     let is_close = anchor == ValidationAnchor::MarketClose;
-    let projection =
-        if is_close && ctx.market == Market::Szse && !is_etf_symbol(ctx.market, ctx.symbol) {
-            let missing = DayLimits::default();
-            let limits = ctx.limits.unwrap_or(&missing);
-            match limits.unlimited() {
-                Ok(false) => Ok(None),
-                Ok(true) => ctx
-                    .close_price
-                    .and_then(|tracker| tracker.range_base.as_ref())
-                    .ok_or_else(|| "missing pre-14:57 successful trade for SZ E0 range".to_owned())
-                    .and_then(|base| {
-                        close_range::project(ctx.book, base, limits)
-                            .map(Some)
-                            .map_err(|e| e.to_string())
-                    }),
-                Err(error) => Err(error),
-            }
-        } else {
-            Ok(None)
-        };
+    let projection = if is_close && ctx.market == Market::Szse && !ctx.rules.is_etf {
+        let missing = DayLimits::default();
+        let limits = ctx.limits.unwrap_or(&missing);
+        match limits.unlimited() {
+            Ok(false) => Ok(None),
+            Ok(true) => ctx
+                .close_price
+                .and_then(|tracker| tracker.range_base.as_ref())
+                .ok_or_else(|| "missing pre-14:57 successful trade for SZ E0 range".to_owned())
+                .and_then(|base| {
+                    close_range::project(ctx.book, base, limits)
+                        .map(Some)
+                        .map_err(|e| e.to_string())
+                }),
+            Err(error) => Err(error),
+        }
+    } else {
+        Ok(None)
+    };
     let (mut close_view, close_price_band, projected) = match projection {
         Ok(Some((view, audit))) => (Some(view), Some(audit), true),
         Ok(None) if is_close => (Some(scalars(ctx)?), None, false),
@@ -445,7 +414,7 @@ pub(super) fn compare_candidate(
             .as_mut()
             .ok_or(ProductionError::Arithmetic("missing candidate cache"))?
     };
-    let mut mask = compare_reference_scalars(ctx.market, ctx.symbol, expected, actual);
+    let mut mask = compare_reference_scalars(ctx.rules.price_quantum, expected, actual);
     let turnover_precision = turnover_precision(
         reference.missing_reception,
         expected.turnover_units,
@@ -493,7 +462,7 @@ pub(super) fn compare_candidate(
         None
     };
     if match_tag.is_some() {
-        mask = compare_reference_scalars(ctx.market, ctx.symbol, expected, actual);
+        mask = compare_reference_scalars(ctx.rules.price_quantum, expected, actual);
         if turnover_precision.is_some() {
             mask.0 &= !DIFF_TURNOVER;
         }
