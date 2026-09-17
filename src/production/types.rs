@@ -176,10 +176,10 @@ pub struct ValidationConfig {
     /// Keep one report record for every successful reference frame.
     ///
     /// Full-market validation should normally disable this: aggregate counts
-    /// still include every frame, while `records` retains only mismatches and
-    /// non-comparable cases.
+    /// still include every selected frame, while `records` retains only
+    /// Mismatched, DataError and MissingSource cases.
     pub retain_matched_records: bool,
-    /// Optional cap for retained mismatch/not-comparable detail records.
+    /// Optional cap for retained Mismatched, DataError and MissingSource details.
     /// Aggregate counts always cover every evaluated reference frame.
     pub max_detail_records: Option<usize>,
 }

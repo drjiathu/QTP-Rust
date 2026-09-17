@@ -308,6 +308,16 @@ impl BookRuntime {
         self.resolve_history(side, order_no)
             .filter(|key| self.book.order(key).is_some())
     }
+
+    fn active_reference_with_remaining(
+        &self,
+        side: Side,
+        order_no: u64,
+    ) -> Option<(OrderKey, u64)> {
+        let key = self.resolve_history(side, order_no)?;
+        let order = self.book.order(&key)?;
+        Some((key, order.remaining_quantity))
+    }
 }
 
 fn same_second_regression_is_allowed(
@@ -369,7 +379,7 @@ fn process_sse_channel(
                     observer,
                     report,
                 )?;
-                apply_sse_row(runtime, request, &row)?;
+                apply_sse_row(runtime, &row)?;
                 report.applied_events += 1;
                 observer.observe(
                     channel,
@@ -447,128 +457,46 @@ fn process_sz_channel(
                 .map(|reader| reader.next_row())
                 .transpose()?
                 .flatten();
-            let book = &runtime(request, &mut runtimes, &row.symbol)?.book;
+            let runtime = runtime(request, &mut runtimes, &row.symbol)?;
             let side = sz_side(row.side);
-            let same_best = book.best_level(side);
+            let same_side_price_available =
+                row.kind == SzOrderKind::SameSideBest && runtime.book.best_level(side).is_some();
             if (row.kind == SzOrderKind::Market
                 && request.sz_market_order_policy
                     != super::SzMarketOrderPolicy::RestAtLastTradePrice)
-                || (row.kind == SzOrderKind::SameSideBest && same_best.is_none())
+                || (row.kind == SzOrderKind::SameSideBest && !same_side_price_available)
             {
-                let opposite_best = book.best_level(match side {
+                let opposite_best = runtime.book.best_level(match side {
                     Side::Buy => Side::Sell,
                     Side::Sell => Side::Buy,
                 });
-                let mut pending = super::sz_pending::PendingOrder::new(
+                let group = collect_pending_group(
+                    request.sz_market_order_policy,
+                    channel,
                     &row,
                     opposite_best.map(|p| p.price.units()),
-                );
-                let mut responses = Vec::new();
-                while let Some(next) = execution.as_ref() {
-                    if order.as_ref().is_some_and(|o| o.sequence == next.sequence) {
-                        return Err(ProductionError::AmbiguousSequence {
-                            channel,
-                            sequence: next.sequence,
-                        });
-                    }
-                    if pending.terminal()
-                        || order.as_ref().is_some_and(|o| o.sequence < next.sequence)
-                        || !pending.references(next)
-                    {
-                        break;
-                    }
-                    pending.observe(next)?;
-                    responses.push(
-                        execution
-                            .take()
-                            .ok_or_else(|| pending.error("missing execution cursor"))?,
-                    );
-                    execution = executions
-                        .as_mut()
-                        .map(|reader| reader.next_row())
-                        .transpose()?
-                        .flatten();
-                }
-                let next_sequence = order
-                    .as_ref()
-                    .map(|o| o.sequence)
-                    .into_iter()
-                    .chain(execution.as_ref().map(|e| e.sequence))
-                    .min();
-                let disposition = pending.finish(request.sz_market_order_policy, next_sequence)?;
-                // Classification happens before any book mutation. All responses
-                // have the order's quote time; do not expose speculative states.
-                before_business_event(
+                    &order,
+                    &mut execution,
+                    &mut executions,
+                )?;
+                apply_pending_group(
                     request,
                     channel,
-                    &row.symbol,
-                    row.quote_time_ns,
-                    runtime(request, &mut runtimes, &row.symbol)?,
+                    &row,
+                    group,
+                    runtime,
+                    same_side_price_available,
                     writer.as_mut(),
                     observer,
                     report,
-                )?;
-                process_sz_order(
-                    request,
-                    channel,
-                    &row,
-                    &mut runtimes,
-                    None,
-                    &mut SilentObserver,
-                    report,
-                )?;
-                for response in &responses {
-                    process_sz_execution(
-                        request,
-                        channel,
-                        response,
-                        &mut runtimes,
-                        None,
-                        &mut SilentObserver,
-                        report,
-                    )?;
-                }
-                if let super::sz_pending::Disposition::Rest(units) = disposition {
-                    let key = order_key(channel, side, row.sequence, &row.symbol, row.sequence)?;
-                    runtime(request, &mut runtimes, &row.symbol)?
-                        .book
-                        .rest_pending_order(key, price(units, &row.symbol, row.sequence)?)
-                        .map_err(|source| ProductionError::Apply {
-                            symbol: Symbol::from(row.symbol.as_str()),
-                            sequence: row.sequence,
-                            source,
-                        })?;
-                    report.sz_inferred_market_remainders += 1;
-                }
-                // Close-price audit observes trades only after group success.
-                for response in &responses {
-                    if response.kind == SzExecutionKind::Trade {
-                        observer.observe_trade_with_sequence(
-                            channel,
-                            &row.symbol,
-                            response.sequence,
-                            response.quote_time_ns,
-                            response.price_units,
-                            response.quantity,
-                        )?;
-                    }
-                }
-                report.sz_pending_groups += 1;
-                if row.kind == SzOrderKind::SameSideBest {
-                    report.sz_empty_same_side_cancellations += 1;
-                }
-                observer.observe(
-                    channel,
-                    &row.symbol,
-                    &runtime(request, &mut runtimes, &row.symbol)?.book,
-                    ObservationPoint::AfterEvent(row.quote_time_ns),
                 )?;
             } else {
                 process_sz_order(
                     request,
                     channel,
                     &row,
-                    &mut runtimes,
+                    runtime,
+                    same_side_price_available,
                     writer.as_mut(),
                     observer,
                     report,
@@ -582,7 +510,7 @@ fn process_sz_channel(
                 request,
                 channel,
                 &row,
-                &mut runtimes,
+                runtime(request, &mut runtimes, &row.symbol)?,
                 writer.as_mut(),
                 observer,
                 report,
@@ -616,30 +544,168 @@ fn process_sz_channel(
     Ok(())
 }
 
-struct SilentObserver;
-
-impl StateObserver for SilentObserver {
-    fn observe(
-        &mut self,
-        _channel: u32,
-        _symbol: &str,
-        _book: &OrderBook,
-        _point: ObservationPoint,
-    ) -> Result<(), ProductionError> {
-        Ok(())
-    }
+/// Collected source responses; classification never mutates the order book.
+struct PendingGroup {
+    responses: Vec<SzExecutionRow>,
+    disposition: super::sz_pending::Disposition,
 }
 
-fn process_sz_order(
+/// Consumes only the bounded response group, preserving the first lookahead row.
+fn collect_pending_group(
+    policy: super::SzMarketOrderPolicy,
+    channel: u32,
+    row: &SzOrderRow,
+    opposite_best_units: Option<i64>,
+    order: &Option<SzOrderRow>,
+    execution: &mut Option<SzExecutionRow>,
+    executions: &mut Option<super::spool::SzExecutionReader>,
+) -> Result<PendingGroup, ProductionError> {
+    let mut pending = super::sz_pending::PendingOrder::new(row, opposite_best_units);
+    let mut responses = Vec::new();
+    while let Some(next) = execution.as_ref() {
+        if order.as_ref().is_some_and(|o| o.sequence == next.sequence) {
+            return Err(ProductionError::AmbiguousSequence {
+                channel,
+                sequence: next.sequence,
+            });
+        }
+        if pending.terminal()
+            || order.as_ref().is_some_and(|o| o.sequence < next.sequence)
+            || !pending.references(next)
+        {
+            break;
+        }
+        pending.observe(next)?;
+        responses.push(
+            execution
+                .take()
+                .ok_or_else(|| pending.error("missing execution cursor"))?,
+        );
+        *execution = executions
+            .as_mut()
+            .map(|reader| reader.next_row())
+            .transpose()?
+            .flatten();
+    }
+    let next_sequence = order
+        .as_ref()
+        .map(|o| o.sequence)
+        .into_iter()
+        .chain(execution.as_ref().map(|e| e.sequence))
+        .min();
+    let disposition = pending.finish(policy, next_sequence)?;
+    Ok(PendingGroup {
+        responses,
+        disposition,
+    })
+}
+
+/// Applies in source order, not transactionally. Failed groups retain the same
+/// already-applied effects; observers see the group boundary, never its interior.
+#[allow(clippy::too_many_arguments)]
+fn apply_pending_group(
     request: &MarketDayRequest,
     channel: u32,
     row: &SzOrderRow,
-    runtimes: &mut SymbolMap<BookRuntime>,
+    group: PendingGroup,
+    runtime: &mut BookRuntime,
+    same_side_price_available: bool,
     writer: Option<&mut SnapshotWriter>,
     observer: &mut dyn StateObserver,
     report: &mut ReplayReport,
 ) -> Result<(), ProductionError> {
-    let runtime = runtime(request, runtimes, &row.symbol)?;
+    let PendingGroup {
+        responses,
+        disposition,
+    } = group;
+    // Classification happens before any book mutation. All responses
+    // have the order's quote time; do not expose speculative states.
+    before_business_event(
+        request,
+        channel,
+        &row.symbol,
+        row.quote_time_ns,
+        runtime,
+        writer,
+        observer,
+        report,
+    )?;
+    process_sz_order(
+        request,
+        channel,
+        row,
+        runtime,
+        same_side_price_available,
+        None,
+        &mut NullObserver,
+        report,
+    )?;
+    for response in &responses {
+        process_sz_execution(
+            request,
+            channel,
+            response,
+            runtime,
+            None,
+            &mut NullObserver,
+            report,
+        )?;
+    }
+    if let super::sz_pending::Disposition::Rest(units) = disposition {
+        let key = order_key(
+            channel,
+            sz_side(row.side),
+            row.sequence,
+            &row.symbol,
+            row.sequence,
+        )?;
+        runtime
+            .book
+            .rest_pending_order(key, price(units, &row.symbol, row.sequence)?)
+            .map_err(|source| ProductionError::Apply {
+                symbol: Symbol::from(row.symbol.as_str()),
+                sequence: row.sequence,
+                source,
+            })?;
+        report.sz_inferred_market_remainders += 1;
+    }
+    // Close-price audit observes trades only after group success.
+    for response in &responses {
+        if response.kind == SzExecutionKind::Trade {
+            observer.observe_trade_with_sequence(
+                channel,
+                &row.symbol,
+                response.sequence,
+                response.quote_time_ns,
+                response.price_units,
+                response.quantity,
+            )?;
+        }
+    }
+    report.sz_pending_groups += 1;
+    if row.kind == SzOrderKind::SameSideBest {
+        report.sz_empty_same_side_cancellations += 1;
+    }
+    observer.observe(
+        channel,
+        &row.symbol,
+        &runtime.book,
+        ObservationPoint::AfterEvent(row.quote_time_ns),
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_sz_order(
+    request: &MarketDayRequest,
+    channel: u32,
+    row: &SzOrderRow,
+    runtime: &mut BookRuntime,
+    same_side_price_available: bool,
+    writer: Option<&mut SnapshotWriter>,
+    observer: &mut dyn StateObserver,
+    report: &mut ReplayReport,
+) -> Result<(), ProductionError> {
     before_business_event(
         request,
         channel,
@@ -652,7 +718,6 @@ fn process_sz_order(
     )?;
     let side = sz_side(row.side);
     let key = order_key(channel, side, row.sequence, &row.symbol, row.sequence)?;
-    let same_side_price_available = runtime.book.best_level(side).is_some();
     let pricing = match row.kind {
         SzOrderKind::Market => PricingInstruction::Unpriced,
         SzOrderKind::Limit => {
@@ -678,13 +743,7 @@ fn process_sz_order(
         SzOrderKind::Limit => CrossingBehavior::Rest,
     };
     let event = BookEvent::AddOrder(AddOrder {
-        meta: meta(
-            runtime,
-            request,
-            row.sequence,
-            row.local_time_ns,
-            row.quote_time_ns,
-        )?,
+        meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
         order_key: key,
         pricing,
         crossing,
@@ -709,12 +768,11 @@ fn process_sz_execution(
     request: &MarketDayRequest,
     channel: u32,
     row: &SzExecutionRow,
-    runtimes: &mut SymbolMap<BookRuntime>,
+    runtime: &mut BookRuntime,
     writer: Option<&mut SnapshotWriter>,
     observer: &mut dyn StateObserver,
     report: &mut ReplayReport,
 ) -> Result<(), ProductionError> {
-    let runtime = runtime(request, runtimes, &row.symbol)?;
     before_business_event(
         request,
         channel,
@@ -727,13 +785,7 @@ fn process_sz_execution(
     )?;
     let event = match row.kind {
         SzExecutionKind::Trade => BookEvent::Trade(Trade {
-            meta: meta(
-                runtime,
-                request,
-                row.sequence,
-                row.local_time_ns,
-                row.quote_time_ns,
-            )?,
+            meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
             bid_order: sz_reference(runtime, Side::Buy, row.bid_order_no),
             ask_order: sz_reference(runtime, Side::Sell, row.ask_order_no),
             price: price(row.price_units, &row.symbol, row.sequence)?,
@@ -746,15 +798,10 @@ fn process_sz_execution(
                 &row.symbol,
                 row.sequence,
             )?;
-            let key = runtime.active_reference(side, order_no).ok_or_else(|| {
-                normalize_error(&row.symbol, row.sequence, "unknown cancellation target")
-            })?;
-            let remaining = runtime
-                .book
-                .order(&key)
-                .map(|order| order.remaining_quantity)
+            let (key, remaining) = runtime
+                .active_reference_with_remaining(side, order_no)
                 .ok_or_else(|| {
-                    normalize_error(&row.symbol, row.sequence, "inactive cancellation target")
+                    normalize_error(&row.symbol, row.sequence, "unknown cancellation target")
                 })?;
             if remaining != row.quantity {
                 return Err(normalize_error(
@@ -767,13 +814,7 @@ fn process_sz_execution(
                 ));
             }
             BookEvent::OrderCancel(OrderCancel {
-                meta: meta(
-                    runtime,
-                    request,
-                    row.sequence,
-                    row.local_time_ns,
-                    row.quote_time_ns,
-                )?,
+                meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
                 order_key: key,
             })
         }
@@ -948,11 +989,7 @@ fn emit_market_close(
     Ok(())
 }
 
-fn apply_sse_row(
-    runtime: &mut BookRuntime,
-    request: &MarketDayRequest,
-    row: &SseRow,
-) -> Result<(), ProductionError> {
+fn apply_sse_row(runtime: &mut BookRuntime, row: &SseRow) -> Result<(), ProductionError> {
     let event = match row.kind {
         SseKind::Add => {
             let (side, order_no) = one_sided_reference(
@@ -973,13 +1010,7 @@ fn apply_sse_row(
             }
             let key = order_key(row.channel, side, order_no, &row.symbol, row.sequence)?;
             let event = BookEvent::AddOrder(AddOrder {
-                meta: meta(
-                    runtime,
-                    request,
-                    row.sequence,
-                    row.local_time_ns,
-                    row.quote_time_ns,
-                )?,
+                meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
                 order_key: key,
                 pricing: PricingInstruction::Provided(price(
                     row.price_units,
@@ -1004,24 +1035,12 @@ fn apply_sse_row(
                 normalize_error(&row.symbol, row.sequence, "unknown deletion target")
             })?;
             BookEvent::OrderCancel(OrderCancel {
-                meta: meta(
-                    runtime,
-                    request,
-                    row.sequence,
-                    row.local_time_ns,
-                    row.quote_time_ns,
-                )?,
+                meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
                 order_key: key,
             })
         }
         SseKind::Trade => BookEvent::Trade(Trade {
-            meta: meta(
-                runtime,
-                request,
-                row.sequence,
-                row.local_time_ns,
-                row.quote_time_ns,
-            )?,
+            meta: meta(runtime, row.sequence, row.local_time_ns, row.quote_time_ns)?,
             bid_order: sse_trade_reference(runtime, Side::Buy, row, row.buy_order_no)?,
             ask_order: sse_trade_reference(runtime, Side::Sell, row, row.sell_order_no)?,
             price: price(row.price_units, &row.symbol, row.sequence)?,
@@ -1128,7 +1147,6 @@ fn snapshot_writer(
 
 fn meta(
     runtime: &BookRuntime,
-    _request: &MarketDayRequest,
     raw_sequence: u64,
     local_time_ns: i64,
     quote_time_ns: i64,
@@ -1232,229 +1250,4 @@ fn sz_side(side: SzSide) -> Side {
 
 #[cfg(test)]
 #[allow(clippy::expect_used)]
-mod tests {
-    use std::time::Duration;
-
-    use super::{SymbolMap, one_sided_reference, runtime, same_second_regression_is_allowed};
-    use crate::{
-        Market, MarketDayRequest, ProductionError, Side, SnapshotSchedule, SzMarketOrderPolicy,
-        TargetUniverse, TradingDay,
-    };
-
-    fn runtime_request() -> MarketDayRequest {
-        MarketDayRequest {
-            raw_root: Default::default(),
-            output_root: Default::default(),
-            temp_root: Default::default(),
-            trading_day: TradingDay::from_yyyymmdd(20_260_828).expect("valid test day"),
-            market: Market::Szse,
-            targets: TargetUniverse::AllStocks,
-            snapshots: None,
-            batch_size: 1,
-            sz_market_order_policy: SzMarketOrderPolicy::RequireEvidence,
-        }
-    }
-
-    #[test]
-    fn runtime_reuses_existing_state_and_keeps_symbols_independent() {
-        let request = runtime_request();
-        let mut runtimes = SymbolMap::default();
-        let first = runtime(&request, &mut runtimes, "000001").expect("create runtime");
-        first.last_business_quote_time_ns = Some(123);
-        first.market_close_emitted = true;
-
-        let existing = runtime(&request, &mut runtimes, "000001").expect("reuse runtime");
-        assert_eq!(existing.last_business_quote_time_ns, Some(123));
-        assert!(existing.market_close_emitted);
-        let second = runtime(&request, &mut runtimes, "000002").expect("independent runtime");
-        assert_eq!(second.last_business_quote_time_ns, None);
-        assert!(!second.market_close_emitted);
-        assert_eq!(runtimes.len(), 2);
-    }
-
-    #[test]
-    fn runtime_creation_failure_does_not_insert_or_reinitialize_existing_state() {
-        let mut request = runtime_request();
-        let mut runtimes = SymbolMap::default();
-        runtime(&request, &mut runtimes, "000001")
-            .expect("create runtime")
-            .last_business_quote_time_ns = Some(123);
-        // Public fields allow this invalid schedule; cursor creation must fail.
-        request.snapshots = Some(SnapshotSchedule {
-            interval: Duration::from_secs(u64::MAX),
-            depth: 10,
-        });
-        assert!(matches!(
-            runtime(&request, &mut runtimes, "000002"),
-            Err(ProductionError::Arithmetic(_))
-        ));
-        assert_eq!(runtimes.len(), 1);
-        assert!(!runtimes.contains_key("000002"));
-        let existing = runtime(&request, &mut runtimes, "000001").expect("reuse runtime");
-        assert_eq!(existing.last_business_quote_time_ns, Some(123));
-        assert!(existing.cursor.is_none());
-
-        request.snapshots =
-            Some(SnapshotSchedule::new(Duration::from_secs(30), 10).expect("valid schedule"));
-        assert!(
-            runtime(&request, &mut runtimes, "000002")
-                .expect("retry creation")
-                .cursor
-                .is_some()
-        );
-        assert_eq!(runtimes.len(), 2);
-    }
-
-    #[test]
-    fn requires_one_cancellation_reference() {
-        assert_eq!(
-            one_sided_reference(10, 0, "000001", 1).ok(),
-            Some((Side::Buy, 10))
-        );
-        assert!(one_sided_reference(0, 0, "000001", 1).is_err());
-        assert!(one_sided_reference(10, 20, "000001", 1).is_err());
-    }
-
-    #[test]
-    fn only_unscheduled_same_second_quote_time_regressions_are_allowed() {
-        let previous = 13 * 3_600_000_000_000 + 10 * 60_000_000_000 + 60_000_000;
-        let current = previous - 10_000_000;
-        assert!(same_second_regression_is_allowed(previous, current, false));
-        assert!(!same_second_regression_is_allowed(previous, current, true));
-        assert!(!same_second_regression_is_allowed(
-            13 * 3_600_000_000_000,
-            13 * 3_600_000_000_000 - 1_000_000,
-            false,
-        ));
-    }
-
-    #[derive(Default)]
-    struct RecordingObserver(Vec<(super::ObservationPoint, crate::BookSnapshot)>);
-
-    impl super::StateObserver for RecordingObserver {
-        fn observe(
-            &mut self,
-            channel: u32,
-            _symbol: &str,
-            book: &crate::OrderBook,
-            point: super::ObservationPoint,
-        ) -> Result<(), ProductionError> {
-            self.0.push((
-                point,
-                crate::BookSnapshot::capture(book, channel, crate::SnapshotKind::Scheduled, 0, 10)?,
-            ));
-            Ok(())
-        }
-    }
-
-    fn replay_sse_rows(
-        rows: &[(super::SseKind, &str, u8)],
-    ) -> (
-        Result<(), ProductionError>,
-        super::ReplayReport,
-        RecordingObserver,
-    ) {
-        let root = tempfile::TempDir::new().expect("temporary directory");
-        let mut request = runtime_request();
-        request.market = Market::Sse;
-        request.temp_root = root.path().to_path_buf();
-        let mut spool =
-            crate::production::spool::SpoolSet::create(root.path(), "status-test").expect("spool");
-        for (index, &(kind, time, status)) in rows.iter().enumerate() {
-            let sequence = index as u64 + 1;
-            let time = super::parse_market_timestamp(request.trading_day, time).expect("time");
-            spool
-                .write_sse(&super::SseRow {
-                    source_row: sequence,
-                    sequence,
-                    channel: 1,
-                    symbol: "600000".try_into().expect("symbol"),
-                    quote_time_ns: time,
-                    local_time_ns: time + 123,
-                    kind,
-                    buy_order_no: sequence,
-                    sell_order_no: 0,
-                    price_units: 100_000,
-                    quantity: 10,
-                    flag: super::Aggressor::Buy,
-                    status,
-                })
-                .expect("row");
-        }
-        let spool = spool.finish().expect("finished spool");
-        let mut report = super::ReplayReport::default();
-        let mut observer = RecordingObserver::default();
-        let result = super::process_sse_channel(&request, &spool, 1, &mut observer, &mut report);
-        (result, report, observer)
-    }
-
-    #[test]
-    fn sse_status_only_and_repeated_close_do_not_emit_business_observations() {
-        use super::{ObservationPoint, SseKind::Status};
-        let (result, report, observer) = replay_sse_rows(&[
-            (Status, "14:57:01.000", 1),
-            (Status, "15:00:01.000", 2),
-            (Status, "15:00:02.000", 2),
-        ]);
-        result.expect("status-only stream");
-        assert_eq!(report.status_events, 3);
-        assert_eq!(report.applied_events, 0);
-        assert_eq!(report.market_close_snapshots, 1);
-        assert_eq!(observer.0.len(), 2);
-        assert!(matches!(observer.0[0].0, ObservationPoint::MarketClose(_)));
-        assert_eq!(observer.0[1].0, ObservationPoint::ChannelFinished);
-        for (_, snapshot) in observer.0 {
-            assert_eq!(snapshot.last_quote_time_ns, None);
-            assert_eq!(snapshot.last_local_time_ns, None);
-            assert!(snapshot.book.bids.is_empty());
-        }
-    }
-
-    #[test]
-    fn sse_business_after_close_is_rejected_before_observation_or_mutation() {
-        use super::{
-            ObservationPoint,
-            SseKind::{Add, Status},
-        };
-        let (result, report, observer) = replay_sse_rows(&[
-            (Add, "14:56:00.000", 0),
-            (Status, "15:00:01.000", 2),
-            (Add, "15:00:02.000", 0),
-        ]);
-        assert!(matches!(
-            result,
-            Err(ProductionError::Normalize { sequence: 3, .. })
-        ));
-        assert_eq!(report.applied_events, 1);
-        assert_eq!(observer.0.len(), 3);
-        let (point, snapshot) = observer.0.last().expect("close");
-        assert!(matches!(point, ObservationPoint::MarketClose(_)));
-        assert_eq!(snapshot.book.total_bid_quantity, 10);
-        let time = super::parse_market_timestamp(runtime_request().trading_day, "14:56:00.000")
-            .expect("time");
-        assert_eq!(snapshot.last_quote_time_ns, Some(time));
-        assert_eq!(snapshot.last_local_time_ns, Some(time + 123));
-    }
-
-    #[test]
-    fn sse_cross_second_business_regression_still_fails_without_mutation() {
-        use super::{
-            ObservationPoint,
-            SseKind::{Add, Status},
-        };
-        let (result, report, observer) = replay_sse_rows(&[
-            (Add, "14:57:01.000", 0),
-            (Status, "14:57:02.000", 1),
-            (Add, "14:57:00.990", 0),
-        ]);
-        assert!(matches!(
-            result,
-            Err(ProductionError::QuoteTimeRegression { .. })
-        ));
-        assert_eq!(report.applied_events, 1);
-        assert_eq!(observer.0.len(), 2);
-        let (point, snapshot) = observer.0.last().expect("last successful event");
-        assert!(matches!(point, ObservationPoint::AfterEvent(_)));
-        assert_eq!(snapshot.book.total_bid_quantity, 10);
-    }
-}
+mod tests;
