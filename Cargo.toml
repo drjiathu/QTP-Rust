@@ -25,7 +25,7 @@ arrow = { version = "56.2", default-features = false }
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clap = { version = "4.5", features = ["derive"] }
 hashbrown = { version = "0.16.1", default-features = false }
-parquet = { version = "56.2", features = ["arrow", "zstd"] }
+parquet = { version = "59.3", features = ["arrow", "zstd"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 slotmap = "1.0"
